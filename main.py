@@ -2,18 +2,17 @@
 astrbot_plugin_webchat — 基于 SenseNova API 的终端风格 Web 聊天插件
 """
 
-import asyncio
 import json
-import uuid
+import logging
 
 import aiohttp
 from quart import Response, jsonify, request
 
 from astrbot.api import AstrBotConfig
-from astrbot.api.event import filter, AstrMessageEvent
 from astrbot.api.star import Context, Star
 
 PLUGIN_NAME = "astrbot_plugin_webchat"
+logger = logging.getLogger(PLUGIN_NAME)
 
 
 class Plugin(Star):
@@ -45,7 +44,7 @@ class Plugin(Star):
             "清空聊天历史",
         )
 
-        self._log.info("astrbot_plugin_webchat 已加载")
+        logger.info("astrbot_plugin_webchat 已加载")
 
     # ── HTTP 会话管理 ───────────────────────────────────────────────
 
@@ -78,6 +77,9 @@ class Plugin(Star):
         请求体: {"message": "...", "session_id": "..."(可选), "model": "..."(可选)}
         """
         data = await request.get_json()
+        if not data:
+            return jsonify({"error": "无效的请求体"}), 400
+
         user_message = data.get("message", "").strip()
         session_id = data.get("session_id", "default")
         model = data.get("model") or self.config.get("model", "deepseek-v4-flash")
@@ -98,7 +100,7 @@ class Plugin(Star):
         history.append({"role": "user", "content": user_message})
 
         # 裁剪历史
-        max_history = self.config.get("max_history", 20) * 2  # 一轮 = user + assistant
+        max_history = int(self.config.get("max_history", 20)) * 2
         if len(history) > max_history:
             self.histories[session_id] = history[-max_history:]
             history = self.histories[session_id]
@@ -111,14 +113,15 @@ class Plugin(Star):
             "Authorization": f"Bearer {api_key}",
             "Content-Type": "application/json",
         }
+        system_prompt = (self.config.get("system_prompt") or "").strip()
+
         payload = {
             "model": model,
             "messages": history,
-            "max_tokens": self.config.get("max_tokens", 4096),
-            "temperature": self.config.get("temperature", 0.7),
+            "max_tokens": int(self.config.get("max_tokens", 4096)),
+            "temperature": float(self.config.get("temperature", 0.7)),
             "stream": True,
         }
-        system_prompt = self.config.get("system_prompt", "").strip()
         if system_prompt:
             payload["system"] = system_prompt
 
@@ -126,15 +129,16 @@ class Plugin(Star):
         async def stream_response():
             session = await self._ensure_session()
             assistant_text = ""
+            done_sent = False
             try:
+                timeout = aiohttp.ClientTimeout(total=300)
                 async with session.post(
-                    base_url, headers=headers, json=payload
+                    base_url, headers=headers, json=payload, timeout=timeout
                 ) as resp:
                     if resp.status != 200:
                         error_body = await resp.text()
                         error_msg = f"API 错误 ({resp.status}): {error_body}"
                         yield f"event: error\ndata: {json.dumps({'error': error_msg}, ensure_ascii=False)}\n\n"
-                        # 移除刚追加的用户消息
                         if history and history[-1]["role"] == "user":
                             history.pop()
                         return
@@ -149,7 +153,9 @@ class Plugin(Star):
                                 continue
                             data_str = line[6:]
                             if data_str == "[DONE]":
-                                yield f"event: done\ndata: {json.dumps({'text': assistant_text}, ensure_ascii=False)}\n\n"
+                                if not done_sent:
+                                    done_sent = True
+                                    yield f"event: done\ndata: {json.dumps({'text': assistant_text}, ensure_ascii=False)}\n\n"
                                 break
                             try:
                                 event_data = json.loads(data_str)
@@ -166,7 +172,9 @@ class Plugin(Star):
                                         yield f"event: thinking\ndata: {json.dumps({'text': thinking}, ensure_ascii=False)}\n\n"
 
                                 elif event_type == "message_delta":
-                                    yield f"event: done\ndata: {json.dumps({'text': assistant_text}, ensure_ascii=False)}\n\n"
+                                    if not done_sent:
+                                        done_sent = True
+                                        yield f"event: done\ndata: {json.dumps({'text': assistant_text}, ensure_ascii=False)}\n\n"
                             except json.JSONDecodeError:
                                 continue
 

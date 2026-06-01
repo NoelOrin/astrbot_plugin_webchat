@@ -8,9 +8,12 @@ const status = document.getElementById("status");
 
 let streaming = false;
 let currentAssistant = null;
-let currentThinking = null;
 let currentThinkingContent = "";
 let currentTextContent = "";
+let sseSubscriptionId = null;
+
+// 每个标签页唯一 session ID
+const SESSION_ID = crypto.randomUUID?.() || `tab-${Date.now()}-${Math.random().toString(36).slice(2)}`;
 
 // ── 初始化 ─────────────────────────────────────────────────────────
 
@@ -40,7 +43,7 @@ async function sendMessage() {
   appendUser(text);
 
   streaming = true;
-  setStatus("生成中...", false);
+  setStatus("● 生成中...", false);
   btnSend.disabled = true;
   input.disabled = true;
 
@@ -49,71 +52,81 @@ async function sendMessage() {
   currentThinkingContent = "";
   currentTextContent = "";
 
-  // 使用 bridge SSE 订阅
-  try {
-    await bridge.subscribeSSE(
-      "chat",
-      {
-        onOpen() {
-          setStatus("● 生成中...", false);
-        },
-        onMessage(event) {
-          handleSSEMessage(event);
-        },
-        onError(err) {
-          setStatus("● 连接错误", true);
-          appendError("SSE 连接异常");
-          finishStreaming();
-        },
-      },
-      {
-        message: text,
-        session_id: getSessionId(),
-      },
-    );
-  } catch (err) {
-    // subscribeSSE 不支持 body，需要改用 POST 回退
-    await fetchViaPost(text);
-  }
+  // bridge.subscribeSSE 不支持自定义 POST body，直接用 fetch
+  await fetchViaPost(text);
 }
 
-// SSE 消息处理
-function handleSSEMessage(event) {
-  const type = event.lastEventId || event.raw.split("\n")[0]?.replace("event: ", "");
-
+// POST 流式请求
+async function fetchViaPost(text) {
+  let eventType = "";
   try {
-    // event.parsed 可能是对象或字符串
-    const data = typeof event.parsed === "object" ? event.parsed : JSON.parse(event.raw.split("data: ")[1] || "{}");
+    const resp = await fetch(`/api/plug/${PLUGIN_NAME}/chat`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        message: text,
+        session_id: SESSION_ID,
+      }),
+    });
 
-    if (data.text !== undefined) {
-      // 判断是 thinking 还是 text
-      // bridge SSE 会把 event type 信息丢失，我们需要从 raw 中解析
-      const rawLines = event.raw.split("\n");
-      let eventType = "";
-      for (const line of rawLines) {
-        if (line.startsWith("event: ")) {
-          eventType = line.substring(7).trim();
-          break;
+    if (!resp.ok) {
+      const err = await resp.json();
+      appendError(err.error || `HTTP ${resp.status}`);
+      finishStreaming();
+      return;
+    }
+
+    const reader = resp.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = "";
+
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+
+      buffer += decoder.decode(value, { stream: true });
+      const lines = buffer.split("\n");
+      buffer = lines.pop() || "";
+
+      for (const line of lines) {
+        const trimmed = line.trim();
+        if (!trimmed) continue;
+
+        if (trimmed.startsWith("event: ")) {
+          eventType = trimmed.substring(7).trim();
+        } else if (trimmed.startsWith("data: ")) {
+          const jsonStr = trimmed.substring(6);
+          try {
+            const data = JSON.parse(jsonStr);
+            switch (eventType) {
+              case "token":
+                currentTextContent += data.text || "";
+                updateAssistantContent();
+                break;
+              case "thinking":
+                currentThinkingContent += data.text || "";
+                updateAssistantContent();
+                break;
+              case "done":
+                finishStreaming();
+                return;
+              case "error":
+                appendError(data.error || "未知错误");
+                finishStreaming();
+                return;
+            }
+          } catch {
+            // 非 JSON 数据，跳过
+          }
         }
       }
-
-      if (eventType === "thinking") {
-        currentThinkingContent += data.text;
-        updateAssistantContent();
-      } else if (eventType === "token") {
-        currentTextContent += data.text;
-        updateAssistantContent();
-      } else if (eventType === "done") {
-        finishStreaming();
-      }
     }
 
-    if (data.error) {
-      appendError(data.error);
-      finishStreaming();
-    }
-  } catch {
-    // 忽略解析错误
+    // 流读取完毕但未收到 done 事件
+    finishStreaming();
+  } catch (err) {
+    appendError(`请求失败: ${err.message}`);
+    finishStreaming();
   }
 }
 
@@ -136,80 +149,20 @@ function updateAssistantContent() {
   scrollToBottom();
 }
 
-// POST 回退方案（bridge.subscribeSSE 可能不支持自定义 body）
-async function fetchViaPost(text) {
-  try {
-    const resp = await fetch(`/api/plug/${PLUGIN_NAME}/chat`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        message: text,
-        session_id: getSessionId(),
-      }),
-    });
-
-    if (!resp.ok) {
-      const err = await resp.json();
-      appendError(err.error || `HTTP ${resp.status}`);
-      finishStreaming();
-      return;
-    }
-
-    const reader = resp.body.getReader();
-    const decoder = new TextDecoder();
-    let buffer = "";
-
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done) break;
-
-      buffer += decoder.decode(value, { stream: true });
-      const lines = buffer.split("\n");
-      buffer = lines.pop();
-
-      let eventType = "";
-      for (const line of lines) {
-        if (line.startsWith("event: ")) {
-          eventType = line.substring(7).trim();
-        } else if (line.startsWith("data: ")) {
-          try {
-            const data = JSON.parse(line.substring(6));
-            if (eventType === "token") {
-              currentTextContent += data.text;
-            } else if (eventType === "thinking") {
-              currentThinkingContent += data.text;
-            } else if (eventType === "done") {
-              // handled below
-            } else if (eventType === "error") {
-              appendError(data.error);
-            }
-            updateAssistantContent();
-          } catch {}
-        }
-      }
-    }
-
-    finishStreaming();
-  } catch (err) {
-    appendError(`请求失败: ${err.message}`);
-    finishStreaming();
-  }
-}
-
 // 完成流式输出
 function finishStreaming() {
+  if (!streaming) return; // 防止重复调用
   streaming = false;
   btnSend.disabled = false;
   input.disabled = false;
   input.focus();
   setStatus("● 已连接", false);
 
-  // 移除光标
+  // 移除光标，最终渲染
   if (currentAssistant) {
     const cursor = currentAssistant.querySelector(".cursor");
     if (cursor) cursor.remove();
 
-    // 最终渲染：thinking 折叠 + 正文
     let html = "";
     if (currentThinkingContent) {
       html += `<details><summary class="msg-thinking">💭 思考过程</summary><span class="msg-thinking">${escapeHtml(currentThinkingContent)}</span></details>\n`;
@@ -221,11 +174,6 @@ function finishStreaming() {
   currentAssistant = null;
   currentThinkingContent = "";
   currentTextContent = "";
-
-  // 取消 SSE 订阅
-  try {
-    bridge.unsubscribeSSE();
-  } catch {}
 }
 
 // ── 清空聊天 ───────────────────────────────────────────────────────
@@ -288,12 +236,6 @@ function escapeHtml(str) {
   const div = document.createElement("div");
   div.textContent = str;
   return div.innerHTML;
-}
-
-function getSessionId() {
-  // 使用 bridge 上下文生成稳定 session ID
-  const ctx = bridge.getContext();
-  return ctx?.pluginName || "default";
 }
 
 // ── 常量 ───────────────────────────────────────────────────────────
