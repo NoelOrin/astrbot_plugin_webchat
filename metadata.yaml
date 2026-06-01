@@ -1,4 +1,5 @@
-name: astrbot_plugin_webchat
+nam:: astrbot_plugin_webchat
 description: Web 终端向 QQ 群发送和接收消息
 version: 0.3.0
-author: noelorin
+author: NoelOrin
+repo: https://github.com/noelorin/astrbot_plugin_webchat
