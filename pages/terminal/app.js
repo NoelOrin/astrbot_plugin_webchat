@@ -65,8 +65,9 @@ async function loadSessions() {
     for (const s of sessions) {
       const opt = document.createElement("option");
       opt.value = s.id;
-      const label = s.group_name || s.group_id || s.platform;
-      opt.textContent = `${label} [${s.platform}] (${s.message_count}条)`;
+      const tag = s.is_group ? "群聊" : "私聊";
+      const name = s.group_name || s.group_id || s.platform;
+      opt.textContent = `[${tag}] ${name} (${s.message_count}条)`;
       sessionSelect.appendChild(opt);
     }
 

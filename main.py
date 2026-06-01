@@ -64,6 +64,31 @@ class Plugin(Star):
 
     # ── 消息事件监听 ────────────────────────────────────────────────
 
+    @staticmethod
+    def _get_group_key(umo: str, group_id: str) -> str:
+        """派生群级会话键。私聊保留原始 UMO。"""
+        if not group_id:
+            return umo
+        # 典型格式: "adapter:group_id:user_id" → "adapter:group_id"
+        if umo.count(":") >= 2:
+            return umo.rsplit(":", 1)[0]
+        return umo
+
+    @staticmethod
+    def _extract_group_name(message_obj, group_id: str) -> str:
+        """尝试从消息对象中提取群名。"""
+        try:
+            raw = getattr(message_obj, "raw_message", None)
+            if isinstance(raw, dict):
+                # 部分适配器在 raw_message 中携带群名
+                name = raw.get("group_name", "") or ""
+                if name:
+                    return name
+        except Exception:
+            pass
+        # 群公告等方式可获取群名，此处 fallback 到群号
+        return group_id if group_id else "私聊"
+
     def _register_session(self, umo: str, meta: dict):
         """注册一个新会话到索引。"""
         if umo not in self.session_meta:
@@ -92,15 +117,22 @@ class Plugin(Star):
         if hasattr(event, "adapter"):
             platform = type(event.adapter).__name__
 
-        # 注册会话
-        self._register_session(umo, {
+        # 群聊 → 使用群级键合并会话；私聊 → 保留单个会话
+        session_key = self._get_group_key(umo, group_id)
+        is_group = bool(group_id)
+        group_name = self._extract_group_name(message_obj, group_id) if is_group else ""
+        session_display = group_name if is_group else (sender_name or str(sender_id))
+
+        # 注册会话（群聊只注册一次）
+        self._register_session(session_key, {
             "platform": platform,
             "group_id": group_id,
-            "group_name": group_id or "私聊",
+            "group_name": session_display,
+            "is_group": is_group,
         })
 
         # 追加消息
-        self._append_message(umo, {
+        self._append_message(session_key, {
             "type": "received",
             "sender": sender_name or str(sender_id),
             "sender_id": str(sender_id),
@@ -125,6 +157,7 @@ class Plugin(Star):
                 "platform": meta.get("platform", ""),
                 "group_id": meta.get("group_id", ""),
                 "group_name": meta.get("group_name", ""),
+                "is_group": meta.get("is_group", False),
                 "message_count": len(self.message_logs.get(umo, [])),
             })
         return jsonify({"sessions": sessions})
