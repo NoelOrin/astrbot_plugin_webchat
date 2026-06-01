@@ -1,0 +1,27 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>WebChat Terminal</title>
+    <link rel="stylesheet" href="./style.css" />
+  </head>
+  <body>
+    <div id="app">
+      <div id="header">
+        <span class="title">webchat://terminal</span>
+        <div class="actions">
+          <button id="btn-clear" title="清空聊天">清空</button>
+          <span id="status" class="status">● 已连接</span>
+        </div>
+      </div>
+      <div id="output"></div>
+      <div id="input-area">
+        <span class="prompt">&gt;</span>
+        <input type="text" id="input" placeholder="输入消息..." autocomplete="off" />
+        <button id="btn-send">发送</button>
+      </div>
+    </div>
+    <script type="module" src="./app.js"></script>
+  </body>
+</html>

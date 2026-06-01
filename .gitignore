@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+.env
+*.egg-info/
+.idea/.gitignore
+metadata.yaml
+_conf_schema.json
+.idea/astrbot_plugin_webchat.iml
+.idea/modules.xml
+.idea/vcs.xml
