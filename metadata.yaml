@@ -1,4 +1,4 @@
 name: astrbot_plugin_webchat
-description: 基于 SenseNova API 的终端风格 Web 聊天插件
-version: 0.1.0
+description: Web 终端向 QQ 群发送和接收消息
+version: 0.2.0
 author: noelorin
