@@ -24,12 +24,24 @@ git clone https://github.com/NoelOrin/astrbot_plugin_webchat.git
 
 3. 在插件管理页面启用 `astrbot_plugin_webchat`
 
+## 🖥️ 进入终端页面
+
+1. 打开 AstrBot WebUI
+2. 左侧菜单点击 **「插件」**
+3. 找到 `astrbot_plugin_webchat` 卡片，**点击卡片进入插件详情页**
+4. 详情页顶部会出现 **「Terminal」** Tab，点击即可进入终端界面
+
+页面路径参考：
+
+```
+http://<你的AstrBot地址>/webui#/plugins/astrbot_plugin_webchat
+```
+
 ## 💬 使用
 
-1. 启用插件后，在 AstrBot WebUI 插件卡片中点击进入 **Terminal** 页面
-2. 在顶部下拉框中选择一个 QQ 群会话
-3. 在底部输入框中输入消息，按 **Enter** 或点击 **发送**
-4. 群内收到的消息会实时显示在终端中
+1. 进入 Terminal 页面后，在顶部下拉框中选择一个 QQ 群会话
+2. 在底部输入框中输入消息，按 **Enter** 或点击 **发送**
+3. 群内收到的消息会实时轮询显示在终端中
 
 ### 消息格式
 
