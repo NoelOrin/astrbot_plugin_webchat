@@ -9,7 +9,7 @@ const sessionSelect = document.getElementById("session-select");
 const statusEl = document.getElementById("status");
 
 const PLUGIN_NAME = "astrbot_plugin_webchat";
-const SESSION_ID = crypto.randomUUID?.() || `tab-${Date.now()}`;
+const STORAGE_KEY = `${PLUGIN_NAME}_last_session`;
 
 let currentSession = "";
 let lastTimestamp = 0;
@@ -41,6 +41,7 @@ sessionSelect.addEventListener("change", () => {
   output.innerHTML = "";
   lastTimestamp = 0;
   if (currentSession) {
+    try { localStorage.setItem(STORAGE_KEY, currentSession); } catch {}
     const label = sessionSelect.options[sessionSelect.selectedIndex].text;
     appendSystem(`已切换到: ${label}`);
     loadHistory();
@@ -71,9 +72,16 @@ async function loadSessions() {
       sessionSelect.appendChild(opt);
     }
 
-    // 恢复选中
-    if (prev && sessions.some((s) => s.id === prev)) {
-      sessionSelect.value = prev;
+    // 恢复上次选中的会话，或自动选中第一个
+    const saved = (() => {
+      try { return localStorage.getItem(STORAGE_KEY); } catch { return null; }
+    })();
+    const target = (saved && sessions.some((s) => s.id === saved)) ? saved
+                 : sessions.length > 0 ? sessions[0].id
+                 : "";
+    if (target) {
+      sessionSelect.value = target;
+      sessionSelect.dispatchEvent(new Event("change"));
     }
 
     setStatus(`● ${sessions.length} 个会话`, false);
