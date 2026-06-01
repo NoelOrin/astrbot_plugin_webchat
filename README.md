@@ -1,4 +1,4 @@
-# astrbot_plugin_webchat
+# as:rbot_plugin_webchat
 
 基于 SenseNova API 的 **终端风格 Web 聊天插件**，为 AstrBot 提供一个极客感十足的网页聊天界面。
 
