@@ -17,9 +17,9 @@ PLUGIN_NAME = "astrbot_plugin_webchat"
 
 
 class Plugin(Star):
-    def __init__(self, context: Context, config: AstrBotConfig):
+    def __init__(self, context: Context, config: AstrBotConfig = None):
         super().__init__(context)
-        self.config = config
+        self.config = config or {}
 
         # 每个会话独立的聊天历史 (key = session_id)
         self.histories: dict[str, list[dict]] = {}
