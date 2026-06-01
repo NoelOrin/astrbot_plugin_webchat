@@ -107,7 +107,7 @@ function connectSSE() {
   disconnectSSE();
   try {
     // 尝试标准 SSE 端点
-    sseSource = new EventSource(`/api/plug/${PLUGIN_NAME}/stream`);
+    sseSource = new EventSource(`/api/plug/${PLUGIN_NAME}/stream`, { withCredentials: true });
 
     sseSource.addEventListener("connected", () => {
       setStatus(`● 已连接 (SSE)`, false);
