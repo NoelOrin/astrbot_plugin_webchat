@@ -11,8 +11,12 @@
       <div id="header">
         <span class="title">webchat://terminal</span>
         <div class="actions">
-          <button id="btn-clear" title="清空聊天">清空</button>
-          <span id="status" class="status">● 已连接</span>
+          <select id="session-select">
+            <option value="">-- 选择会话 --</option>
+          </select>
+          <button id="btn-refresh" title="刷新会话">↻</button>
+          <button id="btn-clear" title="清空消息">清空</button>
+          <span id="status" class="status">● 就绪</span>
         </div>
       </div>
       <div id="output"></div>

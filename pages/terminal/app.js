@@ -4,21 +4,23 @@ const output = document.getElementById("output");
 const input = document.getElementById("input");
 const btnSend = document.getElementById("btn-send");
 const btnClear = document.getElementById("btn-clear");
-const status = document.getElementById("status");
+const btnRefresh = document.getElementById("btn-refresh");
+const sessionSelect = document.getElementById("session-select");
+const statusEl = document.getElementById("status");
 
-let streaming = false;
-let currentAssistant = null;
-let currentThinkingContent = "";
-let currentTextContent = "";
-let sseSubscriptionId = null;
+const PLUGIN_NAME = "astrbot_plugin_webchat";
+const SESSION_ID = crypto.randomUUID?.() || `tab-${Date.now()}`;
 
-// 每个标签页唯一 session ID
-const SESSION_ID = crypto.randomUUID?.() || `tab-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+let currentSession = "";
+let lastTimestamp = 0;
+let polling = false;
+let pollTimer = null;
 
 // ── 初始化 ─────────────────────────────────────────────────────────
 
 await bridge.ready();
-appendSystem("webchat:// 终端已就绪。输入消息开始对话。");
+appendSystem("webchat:// 终端已就绪");
+await loadSessions();
 input.focus();
 
 // ── 事件绑定 ───────────────────────────────────────────────────────
@@ -31,180 +33,191 @@ input.addEventListener("keydown", (e) => {
 });
 
 btnSend.addEventListener("click", sendMessage);
-btnClear.addEventListener("click", clearChat);
+btnClear.addEventListener("click", clearMessages);
+btnRefresh.addEventListener("click", loadSessions);
+
+sessionSelect.addEventListener("change", () => {
+  currentSession = sessionSelect.value;
+  output.innerHTML = "";
+  lastTimestamp = 0;
+  if (currentSession) {
+    const label = sessionSelect.options[sessionSelect.selectedIndex].text;
+    appendSystem(`已切换到: ${label}`);
+    loadHistory();
+    startPolling();
+  } else {
+    appendSystem("请选择一个会话");
+    stopPolling();
+  }
+});
+
+// ── 加载会话列表 ────────────────────────────────────────────────────
+
+async function loadSessions() {
+  try {
+    const data = await bridge.apiGet("sessions");
+    const sessions = data.sessions || [];
+
+    // 保留当前选中
+    const prev = sessionSelect.value;
+    sessionSelect.innerHTML = '<option value="">-- 选择会话 --</option>';
+
+    for (const s of sessions) {
+      const opt = document.createElement("option");
+      opt.value = s.id;
+      const label = s.group_name || s.group_id || s.platform;
+      opt.textContent = `${label} [${s.platform}] (${s.message_count}条)`;
+      sessionSelect.appendChild(opt);
+    }
+
+    // 恢复选中
+    if (prev && sessions.some((s) => s.id === prev)) {
+      sessionSelect.value = prev;
+    }
+
+    setStatus(`● ${sessions.length} 个会话`, false);
+  } catch (err) {
+    setStatus("● 加载失败", true);
+    console.error("加载会话失败:", err);
+  }
+}
+
+// ── 加载历史消息 ────────────────────────────────────────────────────
+
+async function loadHistory() {
+  if (!currentSession) return;
+  try {
+    const data = await bridge.apiGet("history", {
+      session_id: currentSession,
+    });
+    const messages = data.messages || [];
+    for (const msg of messages) {
+      appendMessage(msg);
+      if (msg.timestamp > lastTimestamp) {
+        lastTimestamp = msg.timestamp;
+      }
+    }
+    scrollToBottom();
+  } catch (err) {
+    console.error("加载历史失败:", err);
+  }
+}
 
 // ── 发送消息 ───────────────────────────────────────────────────────
 
 async function sendMessage() {
   const text = input.value.trim();
-  if (!text || streaming) return;
+  if (!text || !currentSession) {
+    if (!currentSession) appendSystem("请先选择一个会话");
+    return;
+  }
 
   input.value = "";
-  appendUser(text);
-
-  streaming = true;
-  setStatus("● 生成中...", false);
   btnSend.disabled = true;
-  input.disabled = true;
 
-  // 创建助手消息容器
-  currentAssistant = appendAssistant("");
-  currentThinkingContent = "";
-  currentTextContent = "";
-
-  // bridge.subscribeSSE 不支持自定义 POST body，直接用 fetch
-  await fetchViaPost(text);
-}
-
-// POST 流式请求
-async function fetchViaPost(text) {
-  let eventType = "";
   try {
-    const resp = await fetch(`/api/plug/${PLUGIN_NAME}/chat`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        message: text,
-        session_id: SESSION_ID,
-      }),
+    const resp = await bridge.apiPost("send", {
+      session_id: currentSession,
+      message: text,
     });
 
-    if (!resp.ok) {
-      const err = await resp.json();
-      appendError(err.error || `HTTP ${resp.status}`);
-      finishStreaming();
-      return;
+    if (resp.error) {
+      appendError(resp.error);
+    } else {
+      appendMessage({
+        type: "sent",
+        sender: "Terminal",
+        content: text,
+        timestamp: Date.now() / 1000,
+      });
+      scrollToBottom();
     }
-
-    const reader = resp.body.getReader();
-    const decoder = new TextDecoder();
-    let buffer = "";
-
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done) break;
-
-      buffer += decoder.decode(value, { stream: true });
-      const lines = buffer.split("\n");
-      buffer = lines.pop() || "";
-
-      for (const line of lines) {
-        const trimmed = line.trim();
-        if (!trimmed) continue;
-
-        if (trimmed.startsWith("event: ")) {
-          eventType = trimmed.substring(7).trim();
-        } else if (trimmed.startsWith("data: ")) {
-          const jsonStr = trimmed.substring(6);
-          try {
-            const data = JSON.parse(jsonStr);
-            switch (eventType) {
-              case "token":
-                currentTextContent += data.text || "";
-                updateAssistantContent();
-                break;
-              case "thinking":
-                currentThinkingContent += data.text || "";
-                updateAssistantContent();
-                break;
-              case "done":
-                finishStreaming();
-                return;
-              case "error":
-                appendError(data.error || "未知错误");
-                finishStreaming();
-                return;
-            }
-          } catch {
-            // 非 JSON 数据，跳过
-          }
-        }
-      }
-    }
-
-    // 流读取完毕但未收到 done 事件
-    finishStreaming();
   } catch (err) {
-    appendError(`请求失败: ${err.message}`);
-    finishStreaming();
+    appendError(`发送失败: ${err.message || err}`);
+  } finally {
+    btnSend.disabled = false;
+    input.focus();
   }
 }
 
-// 更新助手消息显示
-function updateAssistantContent() {
-  if (!currentAssistant) return;
-  let html = "";
+// ── 清空消息 ───────────────────────────────────────────────────────
 
-  if (currentThinkingContent) {
-    html += `<span class="msg-thinking">💭 ${escapeHtml(currentThinkingContent)}</span>\n`;
-  }
-
-  html += escapeHtml(currentTextContent);
-
-  if (streaming) {
-    html += '<span class="cursor"></span>';
-  }
-
-  currentAssistant.innerHTML = html;
-  scrollToBottom();
-}
-
-// 完成流式输出
-function finishStreaming() {
-  if (!streaming) return; // 防止重复调用
-  streaming = false;
-  btnSend.disabled = false;
-  input.disabled = false;
-  input.focus();
-  setStatus("● 已连接", false);
-
-  // 移除光标，最终渲染
-  if (currentAssistant) {
-    const cursor = currentAssistant.querySelector(".cursor");
-    if (cursor) cursor.remove();
-
-    let html = "";
-    if (currentThinkingContent) {
-      html += `<details><summary class="msg-thinking">💭 思考过程</summary><span class="msg-thinking">${escapeHtml(currentThinkingContent)}</span></details>\n`;
-    }
-    html += escapeHtml(currentTextContent);
-    currentAssistant.innerHTML = html || "(空回复)";
-  }
-
-  currentAssistant = null;
-  currentThinkingContent = "";
-  currentTextContent = "";
-}
-
-// ── 清空聊天 ───────────────────────────────────────────────────────
-
-async function clearChat() {
+async function clearMessages() {
   try {
-    await bridge.apiPost("clear", {});
+    await bridge.apiPost("clear", {
+      session_id: currentSession || "",
+    });
     output.innerHTML = "";
-    appendSystem("聊天记录已清空。");
+    lastTimestamp = 0;
+    appendSystem("消息已清空");
   } catch {
     appendError("清空失败");
   }
 }
 
-// ── DOM 操作 ───────────────────────────────────────────────────────
+// ── 轮询新消息 ─────────────────────────────────────────────────────
 
-function appendUser(text) {
-  const div = document.createElement("div");
-  div.className = "msg msg-user";
-  div.textContent = text;
-  output.appendChild(div);
-  scrollToBottom();
+function startPolling() {
+  stopPolling();
+  polling = true;
+  pollTimer = setInterval(pollNewMessages, 2000);
 }
 
-function appendAssistant(text) {
+function stopPolling() {
+  polling = false;
+  if (pollTimer) {
+    clearInterval(pollTimer);
+    pollTimer = null;
+  }
+}
+
+async function pollNewMessages() {
+  if (!currentSession || !polling) return;
+  try {
+    const data = await bridge.apiGet("history", {
+      session_id: currentSession,
+      since: lastTimestamp,
+    });
+    const messages = data.messages || [];
+    for (const msg of messages) {
+      appendMessage(msg);
+      if (msg.timestamp > lastTimestamp) {
+        lastTimestamp = msg.timestamp;
+      }
+    }
+    if (messages.length) scrollToBottom();
+  } catch {
+    // 静默失败
+  }
+}
+
+// ── DOM 操作 ───────────────────────────────────────────────────────
+
+function appendMessage(msg) {
   const div = document.createElement("div");
-  div.className = "msg msg-assistant";
-  div.innerHTML = text ? escapeHtml(text) : '<span class="cursor"></span>';
+  const time = formatTime(msg.timestamp);
+
+  if (msg.type === "sent") {
+    div.className = "msg msg-sent";
+    div.textContent = `[${time}] >>> ${msg.content}`;
+  } else if (msg.type === "received") {
+    div.className = "msg msg-received";
+    const sender = msg.sender || "unknown";
+    div.textContent = `[${time}] <${sender}> ${msg.content}`;
+  } else {
+    div.className = "msg msg-system";
+    div.textContent = `[${time}] ${msg.content}`;
+  }
+
+  output.appendChild(div);
+}
+
+function appendSystem(text) {
+  const div = document.createElement("div");
+  div.className = "msg msg-system";
+  div.textContent = `--- ${text} ---`;
   output.appendChild(div);
   scrollToBottom();
-  return div;
 }
 
 function appendError(text) {
@@ -215,29 +228,21 @@ function appendError(text) {
   scrollToBottom();
 }
 
-function appendSystem(text) {
-  const div = document.createElement("div");
-  div.className = "msg msg-system";
-  div.textContent = text;
-  output.appendChild(div);
-  scrollToBottom();
-}
-
 function setStatus(text, isError) {
-  status.textContent = text;
-  status.className = isError ? "status error" : "status";
+  statusEl.textContent = text;
+  statusEl.className = isError ? "status error" : "status";
 }
 
 function scrollToBottom() {
   output.scrollTop = output.scrollHeight;
 }
 
-function escapeHtml(str) {
-  const div = document.createElement("div");
-  div.textContent = str;
-  return div.innerHTML;
+function formatTime(ts) {
+  if (!ts) return "??:??";
+  const d = new Date(ts * 1000);
+  return d.toLocaleTimeString("zh-CN", {
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+  });
 }
-
-// ── 常量 ───────────────────────────────────────────────────────────
-
-const PLUGIN_NAME = "astrbot_plugin_webchat";

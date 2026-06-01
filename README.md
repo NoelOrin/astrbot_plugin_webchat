@@ -1,15 +1,15 @@
-# as:rbot_plugin_webchat
+# astrbot_plugin_webchat
 
-基于 SenseNova API 的 **终端风格 Web 聊天插件**，为 AstrBot 提供一个极客感十足的网页聊天界面。
+通过 **Web 终端** 向 QQ 群发送和接收消息的 AstrBot 插件。
 
 ## ✨ 功能特性
 
-- **终端风格 UI** — 黑底绿字、闪烁光标、命令行交互体验
-- **SSE 流式输出** — 逐 token 实时返回，打字机效果
-- **思维链展示** — 模型推理过程（thinking）可折叠查看
-- **多轮对话** — 自动维护上下文历史，支持配置最大记忆轮数
-- **SenseNova 兼容** — 使用 Anthropic Messages API 格式，支持 `deepseek-v4-flash`、`sensenova-6.7-flash-lite` 等模型
-- **可视化配置** — 通过 AstrBot WebUI 直接配置 API Key、模型、温度等参数
+- **终端风格 UI** — 黑底绿字、极客命令行交互体验
+- **会话发现** — 自动发现 AstrBot 已接入的 QQ 群/私聊会话
+- **消息发送** — 从终端直接向 QQ 群发送消息
+- **消息接收** — 实时轮询显示群内收到的消息
+- **消息历史** — 保留每个会话的收发记录
+- **无需配置** — 直接使用 AstrBot 已接入的消息平台
 
 ## 🚀 安装
 
@@ -17,66 +17,79 @@
 
 ```bash
 cd /path/to/AstrBot/data/plugins
-git clone https://github.com/your-username/astrbot_plugin_webchat.git
+git clone https://github.com/NoelOrin/astrbot_plugin_webchat.git
 ```
 
 2. 重启 AstrBot 或在 WebUI 中重新加载插件
 
 3. 在插件管理页面启用 `astrbot_plugin_webchat`
 
-## ⚙️ 配置
-
-在 AstrBot WebUI 的插件配置页面中填写：
-
-| 配置项 | 类型 | 默认值 | 说明 |
-|--------|------|--------|------|
-| `api_key` | string | — | SenseNova API Key（必填） |
-| `base_url` | string | `https://token.sensenova.cn/v1/messages` | API 端点地址 |
-| `model` | string | `deepseek-v4-flash` | 模型 ID |
-| `system_prompt` | text | `你是一个严谨的助手` | 系统提示词 |
-| `max_tokens` | int | `4096` | 最大输出 Token 数 |
-| `temperature` | float | `0.7` | 采样温度，范围 [0, 2) |
-| `max_history` | int | `20` | 最大上下文轮数 |
-
-### 获取 API Key
-
-前往 [SenseNova 开放平台](https://token.sensenova.cn/) 注册并创建 API Key。
-
 ## 💬 使用
 
 1. 启用插件后，在 AstrBot WebUI 插件卡片中点击进入 **Terminal** 页面
-2. 在输入框中输入消息，按 **Enter** 或点击 **发送**
-3. 模型回复会以流式逐字显示，思考过程可点击折叠查看
-4. 点击 **清空** 按钮可重置聊天记录
+2. 在顶部下拉框中选择一个 QQ 群会话
+3. 在底部输入框中输入消息，按 **Enter** 或点击 **发送**
+4. 群内收到的消息会实时显示在终端中
+
+### 消息格式
+
+```
+--- webchat:// 终端已就绪 ---
+--- 已切换到: 123456789 [AIOCQHTTP] ---
+[14:30:01] <张三> 大家好
+[14:30:15] >>> 你好！
+[14:30:20] <李四> 欢迎
+```
+
+- `[时间] >>> 消息` — 你发送的消息（右侧蓝色）
+- `[时间] <发送者> 消息` — 收到的消息（左侧灰色）
+
+## ⚙️ 配置
+
+在 AstrBot WebUI 的插件配置页面中：
+
+| 配置项 | 类型 | 默认值 | 说明 |
+|--------|------|--------|------|
+| `max_log_per_session` | int | `200` | 每个会话最大消息记录数 |
 
 ## 📁 项目结构
 
 ```
 astrbot_plugin_webchat/
-├── main.py              # 后端核心：插件逻辑 + SSE 流式 API
-├── _conf_schema.json    # 配置项 Schema 定义
-├── metadata.yaml        # 插件元数据（名称、版本、作者）
+├── main.py              # 后端：消息捕获 + Web API
+├── _conf_schema.json    # 配置项 Schema
+├── metadata.yaml        # 插件元数据
 ├── .gitignore
+├── README.md
+├── docs/                # AstrBot 插件开发文档参考
 └── pages/
     └── terminal/
         ├── index.html   # 终端 UI 页面
-        ├── style.css    # 黑客终端风格样式
-        └── app.js       # 前端逻辑（bridge SDK + SSE 流式接收）
+        ├── style.css    # 终端风格样式
+        └── app.js       # 前端逻辑（轮询 + 消息渲染）
 ```
 
 ### 后端 API
 
 | 端点 | 方法 | 说明 |
 |------|------|------|
-| `/api/plug/astrbot_plugin_webchat/chat` | POST | 发送消息，返回 SSE 流式响应 |
-| `/api/plug/astrbot_plugin_webchat/history` | GET | 获取聊天历史 |
-| `/api/plug/astrbot_plugin_webchat/clear` | POST | 清空聊天历史 |
+| `/api/plug/astrbot_plugin_webchat/sessions` | GET | 获取可用会话列表 |
+| `/api/plug/astrbot_plugin_webchat/send` | POST | 向指定会话发送消息 |
+| `/api/plug/astrbot_plugin_webchat/history` | GET | 获取消息历史（支持 `since` 参数增量拉取） |
+| `/api/plug/astrbot_plugin_webchat/clear` | POST | 清空消息历史 |
+
+### 工作原理
+
+1. **消息捕获** — 插件注册 `@filter.event_message_type(ALL)` 事件监听器，捕获所有经过 AstrBot 的消息
+2. **会话注册** — 通过 `event.unified_msg_origin` 自动发现并注册新会话
+3. **消息发送** — 调用 `context.send_message(umo, chain)` 通过 AstrBot 向目标平台发送消息
+4. **前端轮询** — 每 2 秒拉取新消息，支持增量拉取（`since` 时间戳）
 
 ### 技术栈
 
-- **后端**：Python、Quart（AstrBot 内置）、aiohttp
+- **后端**：Python、Quart（AstrBot 内置）
 - **前端**：原生 HTML/CSS/JS、AstrBot Bridge SDK
-- **API**：SenseNova Anthropic Messages API 兼容接口（SSE 流式）
+- **消息平台**：通过 AstrBot 适配器接入（OneBot v11、QQ Official 等）
 
 ## 📄 License
 

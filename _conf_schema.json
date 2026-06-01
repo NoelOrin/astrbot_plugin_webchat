@@ -1,0 +1,8 @@
+{
+  "max_log_per_session": {
+    "description": "每个会话最大消息记录数",
+    "type": "int",
+    "default": 200,
+    "hint": "超出后自动裁剪最早的消息"
+  }
+}
