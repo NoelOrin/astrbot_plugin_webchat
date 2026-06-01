@@ -2,13 +2,14 @@
 astrbot_plugin_webchat — Web 终端向 QQ 群发送/接收消息
 """
 
+import asyncio
 import json
 import logging
 import os
 import sqlite3
 import time
 
-from quart import jsonify, request
+from quart import jsonify, request, Response
 
 from astrbot.api import AstrBotConfig
 from astrbot.api.event import filter, AstrMessageEvent
@@ -40,6 +41,10 @@ class Plugin(Star):
         self._init_db()
         self._load_sessions_from_db()
 
+        # SSE 推送客户端  client_id -> asyncio.Queue
+        self._sse_clients: dict[str, asyncio.Queue] = {}
+        self._sse_counter = 0
+
         # 注册 Web API
         context.register_web_api(
             f"/{PLUGIN_NAME}/sessions",
@@ -65,6 +70,28 @@ class Plugin(Star):
             ["POST"],
             "清空消息历史",
         )
+        context.register_web_api(
+            f"/{PLUGIN_NAME}/stream",
+            self.api_stream,
+            ["GET"],
+            "SSE 实时消息推送",
+        )
+
+        # 直接注册到 Quart 路由，确保 SSE 流式响应不被包装
+        try:
+            app = context.get_web_app() if hasattr(context, "get_web_app") else None
+            if app is None:
+                app = getattr(context, "quart_app", None) or getattr(context, "app", None)
+            if app is not None:
+                app.add_url_rule(
+                    f"/{PLUGIN_NAME}/stream",
+                    f"{PLUGIN_NAME}_stream",
+                    self._stream_view,
+                    methods=["GET"],
+                )
+                logger.info("SSE stream 路由已注册到 Quart")
+        except Exception as e:
+            logger.debug(f"Quart 路由注册跳过: {e}")
 
         logger.info(f"astrbot_plugin_webchat 已加载 (db: {self.db_path})")
 
@@ -85,6 +112,7 @@ class Plugin(Star):
                     group_id TEXT NOT NULL DEFAULT '',
                     group_name TEXT NOT NULL DEFAULT '',
                     is_group INTEGER NOT NULL DEFAULT 0,
+                    send_target TEXT NOT NULL DEFAULT '',
                     display_order INTEGER NOT NULL DEFAULT 0
                 );
                 CREATE TABLE IF NOT EXISTS messages (
@@ -110,8 +138,15 @@ class Plugin(Star):
     def _load_sessions_from_db(self):
         conn = self._get_db()
         try:
+            # 兼容旧库：补 send_target 列
+            try:
+                conn.execute("SELECT send_target FROM sessions LIMIT 0")
+            except sqlite3.OperationalError:
+                conn.execute("ALTER TABLE sessions ADD COLUMN send_target TEXT NOT NULL DEFAULT ''")
+                conn.commit()
+
             rows = conn.execute(
-                "SELECT id, platform, group_id, group_name, is_group "
+                "SELECT id, platform, group_id, group_name, is_group, send_target "
                 "FROM sessions ORDER BY display_order"
             ).fetchall()
             for r in rows:
@@ -121,6 +156,7 @@ class Plugin(Star):
                     "group_id": r["group_id"],
                     "group_name": r["group_name"],
                     "is_group": bool(r["is_group"]),
+                    "send_target": r["send_target"],
                 }
                 self.session_index.append(sid)
             if rows:
@@ -132,8 +168,8 @@ class Plugin(Star):
         conn = self._get_db()
         try:
             conn.execute(
-                "INSERT OR REPLACE INTO sessions (id, platform, group_id, group_name, is_group, display_order) "
-                "VALUES (?, ?, ?, ?, ?, "
+                "INSERT OR REPLACE INTO sessions (id, platform, group_id, group_name, is_group, send_target, display_order) "
+                "VALUES (?, ?, ?, ?, ?, ?, "
                 "COALESCE((SELECT display_order FROM sessions WHERE id = ?), "
                 "(SELECT COALESCE(MAX(display_order), 0) + 1 FROM sessions)))",
                 (
@@ -142,6 +178,7 @@ class Plugin(Star):
                     meta.get("group_id", ""),
                     meta.get("group_name", ""),
                     1 if meta.get("is_group", False) else 0,
+                    meta.get("send_target", ""),
                     sid,
                 ),
             )
@@ -180,9 +217,12 @@ class Plugin(Star):
         conn = self._get_db()
         try:
             if limit > 0:
+                # 取最新 limit 条，再按时间正序返回
                 rows = conn.execute(
+                    "SELECT * FROM ("
                     "SELECT * FROM messages WHERE session_id = ? AND timestamp > ? "
-                    "ORDER BY timestamp LIMIT ?",
+                    "ORDER BY timestamp DESC LIMIT ?"
+                    ") sub ORDER BY timestamp",
                     (session_id, since, limit),
                 ).fetchall()
             else:
@@ -217,16 +257,65 @@ class Plugin(Star):
         finally:
             conn.close()
 
+    # ── SSE 推送 ────────────────────────────────────────────────────────
+
+    async def _sse_broadcast(self, event_type: str, data: dict):
+        """向所有 SSE 客户端广播事件。"""
+        payload = json.dumps(data, ensure_ascii=False)
+        dead: list[str] = []
+        for cid, q in self._sse_clients.items():
+            try:
+                q.put_nowait((event_type, payload))
+            except asyncio.QueueFull:
+                dead.append(cid)
+        for cid in dead:
+            self._sse_clients.pop(cid, None)
+
+    async def _stream_view(self):
+        """SSE 流式端点（直接注册到 Quart 路由）。"""
+        self._sse_counter += 1
+        cid = f"cli-{self._sse_counter}-{id(request)}"
+        q: asyncio.Queue = asyncio.Queue(maxsize=256)
+        self._sse_clients[cid] = q
+        logger.info(f"SSE 客户端连接: {cid}")
+
+        headers = {
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",
+            "Connection": "keep-alive",
+        }
+        return Response(
+            self._sse_generate(cid, q),
+            mimetype="text/event-stream",
+            headers=headers,
+        )
+
+    async def _sse_generate(self, cid: str, q: asyncio.Queue):
+        """SSE 事件生成器。"""
+        try:
+            yield "event: connected\ndata: {}\n\n"
+            while True:
+                try:
+                    event_type, payload = await asyncio.wait_for(q.get(), timeout=15)
+                    yield f"event: {event_type}\ndata: {payload}\n\n"
+                except asyncio.TimeoutError:
+                    yield ": keepalive\n\n"
+        except asyncio.CancelledError:
+            pass
+        finally:
+            self._sse_clients.pop(cid, None)
+            logger.info(f"SSE 客户端断开: {cid}")
+
+    async def api_stream(self):
+        """SSE 推送端点（register_web_api 回退）。"""
+        return await self._stream_view()
+
     # ── 消息事件监听 ────────────────────────────────────────────────
 
     @staticmethod
-    def _get_group_key(umo: str, group_id: str) -> str:
-        """派生群级会话键。私聊保留原始 UMO。"""
-        if not group_id:
-            return umo
-        if umo.count(":") >= 2:
-            return umo.rsplit(":", 1)[0]
-        return umo
+    def _session_key_for_group(group_id: str) -> str:
+        """用 group_id 构造稳定的群级会话键，不依赖 UMO 格式。"""
+        return f"group:{group_id}"
 
     @staticmethod
     def _extract_group_name(message_obj, group_id: str) -> str:
@@ -241,17 +330,32 @@ class Plugin(Star):
             pass
         return group_id if group_id else "私聊"
 
-    def _register_session(self, umo: str, meta: dict):
+    def _register_session(self, session_key: str, meta: dict):
         """注册一个新会话到索引和数据库。"""
-        if umo not in self.session_meta:
-            self.session_meta[umo] = meta
-            self.session_index.append(umo)
-            self._save_session(umo, meta)
-            logger.info(f"发现新会话: {meta.get('group_name', umo)}")
+        if session_key not in self.session_meta:
+            self.session_meta[session_key] = meta
+            self.session_index.append(session_key)
+            self._save_session(session_key, meta)
+            logger.info(f"发现新会话: {meta.get('group_name', session_key)}")
+            # 通知前端有新会话（需要在事件循环中调度）
+            try:
+                loop = asyncio.get_running_loop()
+                loop.create_task(self._sse_broadcast("session", {
+                    "id": session_key,
+                    "platform": meta.get("platform", ""),
+                    "group_id": meta.get("group_id", ""),
+                    "group_name": meta.get("group_name", ""),
+                    "is_group": meta.get("is_group", False),
+                }))
+            except RuntimeError:
+                pass
+        elif meta.get("send_target"):
+            # 更新群聊的发送目标 UMO（取最新到达的）
+            self.session_meta[session_key]["send_target"] = meta["send_target"]
 
-    def _append_message(self, umo: str, msg: dict):
+    def _append_message(self, session_key: str, msg: dict):
         """追加消息到 SQLite。"""
-        self._save_message(umo, msg)
+        self._save_message(session_key, msg)
 
     @filter.event_message_type(filter.EventMessageType.ALL)
     async def on_message(self, event: AstrMessageEvent):
@@ -267,20 +371,38 @@ class Plugin(Star):
         if hasattr(event, "adapter"):
             platform = type(event.adapter).__name__
 
-        # 群聊 → 群级键；私聊 → 保留单个会话
-        session_key = self._get_group_key(umo, group_id)
         is_group = bool(group_id)
-        group_name = self._extract_group_name(message_obj, group_id) if is_group else ""
-        session_display = group_name if is_group else (sender_name or str(sender_id))
+
+        # 群聊 → group_id 做键，所有群成员归同一会话
+        if is_group:
+            session_key = self._session_key_for_group(group_id)
+            group_name = self._extract_group_name(message_obj, group_id)
+            display_name = group_name
+        else:
+            session_key = umo
+            display_name = sender_name or str(sender_id) or "私聊"
 
         self._register_session(session_key, {
             "platform": platform,
             "group_id": group_id,
-            "group_name": session_display,
+            "group_name": display_name,
             "is_group": is_group,
+            "send_target": umo,
         })
 
         self._append_message(session_key, {
+            "type": "received",
+            "sender": sender_name or str(sender_id),
+            "sender_id": str(sender_id),
+            "content": event.message_str,
+            "group_id": group_id,
+            "platform": platform,
+            "timestamp": time.time(),
+        })
+
+        # 推送给 SSE 客户端
+        await self._sse_broadcast("message", {
+            "session_id": session_key,
             "type": "received",
             "sender": sender_name or str(sender_id),
             "sender_id": str(sender_id),
@@ -295,24 +417,28 @@ class Plugin(Star):
     # ── Web API ─────────────────────────────────────────────────────
 
     async def api_sessions(self):
-        """返回所有已发现的会话列表。"""
+        """返回所有会话列表。?with_history=1 附带每个会话的历史消息。"""
+        with_history = request.args.get("with_history", "") == "1"
         sessions = []
-        for umo in self.session_index:
-            meta = self.session_meta.get(umo, {})
-            sessions.append({
-                "id": umo,
+        for session_key in self.session_index:
+            meta = self.session_meta.get(session_key, {})
+            entry = {
+                "id": session_key,
                 "platform": meta.get("platform", ""),
                 "group_id": meta.get("group_id", ""),
                 "group_name": meta.get("group_name", ""),
                 "is_group": meta.get("is_group", False),
-                "message_count": self._count_messages(umo),
-            })
+                "message_count": self._count_messages(session_key),
+            }
+            if with_history:
+                entry["messages"] = self._query_messages(session_key, limit=self.max_log)
+            sessions.append(entry)
         return jsonify({"sessions": sessions})
 
     async def api_send(self):
         """
         向指定会话发送消息。
-        请求体: {"session_id": "umo字符串", "message": "消息内容"}
+        请求体: {"session_id": "会话key", "message": "消息内容"}
         """
         data = await request.get_json()
         if not data:
@@ -326,12 +452,16 @@ class Plugin(Star):
         if not message:
             return jsonify({"error": "消息不能为空"}), 400
 
-        if session_id not in self.session_meta:
+        meta = self.session_meta.get(session_id)
+        if not meta:
             return jsonify({"error": "会话不存在"}), 404
+
+        # 群聊用 send_target（原始 UMO）发送，私聊直接用 session_id
+        send_target = meta.get("send_target") or session_id
 
         try:
             chain = MessageChain().message(message)
-            await self.context.send_message(session_id, chain)
+            await self.context.send_message(send_target, chain)
 
             self._append_message(session_id, {
                 "type": "sent",
