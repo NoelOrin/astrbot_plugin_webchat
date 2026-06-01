@@ -1,0 +1,4 @@
+name: astrbot_plugin_webchat
+description: 基于 SenseNova API 的终端风格 Web 聊天插件
+version: 0.1.0
+author: noelorin
