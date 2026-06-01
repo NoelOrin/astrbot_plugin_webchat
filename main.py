@@ -77,22 +77,6 @@ class Plugin(Star):
             "SSE 实时消息推送",
         )
 
-        # 直接注册到 Quart 路由，确保 SSE 流式响应不被包装
-        try:
-            app = context.get_web_app() if hasattr(context, "get_web_app") else None
-            if app is None:
-                app = getattr(context, "quart_app", None) or getattr(context, "app", None)
-            if app is not None:
-                app.add_url_rule(
-                    f"/{PLUGIN_NAME}/stream",
-                    f"{PLUGIN_NAME}_stream",
-                    self._stream_view,
-                    methods=["GET"],
-                )
-                logger.info("SSE stream 路由已注册到 Quart")
-        except Exception as e:
-            logger.debug(f"Quart 路由注册跳过: {e}")
-
         logger.info(f"astrbot_plugin_webchat 已加载 (db: {self.db_path})")
 
     # ── SQLite ─────────────────────────────────────────────────────────
