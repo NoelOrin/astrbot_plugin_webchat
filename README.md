@@ -4,6 +4,7 @@
 
 ## ✨ 功能特性
 
+- **平台支持：仅 QQ** — OneBot v11（`aiocqhttp`）与 QQ 官方机器人（`qq_official` / `qq_official_webhook`），其它适配器未验证
 - **双向记录** — 不只是收消息：Bot 的回复、指令响应、其他插件主动推送也一并入库，一次对话两半都看得到
 - **富媒体消息** — 图片、@、表情、语音、文件、合并转发按片段保存，图片可点开大图预览
 - **@ 真正生效** — Bot/AI 回复里的 `<mention id="123"/>` 等占位标签会在发送前还原成真实 At 消息段；
@@ -150,7 +151,7 @@ astrbot_plugin_webchat/
 
 - **后端**：Python、Quart（AstrBot 内置）、SQLite（WAL 模式）
 - **前端**：原生 HTML/CSS/JS、ESM 模块、AstrBot Bridge SDK
-- **消息平台**：通过 AstrBot 适配器接入（OneBot v11、QQ Official、Telegram 等）
+- **消息平台**：仅支持 QQ —— OneBot v11（`aiocqhttp`，如 NapCat / LLOneBot）与 QQ 官方机器人（`qq_official` / `qq_official_webhook`）。其它适配器尚未验证，不在支持范围内。
 
 ## 🧪 开发
 

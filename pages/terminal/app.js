@@ -41,6 +41,8 @@ const THEME_KEY = `${PLUGIN_NAME}_theme`;
 const COMPACT_KEY = `${PLUGIN_NAME}_compact`;
 const POLL_INTERVAL_MS = 2500;
 const HISTORY_LIMIT = HISTORY_PAGE_SIZE;
+/** 小窗自动紧凑阈值：必须与 style.css 顶部的 --compact 保持一致。 */
+const COMPACT_MEDIA = "(max-width: 900px), (max-height: 720px)";
 
 const bridge = window.AstrBotPluginView || window.AstrBotPluginPage || null;
 
@@ -87,6 +89,7 @@ const elements = {
   searchResults: document.getElementById("search-results"),
   searchCount: document.getElementById("search-count"),
   searchStatus: document.getElementById("search-status"),
+  btnDiscover: document.getElementById("btn-discover"),
   btnOpenSession: document.getElementById("btn-open-session"),
   btnPin: document.getElementById("btn-pin"),
   btnExport: document.getElementById("btn-export"),
@@ -180,6 +183,7 @@ function bindEvents() {
   elements.messages.addEventListener("scroll", handleMessageScroll, { passive: true });
 
   elements.messageSearch.addEventListener("input", debounce(onSearchInput, 260));
+  elements.btnDiscover.addEventListener("click", runDiscovery);
   elements.btnOpenSession.addEventListener("click", openNewSessionDialog);
   elements.btnPin.addEventListener("click", togglePin);
   elements.btnExport.addEventListener("click", exportSession);
@@ -205,7 +209,7 @@ function bindEvents() {
     if (!readStoredTheme()) applyTheme(event.matches ? "light" : "dark", { persist: false });
   });
 
-  window.matchMedia("(max-width: 720px), (max-height: 620px)").addEventListener("change", (event) => {
+  window.matchMedia(COMPACT_MEDIA).addEventListener("change", (event) => {
     if (readStoredCompact() === null) applyCompactMode(event.matches, { persist: false });
   });
 
@@ -1126,6 +1130,33 @@ async function copyText(text) {
     toast("已复制");
   } catch {
     toast("复制失败，请手动选中文本", "error");
+  }
+}
+
+// ── 自动发现 ────────────────────────────────────────────────
+
+async function runDiscovery() {
+  if (elements.btnDiscover.disabled) return;
+  elements.btnDiscover.disabled = true;
+  try {
+    const data = await bridge.apiPost("discover", {});
+    const result = data?.result || {};
+    const groups = Number(result.groups_created) || 0;
+    const friends = Number(result.friends_created) || 0;
+    const history = Number(result.history_imported) || 0;
+    const errors = Array.isArray(result.errors) ? result.errors : [];
+
+    await loadSessions({ selectInitial: false });
+    if (errors.length) {
+      // 部分来源失败（常见于协议端不支持列表接口），如实提示而不是假装成功
+      toast(`发现完成，但有 ${errors.length} 处失败：${errors[0]}`, "error");
+      return;
+    }
+    toast(`新增群 ${groups}、好友 ${friends}，导入历史 ${history} 条`);
+  } catch (error) {
+    toast(`自动发现失败: ${errorText(error)}`, "error");
+  } finally {
+    elements.btnDiscover.disabled = false;
   }
 }
 

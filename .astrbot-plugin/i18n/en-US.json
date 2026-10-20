@@ -24,6 +24,18 @@
     "parse_bare_at": {
       "description": "Turn typed @nickname / @QQ into real @ mentions",
       "hint": "Resolves @nickname against this session's participants; unresolvable names stay as plain text"
+    },
+    "auto_discover_sessions": {
+      "description": "Auto-discover platform groups and friends on startup",
+      "hint": "Fetches the bot's groups and friends once AstrBot has loaded, so sessions show up without waiting for a new message"
+    },
+    "auto_discover_include_friends": {
+      "description": "Include active friends during discovery",
+      "hint": "Only friends with existing history become sessions, keeping the list manageable; disable to discover groups only"
+    },
+    "import_astrbot_history": {
+      "description": "Import AstrBot's own message history",
+      "hint": "Reads platform_message_history (requires AstrBot's group message persistence) incrementally with a watermark, never duplicating"
     }
   },
   "views": {

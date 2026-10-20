@@ -27,7 +27,7 @@
         const compact =
           savedCompact === "true" || savedCompact === "false"
             ? savedCompact === "true"
-            : window.matchMedia("(max-width: 720px), (max-height: 620px)").matches;
+            : window.matchMedia("(max-width: 900px), (max-height: 720px)").matches;
         document.documentElement.dataset.compact = String(compact);
       })();
     </script>
@@ -96,6 +96,13 @@
             <div class="sidebar-title-row">
               <h2>会话</h2>
               <span id="session-count" class="count-badge">0</span>
+              <button id="btn-discover" class="icon-button sidebar-action" type="button" aria-label="自动发现会话" title="自动发现群/好友并补导入历史">
+                <svg viewBox="0 0 24 24" aria-hidden="true">
+                  <circle cx="11" cy="11" r="7" />
+                  <path d="m20 20-3.5-3.5" />
+                  <path d="M11 8v6M8 11h6" />
+                </svg>
+              </button>
               <button id="btn-open-session" class="icon-button sidebar-action" type="button" aria-label="新建会话" title="新建会话">
                 <svg viewBox="0 0 24 24" aria-hidden="true">
                   <path d="M12 5v14M5 12h14" />

@@ -28,5 +28,23 @@
     "type": "bool",
     "default": true,
     "hint": "按本会话参与者把 @昵称 解析成 QQ 号；查不到时保留 @昵称 原文"
+  },
+  "auto_discover_sessions": {
+    "description": "启动时自动发现平台群/好友",
+    "type": "bool",
+    "default": true,
+    "hint": "AstrBot 加载完成后拉取机器人所在群与好友列表，无需等群里有新消息就能在终端看到会话"
+  },
+  "auto_discover_include_friends": {
+    "description": "自动发现时包含活跃好友",
+    "type": "bool",
+    "default": true,
+    "hint": "仅对“有过历史记录”的好友建会话，避免上千好友把列表撑爆；关闭则只发现群"
+  },
+  "import_astrbot_history": {
+    "description": "导入 AstrBot 自身的历史消息",
+    "type": "bool",
+    "default": true,
+    "hint": "读取 platform_message_history（需在 AstrBot 开启“持久化群聊消息记录”），按水位增量导入，不会重复"
   }
 }

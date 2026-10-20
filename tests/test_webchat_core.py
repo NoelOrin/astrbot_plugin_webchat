@@ -11,6 +11,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from webchat_core import (  # noqa: E402
     MessageStore,
+    astrbot_history_to_message,
     clamp_int,
     coerce_bool,
     coerce_float,
@@ -246,6 +247,77 @@ def test_preview_prefers_segments_then_content():
     assert preview_of({"segments": [{"type": "text", "text": "hi"}]}) == "hi"
     assert preview_of({"segments": [], "content": "fallback"}) == "fallback"
     assert preview_of({}) == "[非文本消息]"
+
+
+# ── AstrBot 历史记录 → 本插件消息 ─────────────────────────
+
+
+def test_astrbot_history_maps_plain_at_and_reply():
+    """AstrBot platform_message_history 的 content 结构要能无损映射。"""
+    message = astrbot_history_to_message(
+        {
+            "id": 7,
+            "created_at": "2026-10-20 03:00:00",
+            "sender_id": "u1",
+            "sender_name": "小明",
+            "content": {
+                "type": "user",
+                "message": [
+                    {"type": "plain", "text": "你好"},
+                    {"type": "at", "user_id": "9", "name": "小红"},
+                    {"type": "reply", "message_id": "55", "sender_name": "张三", "text": "原文"},
+                ],
+            },
+        }
+    )
+    assert message["type"] == "received"
+    assert message["sender"] == "小明"
+    assert message["sender_id"] == "u1"
+    assert message["content"] == "你好@小红[引用 原文]"
+    assert [s["type"] for s in message["segments"]] == ["text", "at", "reply"]
+    assert message["segments"][1] == {"type": "at", "target": "9", "text": "小红"}
+    assert message["platform_message_id"] == "astrbot:7"
+    assert message["timestamp"] > 0
+
+
+def test_astrbot_history_bot_role_becomes_bot_message():
+    message = astrbot_history_to_message(
+        {"id": 1, "content": {"type": "bot", "message": [{"type": "plain", "text": "我在"}]}}
+    )
+    assert message["type"] == "bot"
+    assert message["content"] == "我在"
+
+
+def test_astrbot_history_degrades_on_bad_input():
+    assert astrbot_history_to_message(None) is None
+    assert astrbot_history_to_message({}) is None
+    assert astrbot_history_to_message({"content": {}}) is None
+    assert astrbot_history_to_message({"content": {"message": []}}) is None
+    # 未知 part 类型降级成文本，不静默丢信息
+    message = astrbot_history_to_message(
+        {"id": 3, "content": {"type": "user", "message": [{"type": "weird"}]}}
+    )
+    assert message["segments"][0]["type"] == "text"
+
+
+def test_astrbot_history_timestamp_parsing():
+    """created_at 是 naive UTC datetime，要转成合理的 unix 秒。"""
+    naive = astrbot_history_to_message(
+        {"id": 1, "created_at": "2026-10-20 03:00:00", "content": {"type": "user",
+         "message": [{"type": "plain", "text": "x"}]}}
+    )
+    assert 1_700_000_000 < naive["timestamp"] < 2_000_000_000
+    # 已经是 unix 秒就直接用
+    epoch = astrbot_history_to_message(
+        {"id": 2, "created_at": 1_700_000_000, "content": {"type": "user",
+         "message": [{"type": "plain", "text": "x"}]}}
+    )
+    assert epoch["timestamp"] == 1_700_000_000
+    # 缺失/坏值不崩，回退当前时间
+    missing = astrbot_history_to_message(
+        {"id": 3, "content": {"type": "user", "message": [{"type": "plain", "text": "x"}]}}
+    )
+    assert missing["timestamp"] > 0
 
 
 # ── 存储：建表与写入 ──────────────────────────────────────
@@ -583,6 +655,50 @@ def test_short_names_are_not_misidentified():
 
     segments = serialize_chain([Format(), Surface()])
     assert all(s["type"] == "other" for s in segments)
+
+
+# ── 导入水位（幂等） ──────────────────────────────────────
+
+
+def test_import_watermark_roundtrip(store):
+    store.init_schema()
+    assert store.get_import_watermark("aiocqhttp-inst", "umo-x") == 0
+    store.set_import_watermark("aiocqhttp-inst", "umo-x", 42)
+    assert store.get_import_watermark("aiocqhttp-inst", "umo-x") == 42
+    # 水位只升不降，避免乱序历史把已导入的部分重新拉一遍
+    store.set_import_watermark("aiocqhttp-inst", "umo-x", 10)
+    assert store.get_import_watermark("aiocqhttp-inst", "umo-x") == 42
+    store.set_import_watermark("aiocqhttp-inst", "umo-x", 99)
+    assert store.get_import_watermark("aiocqhttp-inst", "umo-x") == 99
+
+
+def test_import_watermark_is_per_scope(store):
+    store.init_schema()
+    store.set_import_watermark("p1", "umo-a", 5)
+    assert store.get_import_watermark("p1", "umo-b") == 0
+    assert store.get_import_watermark("p2", "umo-a") == 0
+
+
+def test_has_astrbot_message_detects_duplicates(store):
+    store.init_schema()
+    store.add_message(
+        "group:1",
+        {
+            "content": "你好",
+            "sender_id": "u1",
+            "platform_message_id": "astrbot:7",
+            "timestamp": 1000.0,
+        },
+    )
+    assert store.has_astrbot_message("group:1", 7) is True
+    assert store.has_astrbot_message("group:1", 8) is False
+    assert store.has_astrbot_message("group:2", 7) is False
+
+
+def test_has_astrbot_message_ignores_empty_marker(store):
+    store.init_schema()
+    store.add_message("group:1", {"content": "x", "timestamp": 1.0})
+    assert store.has_astrbot_message("group:1", 0) is False
 
 
 # ── 检索：FTS5 + LIKE 双路径 ──────────────────────────────

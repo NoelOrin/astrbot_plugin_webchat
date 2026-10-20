@@ -123,6 +123,14 @@ def _install_fake_astrbot():
 
             return wrapper
 
+        @staticmethod
+        def on_astrbot_loaded(*args, **kwargs):
+            def wrapper(fn):
+                fn._is_astrbot_loaded = True
+                return fn
+
+            return wrapper
+
     class MessageChain:
         def __init__(self):
             self.chain = []
@@ -197,6 +205,8 @@ class FakeContext:
         self.routes = {}
         self.sent = []
         self.platform_manager = types.SimpleNamespace(get_insts=lambda: [])
+        # AstrBot 自身的消息历史管理器（自动导入用）
+        self.message_history_manager = FakeHistoryManager()
 
     def register_web_api(self, path, handler, methods, desc):
         self.routes[path] = (handler, methods)
@@ -205,7 +215,51 @@ class FakeContext:
         self.sent.append((target, chain))
 
     def get_platform_inst(self, platform_id):
-        raise RuntimeError("不在测试范围内")
+        for platform in self.platform_manager.get_insts():
+            if platform.meta().id == platform_id:
+                return platform
+        raise RuntimeError("平台实例不存在")
+
+
+class FakeHistoryManager:
+    """stand-in for PlatformMessageHistoryManager：按 (platform_id, user_id) 存历史。"""
+
+    def __init__(self):
+        self.rows = {}
+
+    def seed(self, platform_id, user_id, rows):
+        self.rows[(platform_id, user_id)] = list(rows)
+
+    async def get(self, platform_id, user_id, page=1, page_size=200):
+        return list(self.rows.get((platform_id, user_id), []))
+
+
+class FakePlatform:
+    """假平台实例：模拟 aiocqhttp 的 get_group_list / get_friend_list。"""
+
+    def __init__(self, platform_id, adapter="aiocqhttp", groups=None, friends=None):
+        self._platform_id = platform_id
+        self._adapter = adapter
+        self.groups = groups or []
+        self.friends = friends or []
+        self.calls = []
+
+    def meta(self):
+        return types.SimpleNamespace(id=self._platform_id, name=self._adapter, type=self._adapter)
+
+    def get_client(self):
+        platform = self
+
+        class _Api:
+            async def call_action(self, action, **kwargs):
+                platform.calls.append(action)
+                if action == "get_group_list":
+                    return platform.groups
+                if action == "get_friend_list":
+                    return platform.friends
+                return []
+
+        return types.SimpleNamespace(api=_Api())
 
 
 @pytest.fixture()
@@ -625,3 +679,179 @@ def test_plugin_loads_on_host_without_decorating_hook(tmp_path, monkeypatch):
 
     # 钩子被降级成空装饰器后，方法仍然存在但不再被注册
     assert not getattr(instance.on_before_send, "_is_decorating_result", False)
+
+
+# ── 自动发现：平台群/好友 + AstrBot 历史导入 ──────────────
+
+
+def _plugin_with_platform(groups=None, friends=None, config=None):
+    """建一个带假平台实例的插件，返回 (plugin, platform)。"""
+    _install_fake_astrbot()
+    import importlib
+    import tempfile
+
+    sys.modules.pop("main", None)
+    main = importlib.import_module("main")
+    main._resolve_data_dir = lambda: tempfile.mkdtemp()
+
+    platform = FakePlatform(
+        "aiocqhttp-inst",
+        groups=groups if groups is not None else [
+            {"group_id": 111, "group_name": "测试群"},
+            {"group_id": 222, "group_name": "另一个群"},
+        ],
+        friends=friends if friends is not None else [{"user_id": 9, "nickname": "好友甲"}],
+    )
+    ctx = FakeContext()
+    ctx.platform_manager = types.SimpleNamespace(get_insts=lambda: [platform])
+    return main.Plugin(ctx, config or {}), platform, ctx
+
+
+def test_discover_creates_group_sessions_without_any_message():
+    """群无需等新消息，启动就建好会话。"""
+    plugin, _, _ = _plugin_with_platform()
+
+    result = _run(plugin.discover_and_import())
+
+    assert "group:111" in plugin.session_index
+    assert "group:222" in plugin.session_index
+    assert plugin.session_meta["group:111"]["peer_name"] == "测试群"
+    assert result["groups_created"] == 2
+
+
+def test_discover_sets_adapter_name_not_instance_id():
+    """platform 字段必须是适配器名，否则联系人关联与 @ 解析会对不上。"""
+    plugin, _, _ = _plugin_with_platform()
+
+    _run(plugin.discover_and_import())
+
+    meta = plugin.session_meta["group:111"]
+    assert meta["platform"] == "aiocqhttp"
+    assert meta["platform_id"] == "aiocqhttp-inst"
+    assert meta["send_target"] == "aiocqhttp-inst:GroupMessage:111"
+
+
+def test_discover_skips_inactive_friends():
+    """好友按活跃度：没有历史记录就不建会话。"""
+    plugin, _, ctx = _plugin_with_platform(friends=[{"user_id": 9, "nickname": "好友甲"}])
+
+    _run(plugin.discover_and_import())
+
+    assert not any(key.startswith("aiocqhttp-inst:FriendMessage") for key in plugin.session_index)
+
+
+def test_discover_creates_active_friend_from_history():
+    """好友有 AstrBot 历史就说明活跃过，要建会话。"""
+    plugin, _, ctx = _plugin_with_platform(friends=[{"user_id": 9, "nickname": "好友甲"}])
+    ctx.message_history_manager.seed(
+        "aiocqhttp-inst", "aiocqhttp-inst:FriendMessage:9",
+        [{"id": 3, "created_at": 1700000000, "sender_id": "9", "sender_name": "好友甲",
+          "content": {"type": "user", "message": [{"type": "plain", "text": "老朋友"}]}}],
+    )
+
+    _run(plugin.discover_and_import())
+
+    key = "aiocqhttp-inst:FriendMessage:9"
+    assert key in plugin.session_index
+    assert plugin.session_meta[key]["peer_name"] == "好友甲"
+
+
+def test_discover_can_be_disabled():
+    plugin, platform, _ = _plugin_with_platform(config={"auto_discover_sessions": False})
+
+    _run(plugin.discover_and_import())
+
+    assert plugin.session_index == []
+    assert platform.calls == []
+
+
+def test_import_history_maps_messages_and_is_idempotent():
+    """同一批历史导入两次不能重复入库。"""
+    plugin, _, ctx = _plugin_with_platform()
+    ctx.message_history_manager.seed(
+        "aiocqhttp-inst", "aiocqhttp-inst:GroupMessage:111",
+        [
+            {"id": 1, "created_at": 1700000000, "sender_id": "u1", "sender_name": "小明",
+             "content": {"type": "user", "message": [{"type": "plain", "text": "第一条"}]}},
+            {"id": 2, "created_at": 1700000060, "sender_id": "bot", "sender_name": "bot",
+             "content": {"type": "bot", "message": [{"type": "plain", "text": "回复"}]}},
+        ],
+    )
+
+    _run(plugin.discover_and_import())
+    first = [m["content"] for m in plugin.store.query_messages("group:111")]
+    assert first == ["第一条", "回复"]
+    assert [m["type"] for m in plugin.store.query_messages("group:111")] == ["received", "bot"]
+
+    _run(plugin.discover_and_import())
+    second = [m["content"] for m in plugin.store.query_messages("group:111")]
+    assert second == first, "重复导入会破坏历史"
+
+
+def test_import_history_incremental_after_watermark():
+    """水位之后新增的旧记录要能补进来。"""
+    plugin, _, ctx = _plugin_with_platform()
+    manager = ctx.message_history_manager
+    manager.seed(
+        "aiocqhttp-inst", "aiocqhttp-inst:GroupMessage:111",
+        [{"id": 1, "created_at": 1700000000, "sender_id": "u1", "sender_name": "小明",
+          "content": {"type": "user", "message": [{"type": "plain", "text": "旧"}]}}],
+    )
+    _run(plugin.discover_and_import())
+    assert plugin.store.count_messages("group:111") == 1
+
+    manager.seed(
+        "aiocqhttp-inst", "aiocqhttp-inst:GroupMessage:111",
+        [
+            {"id": 1, "created_at": 1700000000, "sender_id": "u1", "sender_name": "小明",
+             "content": {"type": "user", "message": [{"type": "plain", "text": "旧"}]}},
+            {"id": 2, "created_at": 1700000100, "sender_id": "u1", "sender_name": "小明",
+             "content": {"type": "user", "message": [{"type": "plain", "text": "新"}]}},
+        ],
+    )
+    _run(plugin.discover_and_import())
+
+    contents = [m["content"] for m in plugin.store.query_messages("group:111")]
+    assert contents == ["旧", "新"]
+
+
+def test_import_history_survives_missing_manager():
+    """老版本宿主没有 message_history_manager 时不能崩。"""
+    plugin, _, ctx = _plugin_with_platform()
+    del ctx.message_history_manager
+
+    result = _run(plugin.discover_and_import())
+
+    assert "group:111" in plugin.session_index
+    assert result["history_imported"] == 0
+
+
+def test_platform_failure_does_not_break_discovery():
+    """协议端不支持 get_group_list 时静默降级，其它来源照常。"""
+    plugin, platform, _ = _plugin_with_platform()
+
+    async def boom(action, **kwargs):
+        raise RuntimeError("协议端不支持")
+
+    platform.get_client = lambda: types.SimpleNamespace(api=types.SimpleNamespace(call_action=boom))
+
+    result = _run(plugin.discover_and_import())
+
+    assert plugin.session_index == []
+    assert result["errors"], "失败要留在结果里，便于排障"
+
+
+def test_discover_keeps_pinned_and_custom_names():
+    """自动发现不能覆盖用户置顶/改名。"""
+    plugin, _, _ = _plugin_with_platform()
+    plugin._record_inbound(FakeEvent(umo="aiocqhttp-inst:GroupMessage:111", group_id="111",
+                                     sender_id="u1", sender_name="小明", text="在吗"))
+    plugin.store.set_pinned("group:111", True)
+    plugin.store.rename_session("group:111", "我的自定义群名")
+    plugin.session_meta["group:111"]["peer_name"] = "我的自定义群名"
+
+    _run(plugin.discover_and_import())
+
+    row = {s["id"]: s for s in plugin.store.load_sessions()}["group:111"]
+    assert row["pinned"] is True
+    assert row["peer_name"] == "我的自定义群名"

@@ -207,9 +207,47 @@ after_message_sent 钩子 → on_bot_message_sent()
   "capture_bot_messages": { "type": "bool", "default": true },
   "bot_display_name": { "type": "string", "default": "Bot" },
   "convert_mention_tags": { "type": "bool", "default": true },
-  "parse_bare_at": { "type": "bool", "default": true }
+  "parse_bare_at": { "type": "bool", "default": true },
+  "auto_discover_sessions": { "type": "bool", "default": true },
+  "auto_discover_include_friends": { "type": "bool", "default": true },
+  "import_astrbot_history": { "type": "bool", "default": true }
 }
 ```
+
+## 平台支持范围
+
+**仅支持 QQ**：`aiocqhttp`（OneBot v11）、`qq_official`、`qq_official_webhook`。
+
+- `metadata.yaml` 的 `support_platforms` 只列这三个，**不要再加**未验证的适配器
+- 其它平台（Telegram / Discord / Slack…）的 At 语义、群成员接口、UMO 格式都不同，
+  代码里虽有通用兜底，但没有实测过，不对外声明支持
+- 新增平台支持时，必须先在该平台实机验证「收发 + @ + 自动发现」三件事，再改声明
+
+## 自动发现（会话预填充）
+
+**问题**：插件靠入站消息被动发现会话，全新安装时终端是空的，得等群里有人说话。
+
+**方案**：`@filter.on_astrbot_loaded()` → `discover_and_import()`，后台任务，不阻塞启动。
+
+| 来源 | 做法 |
+|---|---|
+| 平台群列表 | `get_group_list` → **全部**建会话 |
+| 平台好友列表 | `get_friend_list` → **仅活跃好友**建会话（有 AstrBot 历史或本插件已有消息） |
+| AstrBot 历史 | `context.message_history_manager.get(platform_id, user_id)` → 增量导入 |
+
+**关键约定**：
+
+- `user_id` 就是 UMO，等于本插件的 `send_target`，两边天然对齐
+- `platform` 存**适配器名**（`aiocqhttp`），`platform_id` 才是实例 ID；
+  `api_open_session` 曾经把两者写成同一个值，已修
+- 已存在的会话**只补空缺**（`_fill_discovered_gaps`），不覆盖用户改过的群名/置顶
+- 历史导入靠 `meta` 表的 `history_import:{platform_id}:{scope}` 水位 + `platform_message_id="astrbot:{id}"` 双保险，
+  重复跑不会重复入库
+- AstrBot 的 `platform_message_history` 默认**关闭**（`group_message_history_enable=false`），
+  多数环境导入为 0 条属正常降级
+- `GET /sessions?with_history=1` 只对 `message_count > 0` 的会话查历史，几百个空会话不会拖慢首屏
+
+手动重跑：前端会话列表的「自动发现」按钮 → `POST /discover`。
 
 ## 测试
 

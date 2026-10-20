@@ -135,6 +135,16 @@ check("日期分隔符存在", doc.querySelectorAll(".date-separator").length >=
 check("加载更早按钮可见", !doc.getElementById("load-more").hidden);
 check("参与者被渲染", doc.querySelectorAll(".participant").length === 1);
 check("置顶按钮存在", Boolean(doc.getElementById("btn-pin")));
+check("自动发现按钮存在", Boolean(doc.getElementById("btn-discover")));
+
+// 点发现按钮 → 调 /discover 并刷新会话列表
+{
+  const before = calls.filter(([m, e]) => m === "POST" && e === "discover").length;
+  doc.getElementById("btn-discover").click();
+  await new Promise((r) => setTimeout(r, 60));
+  const after = calls.filter(([m, e]) => m === "POST" && e === "discover").length;
+  check("点击发现会调用 /discover", after === before + 1);
+}
 
 // 切到私聊会话，验证 bot 消息类名
 const target = [...doc.querySelectorAll(".session-item")]

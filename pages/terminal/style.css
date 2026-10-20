@@ -37,6 +37,15 @@
   color-scheme: dark;
 }
 
+/*
+ * 尺寸断点只在这两处定义，媒体查询与紧凑模式共用同一组阈值：
+ * - --compact：小窗（半屏/分屏/手机）自动进入紧凑模式，侧栏变抽屉
+ * - --tiny：极小的 iframe 再压一层（隐藏品牌文字、压缩头部）
+ * app.js 里的 matchMedia 判定必须与这里保持一致。
+ */
+@custom-media --compact (max-width: 900px), (max-height: 720px);
+@custom-media --tiny (max-width: 420px), (max-height: 440px);
+
 html[data-theme="light"] {
   --background: #fafafa;
   --surface: #ffffff;
@@ -271,12 +280,14 @@ html[data-compact="true"] .compact-icon-expand {
 
 .button {
   min-height: 34px;
+  flex: 0 0 auto;
   gap: 7px;
   padding: 0 12px;
   border: 1px solid var(--border);
   border-radius: var(--radius);
   font-size: 12px;
   font-weight: 550;
+  white-space: nowrap;
 }
 
 .button svg {
@@ -666,7 +677,9 @@ html[data-compact="true"] .compact-icon-expand {
 }
 
 .conversation-meta {
+  display: flex;
   min-width: 0;
+  align-items: center;
   gap: 7px;
   margin-top: 3px;
   color: var(--foreground-subtle);
@@ -688,10 +701,6 @@ html[data-compact="true"] .compact-icon-expand {
 .mono {
   font-family: "SFMono-Regular", Consolas, "Liberation Mono", Menlo, monospace;
   font-variant-numeric: tabular-nums;
-}
-
-.details-button {
-  margin-left: auto;
 }
 
 .chat-workspace {
@@ -1205,7 +1214,9 @@ html[data-compact="true"] .compact-icon-expand {
   }
 }
 
-@media (min-width: 1280px) {
+/* ── 桌面优先的宽度断点 ─────────────────────────────────────── */
+
+@media (width >= 1280px) {
   .details-panel {
     display: flex;
   }
@@ -1215,15 +1226,15 @@ html[data-compact="true"] .compact-icon-expand {
   }
 }
 
-@media (max-width: 1100px) {
+@media (width <= 1100px) {
   :root {
-    --sidebar-width: 286px;
+    --sidebar-width: 264px;
   }
 
   .message-list,
   .composer-shell {
-    padding-right: 28px;
-    padding-left: 28px;
+    padding-right: 24px;
+    padding-left: 24px;
   }
 
   .details-panel {
@@ -1241,22 +1252,73 @@ html[data-compact="true"] .compact-icon-expand {
   }
 }
 
-@media (max-width: 900px) {
-  .mobile-menu-button {
+/*
+ * 小窗布局：宽度或高度任一不足就走同一套紧凑 + 抽屉。
+ * 条件写成逻辑或（而非 --compact 常量），自定义媒体查询不支持的用户代理解析不了时，
+ * 布局仍能正确生效。
+ */
+@media (width <= 900px), (height <= 720px) {
+  .mobile-menu-button,
+  .details-button {
     display: inline-flex;
   }
 
-  .brand-mark {
+  .brand-mark,
+  .brand-copy span {
+    display: none;
+  }
+
+  .topbar {
+    min-height: 48px;
+    padding: 0 8px;
+  }
+
+  .brand {
+    gap: 5px;
+  }
+
+  .brand-copy strong {
+    font-size: 13px;
+  }
+
+  .topbar-actions {
+    gap: 3px;
+  }
+
+  .icon-button {
+    width: 30px;
+    height: 30px;
+  }
+
+  .status-pill {
+    min-width: 26px;
+    min-height: 26px;
+    justify-content: center;
+    padding: 0 9px;
+  }
+
+  #status-text {
+    display: none;
+  }
+
+  .button-ghost {
+    width: 30px;
+    min-height: 30px;
+    padding: 0;
+  }
+
+  .button-ghost span {
     display: none;
   }
 
   .sidebar {
     position: fixed;
     z-index: 60;
-    top: 64px;
+    top: 48px;
     bottom: 0;
     left: 0;
-    width: min(86vw, 330px);
+    width: min(86vw, 300px);
+    min-width: 0;
     transform: translateX(-105%);
     transition: transform 200ms ease;
     box-shadow: var(--shadow-lg);
@@ -1269,7 +1331,7 @@ html[data-compact="true"] .compact-icon-expand {
   .sidebar-backdrop {
     position: fixed;
     z-index: 55;
-    inset: 64px 0 0;
+    inset: 48px 0 0;
     display: block;
     background: var(--backdrop);
     opacity: 0;
@@ -1282,111 +1344,210 @@ html[data-compact="true"] .compact-icon-expand {
     pointer-events: auto;
   }
 
-  .conversation-header {
-    padding: 0 15px;
+  .sidebar-head {
+    padding: 10px 10px 8px;
   }
 
-  .message-list,
-  .composer-shell {
-    padding-right: 18px;
-    padding-left: 18px;
+  .sidebar-title-row {
+    margin-bottom: 8px;
   }
 
-  .message-stack {
-    max-width: 82%;
-  }
-}
-
-@media (max-width: 640px) {
-  .topbar {
-    min-height: 58px;
-    padding: 0 10px;
+  .search-field {
+    height: 32px;
   }
 
-  .brand-copy span {
-    display: none;
+  .session-list {
+    padding: 0 6px 8px;
   }
 
-  .status-pill {
-    min-width: 30px;
-    justify-content: center;
-    padding: 0 10px;
+  .session-item {
+    grid-template-columns: 32px minmax(0, 1fr) auto;
+    gap: 8px;
+    padding: 7px 8px;
   }
 
-  #status-text {
-    display: none;
+  .session-item .avatar {
+    width: 32px;
+    height: 32px;
+    border-radius: 7px;
+    font-size: 10px;
   }
 
-  .button-ghost {
-    width: 34px;
-    padding: 0;
-  }
-
-  .button-ghost span {
-    display: none;
+  .session-preview {
+    margin-top: 1px;
+    font-size: 10px;
   }
 
   .chat-panel {
-    grid-template-rows: 60px minmax(0, 1fr) auto;
-  }
-
-  .sidebar {
-    top: 58px;
-  }
-
-  .sidebar-backdrop {
-    inset: 58px 0 0;
+    grid-template-rows: 52px minmax(0, 1fr) auto;
   }
 
   .conversation-header {
-    gap: 9px;
+    gap: 8px;
     padding: 0 12px;
+  }
+
+  .avatar-large {
+    width: 32px;
+    height: 32px;
+    border-radius: 7px;
+    font-size: 10px;
   }
 
   .conversation-title-row h1 {
     font-size: 14px;
   }
 
-  .avatar-large {
-    width: 36px;
-    height: 36px;
+  .conversation-meta {
+    margin-top: 1px;
+    font-size: 9px;
   }
 
   .conversation-meta .meta-item:first-child {
     max-width: 190px;
   }
 
-  .message-list {
-    padding: 20px 12px 14px;
+  #conversation-kind {
+    display: none !important;
   }
 
-  .message-stack {
-    max-width: 88%;
+  .message-list {
+    padding: 12px 12px 8px;
+  }
+
+  .load-more {
+    min-height: 24px;
+    margin: 0 auto 10px;
+    font-size: 9px;
+  }
+
+  .date-separator {
+    margin: 12px 0 9px;
+  }
+
+  .message-row + .message-row {
+    margin-top: 7px;
   }
 
   .message-row .avatar {
     display: none;
   }
 
-  .message-row.sent .message-meta,
+  .message-stack {
+    max-width: 92%;
+  }
+
   .message-meta {
     flex-wrap: wrap;
+    gap: 5px;
+    margin-bottom: 3px;
+    font-size: 8px;
+  }
+
+  .message-author {
+    max-width: 140px;
   }
 
   .sender-id {
-    max-width: 100px;
+    max-width: 80px;
+  }
+
+  .message-bubble {
+    padding: 6px 9px;
+    border-radius: 4px 9px 9px 9px;
+    font-size: 12px;
+    line-height: 1.48;
+  }
+
+  .message-row.sent .message-bubble {
+    border-radius: 9px 4px 9px 9px;
+  }
+
+  .empty-icon {
+    width: 44px;
+    height: 44px;
+    margin-bottom: 10px;
+    border-radius: 12px;
+  }
+
+  .empty-state {
+    padding: 24px 16px;
+  }
+
+  .empty-state h3 {
+    font-size: 13px;
+  }
+
+  .empty-state p {
+    margin-top: 4px;
+    font-size: 10px;
   }
 
   .composer-shell {
-    padding: 9px 10px 11px;
+    padding: 6px 8px 8px;
   }
 
   .composer {
-    border-radius: var(--radius);
+    gap: 6px;
+    padding: 4px;
+    border-radius: 7px;
+  }
+
+  .composer textarea {
+    min-height: 26px;
+    max-height: 96px;
+    padding: 3px 5px;
+    font-size: 13px;
+    line-height: 1.4;
+  }
+
+  .send-button {
+    width: 30px;
+    height: 30px;
   }
 
   .new-message-pill {
-    top: -41px;
+    top: -34px;
+    height: 28px;
+    padding: 0 10px;
+    font-size: 9px;
+  }
+
+  .details-panel {
+    position: absolute;
+    top: 0;
+    right: 0;
+    bottom: 0;
+    width: min(82vw, 300px);
+    box-shadow: var(--shadow-lg);
+  }
+}
+
+/* 更窄的纯宽度断点：只做小窗之上的额外收缩 */
+@media (width <= 640px) {
+  .topbar {
+    padding: 0 6px;
+  }
+
+  .conversation-header {
+    gap: 6px;
+    padding: 0 10px;
+  }
+
+  .conversation-actions {
+    gap: 2px;
+  }
+
+  .message-list {
+    padding: 10px 8px 8px;
+  }
+
+  .message-stack {
+    max-width: 94%;
+  }
+
+  .composer-shell {
+    padding: 6px 6px 8px;
   }
 
   .details-panel {
@@ -1395,282 +1556,60 @@ html[data-compact="true"] .compact-icon-expand {
   }
 }
 
-html[data-compact="true"] .topbar {
-  min-height: 48px;
-  padding: 0 8px;
-}
+/* ── 高度断点：纵向空间不够时再压一层 ───────────────────────── */
 
-html[data-compact="true"] .brand {
-  gap: 5px;
-}
+@media (height <= 560px) {
+  .topbar {
+    min-height: 44px;
+  }
 
-html[data-compact="true"] .brand-mark,
-html[data-compact="true"] .brand-copy span {
-  display: none;
-}
+  .sidebar {
+    top: 44px;
+  }
 
-html[data-compact="true"] .brand-copy strong {
-  font-size: 13px;
-}
+  .sidebar-backdrop {
+    inset: 44px 0 0;
+  }
 
-html[data-compact="true"] .topbar-actions {
-  gap: 3px;
-}
+  .chat-panel {
+    grid-template-rows: 46px minmax(0, 1fr) auto;
+  }
 
-html[data-compact="true"] .mobile-menu-button,
-html[data-compact="true"] .details-button {
-  display: inline-flex;
-}
-
-html[data-compact="true"] .icon-button {
-  width: 30px;
-  height: 30px;
-}
-
-html[data-compact="true"] .status-pill {
-  min-width: 26px;
-  min-height: 26px;
-  justify-content: center;
-  padding: 0 9px;
-}
-
-html[data-compact="true"] #status-text {
-  display: none;
-}
-
-html[data-compact="true"] .button-ghost {
-  width: 30px;
-  min-height: 30px;
-  padding: 0;
-}
-
-html[data-compact="true"] .button-ghost span {
-  display: none;
-}
-
-html[data-compact="true"] .sidebar {
-  position: fixed;
-  z-index: 60;
-  top: 48px;
-  bottom: 0;
-  left: 0;
-  width: min(86vw, 300px);
-  min-width: 0;
-  transform: translateX(-105%);
-  box-shadow: var(--shadow-lg);
-}
-
-html[data-compact="true"] body.sidebar-open .sidebar {
-  transform: translateX(0);
-}
-
-html[data-compact="true"] .sidebar-backdrop {
-  position: fixed;
-  z-index: 55;
-  inset: 48px 0 0;
-  display: block;
-  background: var(--backdrop);
-  opacity: 0;
-  pointer-events: none;
-  transition: opacity 160ms ease;
-}
-
-html[data-compact="true"] body.sidebar-open .sidebar-backdrop {
-  opacity: 1;
-  pointer-events: auto;
-}
-
-html[data-compact="true"] .sidebar-head {
-  padding: 10px 10px 8px;
-}
-
-html[data-compact="true"] .sidebar-title-row {
-  margin-bottom: 8px;
-}
-
-html[data-compact="true"] .search-field {
-  height: 32px;
-}
-
-html[data-compact="true"] .session-list {
-  padding: 0 6px 8px;
-}
-
-html[data-compact="true"] .session-item {
-  grid-template-columns: 32px minmax(0, 1fr) auto;
-  gap: 8px;
-  padding: 7px 8px;
-}
-
-html[data-compact="true"] .session-item .avatar {
-  width: 32px;
-  height: 32px;
-  border-radius: 7px;
-  font-size: 10px;
-}
-
-html[data-compact="true"] .session-preview {
-  margin-top: 1px;
-  font-size: 10px;
-}
-
-html[data-compact="true"] .chat-panel {
-  grid-template-rows: 52px minmax(0, 1fr) auto;
-}
-
-html[data-compact="true"] .conversation-header {
-  gap: 8px;
-  padding: 0 10px;
-}
-
-html[data-compact="true"] .avatar-large {
-  width: 32px;
-  height: 32px;
-  border-radius: 7px;
-  font-size: 10px;
-}
-
-html[data-compact="true"] .conversation-title-row h1 {
-  font-size: 13px;
-}
-
-html[data-compact="true"] #conversation-kind,
-html[data-compact="true"] .conversation-platform {
-  display: none !important;
-}
-
-html[data-compact="true"] .conversation-meta {
-  margin-top: 1px;
-  font-size: 9px;
-}
-
-html[data-compact="true"] .message-list {
-  padding: 10px 10px 8px;
-}
-
-html[data-compact="true"] .load-more {
-  min-height: 24px;
-  margin: 0 auto 10px;
-  font-size: 9px;
-}
-
-html[data-compact="true"] .date-separator {
-  margin: 12px 0 9px;
-}
-
-html[data-compact="true"] .message-row + .message-row {
-  margin-top: 7px;
-}
-
-html[data-compact="true"] .message-row .avatar {
-  display: none;
-}
-
-html[data-compact="true"] .message-stack {
-  max-width: 92%;
-}
-
-html[data-compact="true"] .message-meta {
-  gap: 5px;
-  margin-bottom: 3px;
-  font-size: 8px;
-}
-
-html[data-compact="true"] .message-author {
-  max-width: 140px;
-}
-
-html[data-compact="true"] .sender-id {
-  max-width: 80px;
-}
-
-html[data-compact="true"] .message-bubble {
-  padding: 6px 9px;
-  border-radius: 4px 9px 9px 9px;
-  font-size: 12px;
-  line-height: 1.48;
-}
-
-html[data-compact="true"] .message-row.sent .message-bubble {
-  border-radius: 9px 4px 9px 9px;
-}
-
-html[data-compact="true"] .empty-icon {
-  width: 44px;
-  height: 44px;
-  margin-bottom: 10px;
-  border-radius: 12px;
-}
-
-html[data-compact="true"] .empty-state h3 {
-  font-size: 13px;
-}
-
-html[data-compact="true"] .empty-state p {
-  font-size: 10px;
-}
-
-html[data-compact="true"] .composer-shell {
-  padding: 6px 8px 8px;
-}
-
-html[data-compact="true"] .composer {
-  gap: 6px;
-  padding: 4px;
-  border-radius: 7px;
-}
-
-html[data-compact="true"] .composer textarea {
-  min-height: 26px;
-  max-height: 96px;
-  padding: 3px 5px;
-  font-size: 13px;
-  line-height: 1.4;
-}
-
-html[data-compact="true"] .send-button {
-  width: 30px;
-  height: 30px;
-}
-
-html[data-compact="true"] .new-message-pill {
-  top: -34px;
-  height: 28px;
-  padding: 0 10px;
-  font-size: 9px;
-}
-
-html[data-compact="true"] .details-panel {
-  display: none;
-  position: absolute;
-  top: 0;
-  right: 0;
-  bottom: 0;
-  width: min(82vw, 300px);
-  box-shadow: var(--shadow-lg);
-}
-
-html[data-compact="true"] .details-panel.open {
-  display: flex;
-}
-
-@media (max-width: 430px) {
-  html[data-compact="true"] .brand-copy {
+  .conversation-meta {
     display: none;
   }
 
-  html[data-compact="true"] .conversation-header > .avatar {
+  .sidebar-head {
+    padding-top: 8px;
+  }
+
+  .date-separator {
+    margin: 10px 0 8px;
+  }
+
+  .empty-icon {
     display: none;
   }
 }
 
-@media (max-height: 520px) {
-  html[data-compact="true"] .conversation-meta {
+@media (height <= 440px) {
+  .empty-state p {
     display: none;
   }
 
-  html[data-compact="true"] .date-separator {
-    margin: 8px 0 6px;
+  .new-message-pill {
+    display: none !important;
+  }
+}
+
+/* 极窄或极矮时进一步收掉品牌文字与头像 */
+@media --tiny {
+  .brand-copy {
+    display: none;
+  }
+
+  .conversation-header > .avatar {
+    display: none;
   }
 }
 
@@ -1953,6 +1892,7 @@ html[data-compact="true"] .details-panel.open {
 
 .conversation-actions {
   display: flex;
+  flex: 0 0 auto;
   align-items: center;
   gap: 4px;
   margin-left: auto;
@@ -2208,7 +2148,7 @@ html[data-compact="true"] .details-panel.open {
   }
 }
 
-/* 紧凑模式下的新组件 */
+/* 紧凑模式（小窗或手动开启）下的新组件：手动开启时可能仍是宽屏，所以单列一段 */
 html[data-compact="true"] .search-results {
   max-height: 34%;
 }

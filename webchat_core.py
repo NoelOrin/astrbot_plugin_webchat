@@ -20,6 +20,7 @@ import re
 import sqlite3
 import time
 from collections.abc import Callable, Iterable, Sequence
+from datetime import datetime, timezone
 from typing import Any
 
 SCHEMA_VERSION = 3
@@ -451,6 +452,111 @@ def preview_of(message: dict) -> str:
     if text:
         return text
     return str(message.get("content") or "") or "[非文本消息]"
+
+
+# ── AstrBot 自身历史记录（platform_message_history）→ 本插件消息 ──────
+
+# AstrBot 把消息链存成 {"type": "user"|"bot", "message": [part, ...]}，
+# part 的 type 只有 plain / at / reply 三种（其余组件已经退化成 [Image] 这类文本）。
+_ASTRBOT_ROLE_TO_TYPE = {"user": "received", "bot": "bot"}
+
+
+def _history_timestamp(raw: Any) -> float:
+    """把 AstrBot 的 created_at 转成 unix 秒。
+
+    该列是 naive UTC datetime，直接当本地时间用会有 8 小时偏差；
+    SQLite 里也可能已经读成字符串或数字，这里逐种兜底。
+    """
+    if isinstance(raw, (int, float)) and not isinstance(raw, bool):
+        value = float(raw)
+        if value > 0:
+            return value
+    text = str(raw or "").strip()
+    if text:
+        try:
+            parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+            if parsed.tzinfo is None:
+                parsed = parsed.replace(tzinfo=timezone.utc)
+            return parsed.timestamp()
+        except (TypeError, ValueError):
+            pass
+    return now_ts()
+
+
+def _history_segment(part: dict) -> dict | None:
+    """单个 part → 片段；认不出就降级成文本，绝不静默丢信息。"""
+    kind = str(part.get("type") or "").strip().lower()
+    if kind == "plain":
+        text = str(part.get("text") or "")
+        return {"type": "text", "text": text} if text else None
+    if kind == "at":
+        target = str(part.get("user_id") or "").strip()
+        name = str(part.get("name") or "").strip()
+        return {"type": "at", "target": target, "text": name or target}
+    if kind == "reply":
+        snippet = str(part.get("text") or "").strip()
+        return {
+            "type": "reply",
+            "target": str(part.get("message_id") or ""),
+            "text": f"[引用 {snippet}]" if snippet else "[引用]",
+        }
+    text = str(part.get("text") or "").strip()
+    return {"type": "text", "text": text or f"[{kind or '未知'}]"}
+
+
+def astrbot_history_to_message(row: Any) -> dict | None:
+    """把一条 platform_message_history 记录转成 add_message 需要的字典。
+
+    返回 None 表示这条记录没有可用内容，调用方应跳过。
+    """
+    if isinstance(row, dict):
+        getter = row.get
+    else:
+        getter = lambda key, default=None: getattr(row, key, default)  # noqa: E731
+
+    content = getter("content") or {}
+    if isinstance(content, str):
+        try:
+            content = json.loads(content)
+        except (TypeError, ValueError):
+            content = {}
+    if not isinstance(content, dict):
+        return None
+
+    parts = content.get("message")
+    if not isinstance(parts, list):
+        return None
+
+    segments: list[dict] = []
+    for part in parts:
+        if not isinstance(part, dict):
+            continue
+        segment = _history_segment(part)
+        if segment is None:
+            continue
+        if segment["type"] == "text" and segments and segments[-1]["type"] == "text":
+            segments[-1]["text"] = f"{segments[-1]['text']}{segment['text']}"
+            continue
+        segments.append(segment)
+    if not segments:
+        return None
+
+    role = str(content.get("type") or "user").strip().lower()
+    row_id = getter("id")
+    sender_id = str(getter("sender_id") or "")
+    sender_name = str(getter("sender_name") or "")
+    if role == "bot" and not sender_name:
+        sender_name = "Bot"
+
+    return {
+        "type": _ASTRBOT_ROLE_TO_TYPE.get(role, "received"),
+        "sender": sender_name or sender_id,
+        "sender_id": sender_id,
+        "content": segments_to_text(segments),
+        "segments": segments,
+        "platform_message_id": f"astrbot:{row_id}" if row_id is not None else "",
+        "timestamp": _history_timestamp(getter("created_at")),
+    }
 
 
 # ── 存储层 ────────────────────────────────────────────────────────────
@@ -896,6 +1002,66 @@ class MessageStore:
         finally:
             conn.close()
         return self._rows_to_messages(rows)
+
+    # ── 导入水位：保证 AstrBot 历史只导一次 ──────────────────────
+
+    @staticmethod
+    def _watermark_key(platform_id: str, scope: str) -> str:
+        return f"history_import:{platform_id}:{scope}"
+
+    def get_import_watermark(self, platform_id: str, scope: str) -> int:
+        """已导入到哪一条 platform_message_history（按 id），0 表示没导过。"""
+        conn = self.connect()
+        try:
+            row = conn.execute(
+                "SELECT value FROM meta WHERE key = ?",
+                (self._watermark_key(platform_id, scope),),
+            ).fetchone()
+        except sqlite3.OperationalError:
+            return 0
+        finally:
+            conn.close()
+        try:
+            return max(0, int(str(row["value"]).strip())) if row else 0
+        except (TypeError, ValueError):
+            return 0
+
+    def set_import_watermark(self, platform_id: str, scope: str, value: int) -> None:
+        """只升不降：乱序回放旧记录时不能把水位拉回去。"""
+        target = max(0, int(value))
+        current = self.get_import_watermark(platform_id, scope)
+        if target <= current:
+            return
+        conn = self.connect()
+        try:
+            conn.execute(
+                "INSERT INTO meta (key, value) VALUES (?, ?) "
+                "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                (self._watermark_key(platform_id, scope), str(target)),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+    def has_astrbot_message(self, session_id: str, row_id: int) -> bool:
+        """这条 AstrBot 历史是否已经导进来过（按 platform_message_id 留痕）。"""
+        try:
+            marker = f"astrbot:{int(row_id)}"
+        except (TypeError, ValueError):
+            return False
+        if marker == "astrbot:0":
+            return False
+        conn = self.connect()
+        try:
+            row = conn.execute(
+                "SELECT 1 FROM messages WHERE session_id = ? AND platform_message_id = ? LIMIT 1",
+                (session_id, marker),
+            ).fetchone()
+        except sqlite3.OperationalError:
+            return False
+        finally:
+            conn.close()
+        return row is not None
 
     def mention_resolver(self, session_id: str) -> Callable[[str], str | None]:
         """构造「昵称 / QQ 号 → 用户 ID」的解析器，供 text_to_segments 使用。

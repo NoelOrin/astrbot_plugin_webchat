@@ -8,35 +8,22 @@ desc: >-
   - 双向记录：入站消息与 Bot / 插件主动推送的出站消息都会入库
   - 富媒体：图片、@、表情、语音、文件、合并转发按片段保存与渲染
   - @ 生效：LLM 回复里的 <mention> 标签与手打 @昵称 会还原成真实 At 消息段
+  - 自动发现：启动即拉取平台群/活跃好友建会话，并增量导入 AstrBot 自身历史消息
+  - 平台支持：仅 QQ（OneBot v11 / QQ 官方机器人），其它平台未验证
   - 实时推送：优先使用 bridge SSE，不可用时自动降级为轮询
   - 历史检索：按关键词全文搜索消息，点击即可跳转定位
   - 会话管理：置顶、导出、删除会话，主动发起新会话
   - 身份映射：展示群号、私聊 ID、发送者 ID 与最新昵称
   - 数据安全：记录保存在 data/plugin_data 目录，重装插件不丢失
-version: 0.4.0
+version: 0.4.1
 author: NoelOrin
 repo: https://github.com/NoelOrin/astrbot_plugin_webchat
 astrbot_version: ">=4.0.0"
 support_platforms:
+  # 仅在 QQ（aiocqhttp / OneBot v11）上验证过；其它平台未测试，不列入支持范围
   - aiocqhttp
   - qq_official
   - qq_official_webhook
-  - telegram
-  - wecom
-  - wecom_ai_bot
-  - lark
-  - dingtalk
-  - discord
-  - slack
-  - kook
-  - vocechat
-  - weixin_official_account
-  - weixin_oc
-  - satori
-  - misskey
-  - line
-  - matrix
-  - mattermost
 tags:
   - webui
   - chat

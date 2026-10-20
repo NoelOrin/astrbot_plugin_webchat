@@ -27,6 +27,7 @@ try:  # 正常情况：以 data.plugins.<dir>.main 包路径加载
     from .webchat_core import (
         DEFAULT_MAX_LOG,
         MessageStore,
+        astrbot_history_to_message,
         clamp_int,
         coerce_bool,
         coerce_float,
@@ -45,6 +46,7 @@ except ImportError:  # 兜底：宿主以裸模块名加载时走同目录导入
     from webchat_core import (  # type: ignore[no-redef]
         DEFAULT_MAX_LOG,
         MessageStore,
+        astrbot_history_to_message,
         clamp_int,
         coerce_bool,
         coerce_float,
@@ -174,6 +176,7 @@ class Plugin(Star):
             ),
             ("platforms", self.api_platforms, ["GET"], "可用平台与适配器"),
             ("peers", self.api_peers, ["GET"], "拉取群列表/好友列表"),
+            ("discover", self.api_discover, ["POST"], "自动发现会话并导入历史"),
             ("open", self.api_open_session, ["POST"], "主动创建会话"),
             ("media", self.api_media, ["GET"], "图片代理"),
             ("export", self.api_export, ["GET"], "导出会话记录"),
@@ -395,6 +398,272 @@ class Plugin(Star):
         self._broadcast_soon("message", saved)
         return saved
 
+    # ── 自动发现：平台群/好友 + AstrBot 自身历史 ──────────────────
+
+    @_optional_hook("on_astrbot_loaded")
+    async def on_loaded(self):
+        """AstrBot 加载完成后，后台补齐会话列表与历史，不阻塞启动。"""
+        if not self._discovery_enabled():
+            return
+        with contextlib.suppress(RuntimeError):
+            asyncio.get_running_loop().create_task(self.discover_and_import())
+
+    def _discovery_enabled(self) -> bool:
+        return coerce_bool(self.config.get("auto_discover_sessions", True), True) or coerce_bool(
+            self.config.get("import_astrbot_history", True), True
+        )
+
+    async def discover_and_import(self) -> dict:
+        """拉平台群/好友建会话，并导入 AstrBot 自身的历史消息。
+
+        群全部自动建；好友按活跃度（有历史才建），避免上千好友把列表撑爆。
+        任何一步失败都只记在该步骤的结果里，不影响其它来源。
+        """
+        result = {
+            "groups_created": 0,
+            "friends_created": 0,
+            "history_imported": 0,
+            "errors": [],
+        }
+        if coerce_bool(self.config.get("auto_discover_sessions", True), True):
+            await self._discover_platforms(result)
+        if coerce_bool(self.config.get("import_astrbot_history", True), True):
+            await self._import_astrbot_history(result)
+        self._broadcast_soon("sessions_discovered", dict(result))
+        logger.info(
+            "自动发现完成：群 +%s、好友 +%s、历史 +%s%s",
+            result["groups_created"],
+            result["friends_created"],
+            result["history_imported"],
+            f"，错误 {len(result['errors'])} 条" if result["errors"] else "",
+        )
+        return result
+
+    async def _discover_platforms(self, result: dict) -> None:
+        """遍历平台实例，把群/好友注册成会话。"""
+        include_friends = coerce_bool(
+            self.config.get("auto_discover_include_friends", True), True
+        )
+        try:
+            platforms = list(self.context.platform_manager.get_insts())
+        except Exception as exc:
+            result["errors"].append(f"读取平台列表失败: {exc}")
+            return
+
+        for platform in platforms:
+            meta = getattr(platform, "meta", None)
+            meta = meta() if callable(meta) else None
+            platform_id = str(getattr(meta, "id", "") or "")
+            adapter = str(getattr(meta, "name", "") or platform_id)
+            if not platform_id:
+                continue
+
+            groups = await self._call_platform(platform, "get_group_list", result)
+            for item in groups:
+                if not isinstance(item, dict):
+                    continue
+                group_id = str(item.get("group_id") or "").strip()
+                if not group_id:
+                    continue
+                name = str(item.get("group_name") or group_id)
+                if self._register_discovered(
+                    session_key_for_group(group_id),
+                    platform_id=platform_id,
+                    adapter=adapter,
+                    peer_id=group_id,
+                    peer_name=name,
+                    is_group=True,
+                ):
+                    result["groups_created"] += 1
+
+            if not include_friends:
+                continue
+            friends = await self._call_platform(platform, "get_friend_list", result)
+            for item in friends:
+                if not isinstance(item, dict):
+                    continue
+                user_id = str(item.get("user_id") or "").strip()
+                if not user_id:
+                    continue
+                send_target = self._infer_umo(platform_id, False, user_id)
+                # 好友按活跃度：没有历史记录就不建，避免私聊列表膨胀
+                if not await self._friend_is_active(platform_id, send_target):
+                    continue
+                if self._register_discovered(
+                    session_key_for_private(send_target, user_id),
+                    platform_id=platform_id,
+                    adapter=adapter,
+                    peer_id=user_id,
+                    peer_name=str(item.get("nickname") or item.get("remark") or user_id),
+                    is_group=False,
+                    send_target=send_target,
+                ):
+                    result["friends_created"] += 1
+
+    async def _call_platform(self, platform, action: str, result: dict) -> list:
+        """调协议端列表接口；不支持时静默降级为空列表。"""
+        try:
+            client = platform.get_client()
+            api = getattr(client, "api", client)
+            raw = await api.call_action(action)
+        except Exception as exc:
+            result["errors"].append(f"{action} 失败: {exc}")
+            return []
+        if isinstance(raw, list):
+            return raw
+        if isinstance(raw, dict):
+            data = raw.get("data")
+            if isinstance(data, list):
+                return data
+        return []
+
+    def _register_discovered(
+        self,
+        session_key: str,
+        *,
+        platform_id: str,
+        adapter: str,
+        peer_id: str,
+        peer_name: str,
+        is_group: bool,
+        send_target: str = "",
+    ) -> bool:
+        """注册一个自动发现的会话；已存在时只补空缺，绝不覆盖用户改动。"""
+        if not session_key:
+            return False
+        if session_key in self.session_meta:
+            self._fill_discovered_gaps(
+                session_key,
+                adapter,
+                send_target or self._infer_umo(platform_id, is_group, peer_id),
+            )
+            return False
+
+        meta = {
+            # platform 存适配器名（如 aiocqhttp），platform_id 才是实例 ID
+            "platform": adapter,
+            "platform_id": platform_id,
+            "group_id": peer_id if is_group else "",
+            "group_name": peer_name if is_group else "",
+            "is_group": is_group,
+            "send_target": send_target or self._infer_umo(platform_id, is_group, peer_id),
+            "peer_id": peer_id,
+            "peer_name": peer_name or peer_id,
+        }
+        self._ensure_session(session_key, meta)
+        return True
+
+    def _fill_discovered_gaps(self, session_key: str, adapter: str, send_target: str) -> None:
+        current = self.session_meta.get(session_key) or {}
+        changed = False
+        # platform 在旧版本里可能被错误地写成了实例 ID，这里顺手纠正
+        platform_stale = not current.get("platform") or (
+            current.get("platform") == current.get("platform_id")
+        )
+        if platform_stale and adapter and current.get("platform") != adapter:
+            current["platform"] = adapter
+            changed = True
+        if send_target and not current.get("send_target"):
+            current["send_target"] = send_target
+            changed = True
+        if changed:
+            self.store.upsert_session(session_key, current)
+
+    async def _friend_is_active(self, platform_id: str, send_target: str) -> bool:
+        """好友是否活跃：本插件已存过消息，或 AstrBot 里有历史。"""
+        session_key = session_key_for_private(send_target, send_target.rpartition(":")[2])
+        if session_key and self.store.count_messages(session_key):
+            return True
+        manager = getattr(self.context, "message_history_manager", None)
+        if manager is None:
+            return False
+        try:
+            rows = await self._fetch_history(manager, platform_id, send_target, page_size=1)
+        except Exception:
+            return False
+        return bool(rows)
+
+    async def _import_astrbot_history(self, result: dict) -> None:
+        """把 AstrBot 自身的 platform_message_history 增量导入本插件。
+
+        只导本插件已知的会话（群 + 已知私聊），user_id 就是它们的 UMO。
+        """
+        manager = getattr(self.context, "message_history_manager", None)
+        if manager is None:
+            return
+
+        for session_key in list(self.session_index):
+            meta = self.session_meta.get(session_key) or {}
+            platform_id = str(meta.get("platform_id") or "")
+            scope = str(meta.get("send_target") or "")
+            if not platform_id or not scope:
+                continue
+            try:
+                imported = await self._import_scope(manager, session_key, platform_id, scope)
+            except Exception as exc:
+                result["errors"].append(f"导入历史失败 {session_key}: {exc}")
+                continue
+            result["history_imported"] += imported
+
+    async def _import_scope(self, manager, session_key: str, platform_id: str, scope: str) -> int:
+        rows = await self._fetch_history(manager, platform_id, scope)
+        if not rows:
+            return 0
+
+        watermark = self.store.get_import_watermark(platform_id, scope)
+        highest = watermark
+        imported = 0
+        for row in rows:
+            row_dict = row if isinstance(row, dict) else self._history_row_dict(row)
+            row_id = row_dict.get("id")
+            try:
+                row_id = int(row_id)
+            except (TypeError, ValueError):
+                continue
+            highest = max(highest, row_id)
+            if row_id <= watermark:
+                continue
+            if self.store.has_astrbot_message(session_key, row_id):
+                continue
+            message = astrbot_history_to_message(row_dict)
+            if message is None:
+                continue
+            meta = self.session_meta.get(session_key) or {}
+            message.update(
+                {
+                    "platform": meta.get("platform", ""),
+                    "platform_id": platform_id,
+                    "group_id": meta.get("group_id", ""),
+                }
+            )
+            self.store.add_message(session_key, message)
+            imported += 1
+
+        self.store.set_import_watermark(platform_id, scope, highest)
+        return imported
+
+    async def _fetch_history(
+        self, manager, platform_id: str, scope: str, page_size: int = 500
+    ) -> list:
+        try:
+            rows = manager.get(platform_id=platform_id, user_id=scope, page=1, page_size=page_size)
+        except TypeError:  # 老签名
+            rows = manager.get(platform_id, scope)
+        if asyncio.iscoroutine(rows):
+            rows = await rows
+        return list(rows or [])
+
+    @staticmethod
+    def _history_row_dict(row) -> dict:
+        """把 SQLModel 行转成 dict，只取我们关心的字段。"""
+        return {
+            "id": getattr(row, "id", None),
+            "created_at": getattr(row, "created_at", None),
+            "sender_id": getattr(row, "sender_id", None),
+            "sender_name": getattr(row, "sender_name", None),
+            "content": getattr(row, "content", None),
+        }
+
     # ── 事件：出站（Bot / 插件主动推送） ──────────────────────────
 
     @_optional_hook("on_decorating_result")
@@ -595,7 +864,8 @@ class Plugin(Star):
                 "participants": participants_map.get(session_key, []),
                 "last_message": summary.get("last_message"),
             }
-            if with_history:
+            if with_history and entry["message_count"]:
+                # 自动发现会让会话数量达到几百个，空会话再查一次是纯浪费
                 page, has_more, next_cursor = self.store.query_page(
                     session_key, limit=history_limit
                 )
@@ -605,6 +875,10 @@ class Plugin(Star):
                     "next_cursor": next_cursor,
                     "limit": history_limit,
                 }
+            elif with_history:
+                entry["messages"] = []
+                entry["history"] = {"has_more": False, "next_cursor": None,
+                                    "limit": history_limit}
             sessions.append(entry)
 
         sessions.sort(key=lambda item: (not item["pinned"], -(item["last_activity"] or 0)))
@@ -882,6 +1156,14 @@ class Plugin(Star):
                 logger.info(f"拉取 {action} 失败（已忽略）: {exc}")
         return jsonify({"peers": peers, "type": kind})
 
+    async def api_discover(self):
+        """手动重跑自动发现：拉群/好友建会话 + 补导入 AstrBot 历史。"""
+        result = await self.discover_and_import()
+        result["sessions"] = [
+            self._session_payload(key) for key in list(self.session_index)
+        ]
+        return jsonify({"status": "ok", "result": result})
+
     async def api_open_session(self):
         """主动创建会话：body: {platform_id, peer_id, type: group|friend, name?}"""
         data = await request.get_json(silent=True) or {}
@@ -904,7 +1186,9 @@ class Plugin(Star):
 
         send_target = self._infer_umo(platform_id, is_group, peer_id)
         meta = {
-            "platform": platform_id,
+            # platform 必须是适配器名（aiocqhttp），不能写成平台实例 ID，
+            # 否则联系人关联与 @昵称解析都会对不上。
+            "platform": self._adapter_name(platform_id),
             "platform_id": platform_id,
             "group_id": peer_id if is_group else "",
             "group_name": name or (peer_id if is_group else ""),
@@ -916,6 +1200,19 @@ class Plugin(Star):
         }
         self._ensure_session(session_key, meta)
         return jsonify({"status": "ok", "session": self._session_payload(session_key)})
+
+    def _adapter_name(self, platform_id: str) -> str:
+        """平台实例 ID → 适配器名；取不到时退回实例 ID（与旧行为一致）。"""
+        try:
+            platform = self.context.get_platform_inst(platform_id)
+            meta = getattr(platform, "meta", None)
+            meta = meta() if callable(meta) else meta
+            name = str(getattr(meta, "name", "") or "")
+            if name:
+                return name
+        except Exception:
+            pass
+        return platform_id
 
     def _infer_umo(self, platform_id: str, is_group: bool, peer_id: str) -> str:
         """从同平台已有会话推断 UMO 模板，把最后一段替换成目标 id。"""
