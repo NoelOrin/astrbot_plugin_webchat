@@ -6,54 +6,70 @@ description: AI agent 指南 — 项目架构、数据流、关键约定
 
 ## 项目概览
 
-AstrBot 插件，提供一个 Web 终端 UI，通过 AstrBot 消息平台向 QQ 群/私聊发送和接收消息。
+AstrBot 插件，提供一个 Web 终端 UI，通过 AstrBot 消息平台**双向**收发消息并支持历史检索。
 
-**技术栈**: Python (Quart) 后端 + 纯前端 JS (Vanilla, ESM module)
+**技术栈**: Python (Quart) 后端 + SQLite + 纯前端 JS (Vanilla, ESM module)
 
 ## 架构
 
+### 分层（重要）
+
+| 文件 | 职责 | 依赖 |
+|---|---|---|
+| `webchat_core.py` | 纯逻辑：片段序列化、SQLite 存储、会话键 | 仅标准库，**不 import AstrBot** |
+| `main.py` | 插件入口：事件监听、Web API、SSE、生命周期 | AstrBot SDK + Quart + webchat_core |
+| `pages/terminal/webchat-lib.js` | 前端纯函数：去重、排序、格式化、高亮 | 无（不碰 DOM/bridge） |
+| `pages/terminal/app.js` | 状态、渲染、SSE、弹窗 | DOM + bridge + webchat-lib |
+
+**这条边界是刻意的**：`webchat_core.py` 和 `webchat-lib.js` 能脱离宿主单测，改动逻辑时优先放这里。
+
 ### 后端 (`main.py`)
-- **`Plugin(Star)`** — AstrBot 插件入口
-  - `on_message()`: 监听所有消息事件，按 `group_id` 归入会话、存 SQLite、推 SSE
-  - `api_sessions`, `api_send`, `api_history`, `api_clear`: REST API
-  - `api_stream`: SSE 流式推送端点（注册在 `/api/plug/{plugin_name}/stream`）
-- **数据存储**: SQLite (`data/astrbot_plugin_webchat.db`)
-- **SSE 推送**: `asyncio.Queue` 队列，每客户端一个，广播消息/会话事件
+- **`Plugin(Star)`**
+  - `on_message()` → `_record_inbound()`：入站消息入库并广播
+  - `on_bot_message_sent()`（`@filter.after_message_sent()`）：出站消息入库
+  - `_ensure_session()`：幂等注册会话，新会话广播 `session` 事件
+  - 14 个 REST 端点，见 `_register_web_apis()` 的 routes 列表
+  - `_sse_broadcast()` / `_broadcast_soon()`：SSE 广播（后者在无事件循环时安全降级）
+  - `terminate()`：清理 SSE 与缓存
+- **数据存储**: `data/plugin_data/astrbot_plugin_webchat/astrbot_plugin_webchat.db`
+  - 启动时 `_migrate_legacy_db()` 从旧插件目录复制数据库
+  - WAL + `busy_timeout=5000`，每次操作独立连接
 
 ### 前端 (`pages/terminal/`)
-- `index.html` — 终端 UI 骨架
-- `app.js` — ESM 模块，`window.AstrBotPluginPage` bridge 调用后端 API
-- 启动即加载所有会话+历史（`loadSessionsWithHistory`），之后通过 SSE 实时更新
+- `index.html` — 结构 + 首屏主题/紧凑模式内联脚本（避免闪烁）
+- `webchat-lib.js` — 纯函数（有测试）
+- `app.js` — 控制器，`window.AstrBotPluginView`（回退 `AstrBotPluginPage`）
 
 ### 路由前缀
-AstrBot 在 `/api/plug/` 下注册插件 API。前端 bridge 自动加前缀，但原生 `EventSource` 需要写完整路径：
+AstrBot 在 `/api/plug/` 下注册插件 API。bridge 自动加前缀；原生 `EventSource` 需完整路径：
 ```
 /api/plug/astrbot_plugin_webchat/stream
 ```
 
 ## 核心数据流
 
-### 消息接收
+### 入站
 ```
-AstrBot event → on_message()
-  → 群聊: session_key = "group:{group_id}"  私聊: session_key = umo
-  → _register_session() → 存 SQLite sessions 表
-  → _save_message() → 存 SQLite messages 表
-  → _sse_broadcast("message", {...}) → 推送 SSE 给前端
-```
-
-### 消息发送
-```
-前端 POST /api/plug/.../send {session_id, message}
-  → api_send() → meta.send_target (群聊原始 UMO) → context.send_message()
-  → _save_message() → 存 SQLite
+AstrBot event → on_message() → _record_inbound()
+  → 群聊: session_key = "group:{group_id}"   私聊: session_key = umo
+  → _ensure_session() → store.upsert_session()
+  → store.add_message(type="received") → 按 id 裁剪
+  → _broadcast_soon("message", saved)
 ```
 
-### 初始化加载
+### 出站（Bot / 插件主动推送）
 ```
-前端 loadSessionsWithHistory() → GET .../sessions?with_history=1
-  → 返回所有会话元数据 + 最新 N 条消息 (N = max_log_per_session)
-  → 前端缓存到 sessionMessages{}，切换会话即时渲染
+after_message_sent 钩子 → on_bot_message_sent()
+  → serialize_chain(event.get_result().chain)
+  → 会话不存在则丢弃；命中 _recent_sends 指纹则丢弃（终端已入库）
+  → store.add_message(type="bot") → 广播
+```
+
+### 发送
+```
+前端 apiPost("send", {session_id, message, segments})
+  → api_send() → _build_chain(segments) → context.send_message(send_target, chain)
+  → 记录 _recent_sends 指纹 → store.add_message(type="sent") → 广播
 ```
 
 ## 数据库
@@ -62,58 +78,163 @@ AstrBot event → on_message()
 | 列 | 说明 |
 |---|---|
 | id | session_key（群聊 `group:{group_id}`，私聊 `umo`）|
-| platform | 适配器名 |
-| group_id | 群号（私聊为空）|
-| group_name | 群名/显示名 |
+| platform | 适配器名（如 `aiocqhttp`，来自 `get_platform_name()`）|
+| platform_id | 平台实例 ID |
+| group_id / group_name | 群号 / 群名 |
 | is_group | 是否群聊 |
 | send_target | 发送消息用的原始 UMO |
-| display_order | 显示顺序 |
+| peer_id / peer_name | 统一展示用的对端 ID / 名称 |
+| pinned | 置顶 |
+| display_order | 发现顺序（排序实际由 pinned + 活跃时间决定）|
+| created_at | 主动建会话的时间 |
 
 ### messages 表
 | 列 | 说明 |
 |---|---|
-| id | 自增 PK |
+| id | 自增 PK（**分页与裁剪的唯一口径**）|
 | session_id | 关联 sessions.id |
-| type | `received` / `sent` |
-| sender | 发送者昵称 |
-| sender_id | 发送者 UID |
-| content | 消息文本 |
-| group_id | 群号 |
-| platform | 适配器名 |
+| type | `received` / `sent` / `bot` |
+| sender / sender_id | 发送者昵称 / UID |
+| content | 纯文本（从 segments 折叠而来）|
+| segments | JSON 片段数组（图片、@、表情…）|
+| platform / platform_id | 平台信息 |
+| platform_message_id | 平台消息 ID（撤回用）|
 | timestamp | unix 时间戳 |
 
-**裁剪策略**: 每插入一条消息后 `DELETE ... ORDER BY timestamp DESC LIMIT {max_log}`，保留最新 N 条。
+**裁剪策略**: `DELETE ... WHERE id NOT IN (SELECT id ... ORDER BY id DESC LIMIT {max_log})`
+
+> 历史版本按 `timestamp` 裁剪、按 `id` 分页，两套口径不一致会漏消息。**统一用 id，不要再改回 timestamp。**
+
+## 检索（FTS5 + LIKE 双路径）
+
+`store.search_messages()` 按关键词长度分流：
+
+| 条件 | 路径 |
+|---|---|
+| 长度 ≥ `FTS_MIN_CHARS`（3）且 FTS 可用 | `messages_fts` trigram 索引 |
+| 长度 ≤ 2 | LIKE 回退 |
+| FTS 建表失败 | 全程 LIKE |
+
+**为什么不是纯 FTS5**：trigram 分词器匹配不了少于 3 个字符的查询，
+中文"苹果""天气"双字检索是主流场景，必须回退。
+
+> ⚠️ 不要改成 `unicode61`——它把整句当一个 token，中文子串完全搜不到（实测）。
+
+索引由 `messages_fts_insert/delete/update` 三个触发器自动同步，
+新增写入路径不需要手动维护索引。
+
+## 增量渲染
+
+`planMessages(messages, sessionId)` 生成纯数据渲染计划，`diffPlan(prev, next)`
+比对后决定最小变更：
+
+| 场景 | 模式 | DOM 操作 |
+|---|---|---|
+| 尾部追加新消息 | `append` | 只 append 新增节点 |
+| 尾部删除消息 | `truncate` | 只移除尾部节点 |
+| 中间增删改 / 切换会话 | `rebuild` | `replaceChildren` |
+
+节点签名包含 type / timestamp / senderName / content / segments 长度 / pending，
+任一变化都会触发 rebuild。`state.renderPlan` 缓存上一轮计划，
+`state.renderSessionId` 用于切换会话时强制重建。
 
 ## 群聊会话合并
 
-**关键设计**: 群聊消息用 `group:{group_id}` 作为 session_key，同群所有人消息归入同一会话。发送时用 `send_target`（原始 UMO）路由到群。`_extract_group_name()` 从 `message_obj.raw_message.group_name` 提取群名。
+群聊消息用 `group:{group_id}` 作为 session_key，同群所有人归一个会话；发送时用 `send_target`（原始 UMO）路由。`_extract_group_name()` 从 `raw_message` 多路兜底取群名。
+
+## 组件识别
+
+`serialize_component()` 按**类名**判断组件类型，不 import 宿主组件类：
+- 先精确匹配 `_COMPONENT_ALIASES`
+- 再对长度 ≥5 的别名做**后缀匹配**（兼容 `AiocqhttpPlain` 这类子类）
+- 短别名（`at` / `face`）只认 **CamelCase 结尾**（`TextAt`、`LarkFace`），大小写敏感
+- 都不命中则降级为 `other`，保留类名与可见文本
+
+> 短别名必须保留大写边界：否则 `Format` 会被当成 `at`、`Surface` 当成 `face`。
+
+## @ 提及还原（mention）
+
+**问题**：LLM 会用 `<mention id="123"/>`、`<mention>小明</mention>`、`<at qq="1"/>`
+这类占位标签表达「@某人」，但 AstrBot 核心层**没有解析它们的约定**——标签会原样发到
+聊天平台，用户看到字面 `<mention>`，被 @ 的人也收不到提醒。
+
+**修复分三层**（缺一层就会漏）：
+
+| 层 | 位置 | 作用 |
+|---|---|---|
+| 发送前 | `on_before_send`（`filter.on_decorating_result`） | 把标签改写成真实 `At`，**这是根治点** |
+| 入库兜底 | `on_bot_message_sent` | 流式输出不经过前一个钩子，这里再改写一次 |
+| 终端发送 | `api_send` | 手打 `@昵称` / `@QQ号` 也解析成 `At` |
+
+**解析规则**（`webchat_core.text_to_segments`）：
+
+- `has_mention_markup()` 快速判断，普通消息零开销直接放行
+- 认 `<mention>`/`<at>` 的四类写法：成对、冒号、属性、自闭合；`id/qq/user_id/uid/target` 都算 ID
+- 昵称 → ID 由 `MessageStore.mention_resolver(session_key)` 解析：**先本会话参与者，再全局联系人**
+  （同名不同人时优先本会话，避免 @ 错人）
+- **解析不出来就退化成 `@昵称` 明文**，绝不允许尖括号标签外泄
+- `@全体成员` / `@all` 映射成 `target="all"`
+- 手打 `@` 只在**解析成功时**才转 `At`；邮箱（`a@b.com`）、`@ 空格`、`@数字` 不受影响
+
+> ⚠️ 改写后若整条链**只剩 At**，必须补一个 `\u200b` 明文段。AstrBot 的 respond 阶段会
+> 跳过「只含 Reply/At」的消息链（`astrbot/core/pipeline/respond/stage.py`），否则消息被静默丢弃。
+
+> ⚠️ `_send_fingerprint()` 把 @ 折成 `@名` 并去掉全部空白，用于终端回声去重。
+> 文本被拆成 `At + 文本` 后表示会变，不归一化就会让同一条消息入库两次。
 
 ## SSE 实时推送
 
 - 端点: `GET /api/plug/astrbot_plugin_webchat/stream`
-- 事件: `message`（新消息）、`session`（新会话）、`connected`（连接成功）
-- keepalive: 每 15 秒发送注释行
-- 客户端断开自动清理队列
-- 前端自动降级回轮询（2 秒间隔）
+- 事件: `connected`、`hello`、`message`、`session`、`session_updated`、`session_removed`、`message_removed`、`cleared`
+- keepalive: 每 15 秒注释行
+- 前端优先 `bridge.subscribeSSE("stream", ...)`；bridge 无此方法才退回原生 `EventSource`
+- 全部失败时降级轮询（2.5 秒）
+
+## 前端约束（iframe 沙箱）
+
+插件视图跑在 `allow-scripts allow-forms allow-downloads` 的 iframe 里，**没有** `allow-modals`、**没有**同源 localStorage：
+
+- ❌ 不要用 `window.confirm` / `alert` — 会被静默忽略。用 `confirmDialog()` / `formDialog()`
+- ⚠️ `localStorage` 可能抛异常，读写一律 try/catch 并回退
+- ⚠️ bridge 只有 `apiGet` / `apiPost`（新版本另有 `apiFetch`）；PATCH/DELETE 走后端 `?method=` 覆盖，后端 `_effective_method()` 解析
+- 图片走 `/media?url=` 代理，规避防盗链与混合内容
 
 ## 配置 (`_conf_schema.json`)
 
 ```json
 {
-  "max_log_per_session": { "type": "int", "default": 200 }
+  "max_log_per_session": { "type": "int", "default": 200 },
+  "capture_bot_messages": { "type": "bool", "default": true },
+  "bot_display_name": { "type": "string", "default": "Bot" },
+  "convert_mention_tags": { "type": "bool", "default": true },
+  "parse_bare_at": { "type": "bool", "default": true }
 }
 ```
+
+## 测试
+
+| 命令 | 覆盖 |
+|---|---|
+| `ruff check .` | 后端 lint |
+| `python -m pytest tests -q` | 存储/序列化 + 插件行为（假宿主）|
+| `node --test pages/terminal/webchat-lib.test.js` | 前端纯函数 |
+| `node tests/frontend/dom-smoke.mjs` | jsdom 端到端（需 `npm i jsdom`）|
+
+`tests/test_plugin.py` 用 `sys.modules` 注入假 AstrBot/Quart，因此**不需要装 AstrBot 就能跑**。
+新增宿主 API 依赖时，记得同步在 `_install_fake_astrbot()` 里补桩。
 
 ## 发布流程
 
 版本号在 `metadata.yaml`:
 - 手动改 `version: x.x.x` → 推 main
 - GitHub Actions 自动检测变更 → 创建 `v{x.x.x}` tag + Release (自动生成 changelog)
+- `ci.yml` 在每次 push/PR 跑 lint + 三套测试 + 元数据校验
 
 ## 代码约定
 
-- **无外部依赖**（除 AstrBot SDK + Quart）
+- **运行时零外部依赖**（除 AstrBot SDK + Quart）；`aiohttp` 按需延迟导入
 - 群聊 session_key 始终以 `group:` 开头，不要依赖 UMO 格式解析
-- `_register_session()` 是幂等的 — 已存在则只更新 `send_target`
-- `_query_messages(limit=N)` 返回**最新** N 条（用子查询 `ORDER BY timestamp DESC LIMIT N` 再外层正序排）
-- frontend: `const sessionMessages = {}` 是唯一消息缓存，切换会话不做 API 请求
+- `_ensure_session()` 幂等 — 已存在时只更新非空字段，不覆盖置顶/自定义名
+- 消息读取一律按 id 排序做游标，避免 timestamp 重复或乱序导致漏数据
+- 前端缓存 `state.messages` / `state.history` 是唯一真相，切换会话不再请求
+- 刷新会话时保留用户已翻出的更早历史，不要整段覆盖

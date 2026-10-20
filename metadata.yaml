@@ -1,5 +1,45 @@
 name: astrbot_plugin_webchat
-description: Web 终端向 QQ 群发送和接收消息
-version: 0.3.1
+display_name: WebChat 消息终端
+short_desc: 在 WebUI 里收发并检索所有会话的消息，双向记录 Bot 与人工消息。
+desc: >-
+  为 AstrBot 提供一个 Web 消息终端页面：自动发现已接入的群聊与私聊，
+  实时收发消息，并完整记录 Bot 回复与人工发送的双向对话。
+
+  - 双向记录：入站消息与 Bot / 插件主动推送的出站消息都会入库
+  - 富媒体：图片、@、表情、语音、文件、合并转发按片段保存与渲染
+  - @ 生效：LLM 回复里的 <mention> 标签与手打 @昵称 会还原成真实 At 消息段
+  - 实时推送：优先使用 bridge SSE，不可用时自动降级为轮询
+  - 历史检索：按关键词全文搜索消息，点击即可跳转定位
+  - 会话管理：置顶、导出、删除会话，主动发起新会话
+  - 身份映射：展示群号、私聊 ID、发送者 ID 与最新昵称
+  - 数据安全：记录保存在 data/plugin_data 目录，重装插件不丢失
+version: 0.4.0
 author: NoelOrin
 repo: https://github.com/NoelOrin/astrbot_plugin_webchat
+astrbot_version: ">=4.0.0"
+support_platforms:
+  - aiocqhttp
+  - qq_official
+  - qq_official_webhook
+  - telegram
+  - wecom
+  - wecom_ai_bot
+  - lark
+  - dingtalk
+  - discord
+  - slack
+  - kook
+  - vocechat
+  - weixin_official_account
+  - weixin_oc
+  - satori
+  - misskey
+  - line
+  - matrix
+  - mattermost
+tags:
+  - webui
+  - chat
+  - message
+  - log
+social_link: https://github.com/NoelOrin

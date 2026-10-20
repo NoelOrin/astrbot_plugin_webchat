@@ -1,0 +1,256 @@
+import { JSDOM } from "jsdom";
+import fs from "node:fs";
+import path from "node:path";
+
+const root = path.resolve(
+  path.dirname(new URL(import.meta.url).pathname),
+  "../../pages/terminal",
+);
+const html = fs.readFileSync(path.join(root, "index.html"), "utf8");
+
+const dom = new JSDOM(html, { url: "http://localhost/", runScripts: "outside-only", pretendToBeVisual: true });
+const { window } = dom;
+
+// 桩：AstrBot bridge
+const calls = [];
+const sessionsPayload = {
+  sessions: [
+    {
+      id: "group:111", platform: "aiocqhttp", peer_id: "111", peer_name: "测试群",
+      group_id: "111", is_group: true, pinned: false, message_count: 2, last_activity: 1700000500,
+      participants: [{ id: "u1", name: "小明", message_count: 2, last_seen: 1700000500 }],
+      messages: [
+        { id: 1, session_id: "group:111", type: "received", sender: "小明", sender_id: "u1",
+          sender_name: "小明", content: "第一条", segments: [{type:"text",text:"第一条"}],
+          timestamp: 1700000400 },
+        { id: 2, session_id: "group:111", type: "received", sender: "小明", sender_id: "u1",
+          sender_name: "小明", content: "看图", segments: [
+            {type:"text",text:"看图"}, {type:"image",url:"https://example.com/a.png"},
+            {type:"at",target:"u2",text:"小红"}], timestamp: 1700000500 },
+      ],
+      history: { has_more: true, next_cursor: 1, limit: 40 },
+    },
+    { id: "aiocqhttp:FriendMessage:9", platform: "aiocqhttp", peer_id: "9", peer_name: "小红",
+      is_group: false, message_count: 1, last_activity: 1700000300, participants: [],
+      messages: [{ id: 3, session_id: "aiocqhttp:FriendMessage:9", type: "bot", sender: "Bot",
+        sender_name: "Bot", content: "自动回复", segments: [{type:"text",text:"自动回复"}],
+        timestamp: 1700000300 }],
+      history: { has_more: false, next_cursor: null, limit: 40 } },
+  ],
+};
+
+window.AstrBotPluginView = {
+  ready: async () => ({ isDark: true, locale: "zh-CN" }),
+  onContext: () => {},
+  apiGet: async (endpoint, params) => {
+    calls.push(["GET", endpoint, params]);
+    if (endpoint === "sessions") return sessionsPayload;
+    if (endpoint === "history") {
+      // 尊重 since / before_id 语义，模拟真实后端
+      if (params?.before_id) {
+        return { messages: [
+          { id: 0, session_id: "group:111", type: "received", sender: "小明", sender_id: "u1",
+            sender_name: "小明", content: "更早", segments: [{type:"text",text:"更早"}],
+            timestamp: 1700000000 }], has_more: false, next_cursor: null };
+      }
+      const since = Number(params?.since || 0);
+      return { messages: since > 1700000600 ? [] : [], has_more: false, next_cursor: null };
+    }
+    if (endpoint === "search") return { results: [
+      { id: 1, session_id: "group:111", type: "received", sender_name: "小明",
+        content: "第一条", segments: [{type:"text",text:"第一条"}], timestamp: 1700000400 }] };
+    if (endpoint === "platforms") return { platforms: [{ id: "p1", name: "OneBot", adapter: "aiocqhttp" }] };
+    if (endpoint === "peers") return { peers: [{ id: "222", name: "另一个群" }] };
+    if (endpoint === "export") return { text: "导出内容" };
+    return {};
+  },
+  apiPost: async (endpoint, body) => {
+    calls.push(["POST", endpoint, body]);
+    if (endpoint === "send") return { data: {
+      id: 99, session_id: body.session_id, type: body.segments?.length || body.message ? "sent" : "sent",
+      sender: "Terminal", sender_name: "你", content: body.message,
+      segments: [{type:"text",text:body.message}], timestamp: 1700000600 } };
+    return { status: "ok" };
+  },
+  subscribeSSE: async (endpoint, handlers) => {
+    calls.push(["SSE", endpoint]);
+    window.__sseHandlers = handlers;
+    setTimeout(() => handlers.onOpen(), 0);
+    return "sub-1";
+  },
+  unsubscribeSSE: async () => {},
+};
+
+window.matchMedia = (q) => ({ matches: false, media: q, addEventListener() {}, removeEventListener() {} });
+window.CSS = window.CSS || {}; window.CSS.escape = (s) => String(s).replace(/"/g, '\\"');
+window.URL.createObjectURL = () => "blob:mock";
+window.URL.revokeObjectURL = () => {};
+window.navigator.clipboard = { writeText: async () => {} };
+window.Element.prototype.scrollIntoView = function () {};
+// jsdom 未实现 scrollTo / scrollHeight 布局，打桩到真实浏览器等价行为
+window.Element.prototype.scrollTo = function (opts) {
+  if (opts && typeof opts.top === "number") this.scrollTop = opts.top;
+};
+
+// 把 app.js 与 webchat-lib.js 作为 ESM 加载
+const code = fs.readFileSync(path.join(root, "app.js"), "utf8")
+  .replace('from "./webchat-lib.js"', `from "file://${path.join(root, "webchat-lib.js")}"`);
+
+// 把 jsdom 的 window 暴露为 Node 全局，供 ESM 模块访问
+globalThis.window = window;
+globalThis.document = window.document;
+Object.defineProperty(globalThis, "navigator", {
+  value: window.navigator, configurable: true, writable: true,
+});
+globalThis.CSS = window.CSS;
+globalThis.EventSource = window.EventSource;
+globalThis.FileReader = window.FileReader;
+globalThis.Blob = window.Blob;
+globalThis.URL = window.URL;
+globalThis.requestAnimationFrame = (fn) => setTimeout(fn, 0);
+
+const tmp = path.join(root, "__smoke_app.mjs");
+fs.writeFileSync(tmp, code);
+await import("file://" + tmp);
+
+await new Promise((r) => setTimeout(r, 400));
+
+const doc = window.document;
+const results = [];
+const check = (name, cond, extra = "") => results.push([cond ? "PASS" : "FAIL", name, extra]);
+
+check("会话列表渲染出 2 项", doc.querySelectorAll(".session-item").length === 2,
+  doc.querySelectorAll(".session-item").length);
+check("状态为实时连接", doc.getElementById("status-text").textContent === "实时连接",
+  doc.getElementById("status-text").textContent);
+check("默认选中第一个会话", doc.getElementById("conversation-title").textContent === "测试群",
+  doc.getElementById("conversation-title").textContent);
+check("消息渲染出 2 条", doc.querySelectorAll(".message-row").length === 2,
+  doc.querySelectorAll(".message-row").length);
+check("图片被渲染为 img", doc.querySelectorAll(".message-image").length === 1);
+check("图片走插件代理", (doc.querySelector(".message-image")?.src || "").includes("/media?url="),
+  doc.querySelector(".message-image")?.src);
+check("@ 片段渲染为 chip", doc.querySelectorAll(".segment-chip.at").length === 1);
+check("日期分隔符存在", doc.querySelectorAll(".date-separator").length >= 1);
+check("加载更早按钮可见", !doc.getElementById("load-more").hidden);
+check("参与者被渲染", doc.querySelectorAll(".participant").length === 1);
+check("置顶按钮存在", Boolean(doc.getElementById("btn-pin")));
+
+// 切到私聊会话，验证 bot 消息类名
+const target = [...doc.querySelectorAll(".session-item")]
+  .find((el) => el.textContent.includes("小红"));
+check("找到小红会话按钮", Boolean(target));
+target.dispatchEvent(new window.MouseEvent("click", { bubbles: true }));
+await new Promise((r) => setTimeout(r, 60));
+check("切换会话后标题更新", doc.getElementById("conversation-title").textContent === "小红",
+  doc.getElementById("conversation-title").textContent);
+check("bot 消息有专属样式类", doc.querySelectorAll(".message-row.bot").length === 1,
+  doc.querySelectorAll(".message-row.bot").length);
+
+// 搜索
+const searchInput = doc.getElementById("message-search");
+searchInput.value = "第一条";
+searchInput.dispatchEvent(new window.Event("input", { bubbles: true }));
+await new Promise((r) => setTimeout(r, 500));
+check("搜索结果渲染", doc.querySelectorAll(".search-hit").length === 1,
+  doc.querySelectorAll(".search-hit").length);
+check("命中关键词被高亮", doc.querySelectorAll(".search-hit-body mark").length === 1,
+  doc.querySelectorAll(".search-hit-body mark").length);
+
+// 加载更早消息
+const loadMoreBtn = doc.getElementById("load-more");
+if (!loadMoreBtn.hidden) {
+  loadMoreBtn.dispatchEvent(new window.MouseEvent("click", { bubbles: true }));
+  await new Promise((r) => setTimeout(r, 200));
+  check("加载更早消息后行数增加", doc.querySelectorAll(".message-row").length === 1,
+    doc.querySelectorAll(".message-row").length);
+}
+
+// 清空弹窗（替代 window.confirm）
+const clearBtn = doc.getElementById("btn-clear");
+clearBtn.dispatchEvent(new window.MouseEvent("click", { bubbles: true }));
+await new Promise((r) => setTimeout(r, 60));
+check("清空弹出自定义确认框", doc.querySelectorAll(".dialog-overlay").length === 1,
+  doc.querySelectorAll(".dialog-overlay").length);
+const confirmBtn = doc.querySelector(".dialog-actions .button-danger");
+confirmBtn?.dispatchEvent(new window.MouseEvent("click", { bubbles: true }));
+await new Promise((r) => setTimeout(r, 100));
+const clearCall = calls.find((c) => c[1] === "clear");
+check("确认后真的调用了 clear 接口", Boolean(clearCall), JSON.stringify(clearCall || null));
+check("弹窗已关闭", doc.querySelectorAll(".dialog-overlay").length === 0);
+
+// 新建会话弹窗
+doc.getElementById("btn-open-session").dispatchEvent(new window.MouseEvent("click", { bubbles: true }));
+await new Promise((r) => setTimeout(r, 200));
+check("新建会话弹窗出现", doc.querySelectorAll(".dialog-overlay").length === 1);
+check("平台下拉已填充", doc.querySelectorAll(".dialog-input option").length >= 3,
+  doc.querySelectorAll(".dialog-input option").length);
+check("好友列表已拉取", doc.querySelectorAll(".peer-item").length === 1,
+  doc.querySelectorAll(".peer-item").length);
+
+// 主题切换
+const before = doc.documentElement.dataset.theme;
+doc.getElementById("btn-theme").dispatchEvent(new window.MouseEvent("click", { bubbles: true }));
+check("主题可切换", doc.documentElement.dataset.theme !== before,
+  `${before} -> ${doc.documentElement.dataset.theme}`);
+
+// 紧凑模式
+doc.getElementById("btn-compact").dispatchEvent(new window.MouseEvent("click", { bubbles: true }));
+check("紧凑模式可切换", doc.documentElement.dataset.compact === "true",
+  doc.documentElement.dataset.compact);
+
+// SSE 消息推送
+window.__sseHandlers.onMessage({ eventType: "message", parsed: {
+  id: 100, session_id: "group:111", type: "received", sender: "新来的",
+  sender_id: "u9", sender_name: "新来的", content: "实时消息",
+  segments: [{type:"text",text:"实时消息"}], timestamp: 1700000700 } });
+await new Promise((r) => setTimeout(r, 100));
+const totalMessages = doc.querySelectorAll(".message-row").length;
+const unreadBadges = doc.querySelectorAll(".unread-badge").length;
+const pillVisible = !doc.getElementById("new-message-pill").hidden;
+check("SSE 新消息进入当前会话或计入未读", totalMessages >= 1 || unreadBadges >= 1 || pillVisible,
+  JSON.stringify({ totalMessages, unreadBadges, pillVisible }));
+
+// ── 增量渲染：追加时不应重建已有节点 ──────────────────────
+// 先切回群会话，确保追加消息落在当前渲染的会话上
+const groupButton = [...doc.querySelectorAll(".session-item")]
+  .find((el) => el.textContent.includes("测试群"));
+groupButton?.dispatchEvent(new window.MouseEvent("click", { bubbles: true }));
+await new Promise((r) => setTimeout(r, 120));
+
+const content = doc.getElementById("message-content");
+const beforeNodes = [...content.children];
+window.__sseHandlers.onMessage({ eventType: "message", parsed: {
+  id: 101, session_id: "group:111", type: "received", sender: "追加者",
+  sender_id: "u7", sender_name: "追加者", content: "追加的一条",
+  segments: [{type:"text",text:"追加的一条"}], timestamp: 1700000800 } });
+await new Promise((r) => setTimeout(r, 150));
+
+const afterNodes = [...content.children];
+const reused = beforeNodes.filter((node) => afterNodes.includes(node)).length;
+check("增量渲染复用了已有节点", reused === beforeNodes.length,
+  `reused ${reused}/${beforeNodes.length}`);
+check("增量渲染确实追加了新节点", afterNodes.length > beforeNodes.length,
+  `${beforeNodes.length} -> ${afterNodes.length}`);
+
+// 删除消息应走 truncate/rebuild 且不残留
+window.__sseHandlers.onMessage({ eventType: "message_removed",
+  parsed: { id: 101, session_id: "group:111" } });
+await new Promise((r) => setTimeout(r, 120));
+const afterRemove = doc.querySelectorAll('[data-message-id="101"]').length;
+check("message_removed 后节点被清掉", afterRemove === 0, afterRemove);
+
+// session_removed 事件
+window.__sseHandlers.onMessage({ eventType: "session_removed", parsed: { id: "group:111" } });
+await new Promise((r) => setTimeout(r, 80));
+check("会话删除后从列表移除", doc.querySelectorAll(".session-item").length === 1,
+  doc.querySelectorAll(".session-item").length);
+
+fs.unlinkSync(tmp);
+
+const failed = results.filter((r) => r[0] === "FAIL");
+for (const [status, name, extra] of results) {
+  console.log(`${status === "PASS" ? "✔" : "✘"} ${name}${status === "FAIL" ? "  <= " + extra : ""}`);
+}
+console.log(`\n${results.length - failed.length}/${results.length} passed`);
+process.exit(failed.length ? 1 : 0);

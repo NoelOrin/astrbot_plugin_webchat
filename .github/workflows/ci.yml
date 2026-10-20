@@ -1,0 +1,86 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  backend:
+    name: Backend (ruff + pytest)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install tooling
+        run: pip install ruff pytest
+
+      - name: Lint
+        run: ruff check .
+
+      - name: Test
+        run: python -m pytest tests -q
+
+  frontend:
+    name: Frontend (node --test + DOM smoke)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Syntax check
+        run: node --check pages/terminal/app.js
+
+      - name: Pure function tests
+        run: node --test pages/terminal/webchat-lib.test.js
+
+      - name: DOM smoke test
+        run: |
+          npm install --no-save jsdom
+          node tests/frontend/dom-smoke.mjs
+
+  metadata:
+    name: Metadata sanity
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Verify metadata.yaml and schema are valid
+        run: |
+          pip install pyyaml
+          python - <<'PY'
+          import json, pathlib, sys, yaml
+
+          meta_path = pathlib.Path("metadata.yaml")
+          meta = yaml.safe_load(meta_path.read_text(encoding="utf-8"))
+          required = ["name", "desc", "version", "author", "repo"]
+          missing = [key for key in required if not meta.get(key)]
+          if missing:
+              print(f"metadata.yaml 缺少字段: {missing}")
+              sys.exit(1)
+          print("metadata.yaml OK:", meta["name"], meta["version"])
+
+          for path in pathlib.Path(".astrbot-plugin/i18n").glob("*.json"):
+              json.loads(path.read_text(encoding="utf-8"))
+              print("i18n OK:", path)
+
+          schema = json.loads(pathlib.Path("_conf_schema.json").read_text(encoding="utf-8"))
+          for key, spec in schema.items():
+              if "type" not in spec:
+                  print(f"_conf_schema.json 条目 {key} 缺少 type")
+                  sys.exit(1)
+          print("_conf_schema.json OK:", len(schema), "items")
+          PY

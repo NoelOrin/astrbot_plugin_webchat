@@ -1,0 +1,1206 @@
+"""
+webchat_core — 纯逻辑层。
+
+本模块**不导入 AstrBot**，只依赖标准库，因此可以脱离宿主框架独立单元测试：
+
+    pytest tests/
+
+职责：
+  * 消息链 ↔ 可存储片段（segments）的相互转换
+  * SQLite 存储（WAL、忙等待、按 id 裁剪、游标分页、批量汇总、全文检索）
+  * 会话键（session key）构造与输入清洗
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+import os
+import re
+import sqlite3
+import time
+from collections.abc import Callable, Iterable, Sequence
+from typing import Any
+
+SCHEMA_VERSION = 3
+
+# FTS5 trigram 分词器无法匹配少于 3 个字符的查询（"苹果" 命中不了）。
+# 中文双字检索极常见，所以更短的查询走 LIKE 回退。
+FTS_MIN_CHARS = 3
+
+DEFAULT_MAX_LOG = 200
+MAX_PAGE_SIZE = 200
+MAX_SEARCH_LIMIT = 200
+
+# 消息类型：received = 对方发来的；sent = 从 Web 终端手动发出；bot = Bot/插件自动发出
+MESSAGE_TYPES = ("received", "sent", "bot")
+
+# 片段类型，前端按 type 决定渲染方式
+SEGMENT_TYPES = (
+    "text",
+    "image",
+    "at",
+    "face",
+    "record",
+    "video",
+    "file",
+    "reply",
+    "forward",
+    "other",
+)
+
+
+# ── 数值与输入清洗 ────────────────────────────────────────────────────
+
+
+def now_ts() -> float:
+    """当前时间戳（秒，浮点）。"""
+    return time.time()
+
+
+def coerce_float(value: Any, default: float = 0.0) -> float:
+    """把任意输入转成有限浮点数，失败时回退默认值。"""
+    try:
+        result = float(value)
+    except (TypeError, ValueError):
+        return default
+    if result != result or result in (float("inf"), float("-inf")):
+        return default
+    return result
+
+
+def clamp_int(value: Any, low: int, high: int, default: int) -> int:
+    """把任意输入转成 [low, high] 区间内的整数。"""
+    try:
+        result = int(value)
+    except (TypeError, ValueError):
+        return default
+    return max(low, min(high, result))
+
+
+def coerce_bool(value: Any, default: bool = False) -> bool:
+    """宽松布尔转换，兼容 "1"/"true"/"yes"/"on"。"""
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return default
+    if isinstance(value, (int, float)):
+        return bool(value)
+    text = str(value).strip().lower()
+    if text in ("1", "true", "yes", "on", "y"):
+        return True
+    if text in ("0", "false", "no", "off", "n", ""):
+        return False
+    return default
+
+
+def session_key_for_group(group_id: Any) -> str:
+    """群聊会话键。群聊始终用 group:<id>，不依赖 UMO 格式。"""
+    return f"group:{str(group_id or '').strip()}"
+
+
+def session_key_for_private(umo: str, peer_id: Any = "") -> str:
+    """私聊会话键。优先用 UMO（可回发），缺失时退回 peer id。"""
+    umo_text = str(umo or "").strip()
+    if umo_text:
+        return umo_text
+    peer_text = str(peer_id or "").strip()
+    return f"private:{peer_text}" if peer_text else ""
+
+
+def make_session_key(is_group: bool, group_id: Any, umo: str, peer_id: Any = "") -> str:
+    """按群聊/私聊规则生成稳定的会话键。"""
+    if is_group:
+        return session_key_for_group(group_id)
+    return session_key_for_private(umo, peer_id)
+
+
+# ── 消息片段序列化 ────────────────────────────────────────────────────
+
+
+def _clean(value: Any) -> Any:
+    """把空值折叠成 None，便于从片段里剔除。"""
+    if value is None:
+        return None
+    if isinstance(value, str):
+        text = value.strip()
+        return text or None
+    return value
+
+
+def _first_attr(component: Any, *names: str) -> Any:
+    for name in names:
+        try:
+            value = getattr(component, name, None)
+        except Exception:  # 属性可能是会抛异常的 property
+            continue
+        cleaned = _clean(value)
+        if cleaned is not None:
+            return cleaned
+    return None
+
+
+# 组件类名 → 片段类型。比 SEGMENT_TYPES 多出 plain 等宿主组件名。
+_COMPONENT_ALIASES = {
+    "plain": "text",
+    "text": "text",
+    "at": "at",
+    "image": "image",
+    "face": "face",
+    "record": "record",
+    "video": "video",
+    "file": "file",
+    "reply": "reply",
+    "quote": "reply",
+    "node": "forward",
+    "nodes": "forward",
+    "forward": "forward",
+}
+
+# 仅对足够长的名字做后缀匹配，避免 "Format" 被误判成 at、"Surface" 判成 face
+_SUFFIX_MIN_LEN = 5
+
+# 短别名（at / face）不能裸后缀匹配，但宿主子类常用 CamelCase 结尾（TextAt、LarkFace）。
+# 要求首字母大写，才能把 "Format" 排除在外。
+_SHORT_ALIASES = {"at": "at", "face": "face"}
+
+
+def _component_kind(component: Any) -> str:
+    """按类名判断组件类型；先精确匹配，再对长子串做后缀匹配以兼容子类。"""
+    name = type(component).__name__
+    raw = name.lower()
+    if raw in _COMPONENT_ALIASES:
+        return _COMPONENT_ALIASES[raw]
+    for alias, kind in _COMPONENT_ALIASES.items():
+        if len(alias) >= _SUFFIX_MIN_LEN and raw.endswith(alias):
+            return kind
+    for alias, kind in _SHORT_ALIASES.items():
+        # "TextAt" 命中，"Format" 不命中（结尾是小写 at）
+        if len(name) > len(alias) and name.endswith(alias.capitalize()):
+            return kind
+    return raw
+
+
+def serialize_component(component: Any) -> dict:
+    """把单个消息组件转成可 JSON 存储的片段字典。
+
+    只做鸭子类型读取，不 import AstrBot 的组件类，避免版本差异导致 ImportError。
+    """
+    kind = _component_kind(component)
+    text = _first_attr(component, "text")
+    url = _first_attr(component, "url")
+    file = _first_attr(component, "file", "path")
+    name = _first_attr(component, "name", "file_name")
+
+    if kind == "text":
+        return {"type": "text", "text": str(text or "")}
+
+    if kind == "image":
+        segment = {
+            "type": "image",
+            "url": url,
+            "file": file,
+            "text": text,
+            "name": name,
+        }
+        return {k: v for k, v in segment.items() if v is not None}
+
+    if kind == "at":
+        qq = _first_attr(component, "qq", "user_id", "target")
+        # text 兜底：有些宿主 At 子类用 text 承载昵称
+        label = name or _first_attr(component, "text")
+        return {"type": "at", "target": str(qq) if qq is not None else "",
+                "text": str(label or qq or "")}
+
+    if kind == "face":
+        face_id = _first_attr(component, "id", "face_id")
+        return {"type": "face", "text": f"[表情 {face_id}]" if face_id else "[表情]"}
+
+    if kind == "record":
+        return {"type": "record", "url": url, "file": file, "text": "[语音]"}
+
+    if kind in ("video",):
+        return {"type": "video", "url": url, "file": file, "text": "[视频]"}
+
+    if kind == "file":
+        return {"type": "file", "url": url, "file": file, "text": f"[文件] {name or ''}".strip()}
+
+    if kind in ("reply", "quote"):
+        reply_id = _first_attr(component, "id", "message_id")
+        return {"type": "reply", "target": str(reply_id) if reply_id else "",
+                "text": "[引用]"}
+
+    if kind in ("node", "nodes", "forward"):
+        return {"type": "forward", "text": text or "[合并转发]"}
+
+    # 未知组件：保留类型名与可见文本，避免信息全丢
+    return {"type": "other", "name": kind, "text": str(text or f"[{kind}]")}
+
+
+def serialize_chain(chain: Iterable[Any] | None) -> list[dict]:
+    """把消息链转成片段列表；跳过空文本片段。"""
+    if not chain:
+        return []
+    segments: list[dict] = []
+    for component in chain:
+        try:
+            segment = serialize_component(component)
+        except Exception:
+            continue
+        if segment.get("type") == "text" and not segment.get("text"):
+            continue
+        segments.append(segment)
+    return segments
+
+
+# ── 出站文本 → 片段（把 <mention> 标签 / 手打 @ 还原成真实 At） ──────────
+
+# LLM 与插件常用 <mention id="123"/> 这类占位标记表达「@某人」。
+# AstrBot 核心层并没有解析它们的约定，于是会原样发到聊天平台——
+# 用户看到的是字面的 "<mention>"，被 @ 的人当然收不到提醒。
+_TAG = r"(?:mention|at)"
+
+_MENTION_TOKEN_RE = re.compile(
+    rf"""
+    <(?P<paired_tag>{_TAG})\s*>\s*(?P<paired_name>[^<>]{{1,64}}?)\s*</(?P=paired_tag)\s*>
+  | <(?P<colon_tag>{_TAG})\s*:\s*(?P<colon_id>[^<>\s]+)\s*>
+  | <(?P<attr_tag>{_TAG})(?P<attrs>[^<>]*?)/?>
+  | </?(?P<stray_tag>{_TAG})\s*/?>
+    """,
+    re.VERBOSE | re.IGNORECASE,
+)
+
+_MENTION_ID_ATTR_RE = re.compile(
+    r"""(?:^|\s)(?:id|qq|user_id|uid|qq_id|target)\s*=\s*["']?\s*([^"'\s/>]+)""",
+    re.IGNORECASE,
+)
+
+# 手打 @昵称 / @QQ号。邮箱（a@b.com）与 "@ 一下" 这类写法必须排除在外。
+_BARE_AT_RE = re.compile(r"(?<![A-Za-z0-9_.@\-])@(?P<name>[A-Za-z0-9_\u4e00-\u9fff·\-]{1,32})")
+
+_ALL_ALIASES = frozenset({"all", "everyone", "全体", "全体成员", "所有人"})
+
+
+def has_mention_markup(text: Any) -> bool:
+    """文本里是否含 <mention ...> / <at ...> 标记（用于跳过绝大多数普通消息）。"""
+    if not text:
+        return False
+    return bool(_MENTION_TOKEN_RE.search(str(text)))
+
+
+def text_to_segments(
+    text: Any,
+    resolve: Callable[[str], str | None] | None = None,
+    *,
+    allow_bare_at: bool = True,
+) -> list[dict]:
+    """把一段出站文本拆成片段，把 @ 语义还原成 at 片段。
+
+    ``resolve`` 把昵称 / QQ 号映射成用户 ID；查不到时**保留人类可读的 @昵称**，
+    绝不会把尖括号标签原样留在消息里。
+    """
+    raw = "" if text is None else str(text)
+    if not raw:
+        return []
+
+    segments: list[dict] = []
+    cursor = 0
+    for match in _MENTION_TOKEN_RE.finditer(raw):
+        _append_text(segments, raw[cursor:match.start()], resolve, allow_bare_at)
+        cursor = match.end()
+        segment = _mention_segment(match, resolve)
+        if segment is not None:
+            _push_segment(segments, segment)
+    _append_text(segments, raw[cursor:], resolve, allow_bare_at)
+    return segments
+
+
+def _resolve_mention(name: str, resolve: Callable[[str], str | None] | None) -> str:
+    target = str(name or "").strip()
+    if not target:
+        return ""
+    if target.lower() in _ALL_ALIASES:
+        return "all"
+    if resolve is None:
+        return ""
+    try:
+        resolved = resolve(target)
+    except Exception:
+        return ""
+    return str(resolved).strip() if resolved else ""
+
+
+def _at_segment(target: str, text: str = "") -> dict:
+    segment = {"type": "at", "target": str(target)}
+    if text:
+        segment["text"] = text
+    return segment
+
+
+def _mention_segment(
+    match: re.Match, resolve: Callable[[str], str | None] | None
+) -> dict | None:
+    paired = match.group("paired_name")
+    if paired is not None:
+        name = paired.strip()
+        if not name:
+            return None
+        target = _resolve_mention(name, resolve)
+        if target:
+            return _at_segment(target, name)
+        # 解析不出 ID 时退化成可读文本，标签本身不能外泄
+        return {"type": "text", "text": f"@{name}"}
+
+    colon_id = match.group("colon_id")
+    if colon_id:
+        return _at_segment(colon_id)
+
+    attrs = match.group("attrs")
+    if attrs:
+        found = _MENTION_ID_ATTR_RE.search(attrs)
+        if found:
+            return _at_segment(found.group(1))
+    return None
+
+
+def _append_text(
+    segments: list[dict],
+    chunk: str,
+    resolve: Callable[[str], str | None] | None,
+    allow_bare_at: bool,
+) -> None:
+    if not chunk:
+        return
+    if not allow_bare_at or resolve is None:
+        _push_segment(segments, {"type": "text", "text": chunk})
+        return
+
+    cursor = 0
+    for match in _BARE_AT_RE.finditer(chunk):
+        name = match.group("name")
+        target = _resolve_mention(name, resolve)
+        if not target:
+            continue  # 查不到就整段原样保留，避免误伤正文里的 @
+        _push_segment(segments, {"type": "text", "text": chunk[cursor:match.start()]})
+        _push_segment(segments, _at_segment(target, name))
+        cursor = match.end()
+    _push_segment(segments, {"type": "text", "text": chunk[cursor:]})
+
+
+def _push_segment(segments: list[dict], segment: dict) -> None:
+    """追加片段；相邻文本合并，空文本丢弃。"""
+    if segment.get("type") != "text":
+        segments.append(segment)
+        return
+    text = str(segment.get("text") or "")
+    if not text:
+        return
+    if segments and segments[-1].get("type") == "text":
+        segments[-1]["text"] = str(segments[-1].get("text") or "") + text
+        return
+    segments.append({"type": "text", "text": text})
+
+
+def segments_to_text(segments: Sequence[dict] | None) -> str:
+    """把片段列表折成纯文本预览（不含图片/文件占位之外的冗余信息）。"""
+    if not segments:
+        return ""
+    parts: list[str] = []
+    for segment in segments:
+        kind = segment.get("type")
+        if kind == "text":
+            parts.append(str(segment.get("text") or ""))
+        elif kind == "at":
+            parts.append(f"@{segment.get('text') or segment.get('target') or ''}")
+        elif kind == "image":
+            parts.append("[图片]")
+        elif kind in ("record", "video", "file", "forward"):
+            parts.append(str(segment.get("text") or f"[{kind}]"))
+        elif kind in ("face", "reply"):
+            parts.append(str(segment.get("text") or ""))
+    return "".join(parts).strip()
+
+
+def dumps_segments(segments: Sequence[dict] | None) -> str:
+    """片段列表 → JSON 字符串（落库用）。"""
+    try:
+        return json.dumps(list(segments or []), ensure_ascii=False)
+    except (TypeError, ValueError):
+        return "[]"
+
+
+def loads_segments(raw: Any) -> list[dict]:
+    """JSON 字符串 → 片段列表，坏数据一律降级为空列表。"""
+    if isinstance(raw, list):
+        return [item for item in raw if isinstance(item, dict)]
+    if not raw:
+        return []
+    try:
+        parsed = json.loads(raw)
+    except (TypeError, ValueError):
+        return []
+    if not isinstance(parsed, list):
+        return []
+    return [item for item in parsed if isinstance(item, dict)]
+
+
+def preview_of(message: dict) -> str:
+    """消息的一句话预览，供会话列表使用。"""
+    segments = message.get("segments") or []
+    text = segments_to_text(segments)
+    if text:
+        return text
+    return str(message.get("content") or "") or "[非文本消息]"
+
+
+# ── 存储层 ────────────────────────────────────────────────────────────
+
+_SCHEMA_SQL = """
+CREATE TABLE IF NOT EXISTS sessions (
+    id TEXT PRIMARY KEY,
+    platform TEXT NOT NULL DEFAULT '',
+    platform_id TEXT NOT NULL DEFAULT '',
+    group_id TEXT NOT NULL DEFAULT '',
+    group_name TEXT NOT NULL DEFAULT '',
+    is_group INTEGER NOT NULL DEFAULT 0,
+    send_target TEXT NOT NULL DEFAULT '',
+    peer_id TEXT NOT NULL DEFAULT '',
+    peer_name TEXT NOT NULL DEFAULT '',
+    pinned INTEGER NOT NULL DEFAULT 0,
+    display_order INTEGER NOT NULL DEFAULT 0,
+    created_at REAL NOT NULL DEFAULT 0
+);
+CREATE TABLE IF NOT EXISTS messages (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id TEXT NOT NULL,
+    type TEXT NOT NULL DEFAULT 'received',
+    sender TEXT NOT NULL DEFAULT '',
+    sender_id TEXT NOT NULL DEFAULT '',
+    content TEXT NOT NULL DEFAULT '',
+    segments TEXT NOT NULL DEFAULT '[]',
+    group_id TEXT NOT NULL DEFAULT '',
+    platform TEXT NOT NULL DEFAULT '',
+    platform_id TEXT NOT NULL DEFAULT '',
+    platform_message_id TEXT NOT NULL DEFAULT '',
+    timestamp REAL NOT NULL DEFAULT 0
+);
+CREATE TABLE IF NOT EXISTS contacts (
+    platform TEXT NOT NULL DEFAULT '',
+    user_id TEXT NOT NULL,
+    nickname TEXT NOT NULL DEFAULT '',
+    updated_at REAL NOT NULL DEFAULT 0,
+    PRIMARY KEY (platform, user_id)
+);
+CREATE TABLE IF NOT EXISTS meta (
+    key TEXT PRIMARY KEY,
+    value TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS idx_messages_session_ts ON messages(session_id, timestamp);
+CREATE INDEX IF NOT EXISTS idx_messages_session_id ON messages(session_id);
+CREATE INDEX IF NOT EXISTS idx_messages_sender_id ON messages(sender_id);
+"""
+
+# FTS5 索引：trigram 分词器支持子串匹配与中日韩文本，无需外部分词器。
+# 建表可能因 SQLite 编译选项失败，因此与主 schema 分开、允许降级。
+_FTS_SQL = """
+CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts
+    USING fts5(content, tokenize='trigram case_sensitive 0');
+"""
+
+# 用触发器让索引与 messages 表自动保持一致，避免每条写入路径都要手动维护。
+_FTS_TRIGGERS_SQL = """
+CREATE TRIGGER IF NOT EXISTS messages_fts_insert AFTER INSERT ON messages BEGIN
+    INSERT INTO messages_fts (rowid, content) VALUES (new.id, new.content);
+END;
+CREATE TRIGGER IF NOT EXISTS messages_fts_delete AFTER DELETE ON messages BEGIN
+    DELETE FROM messages_fts WHERE rowid = old.id;
+END;
+CREATE TRIGGER IF NOT EXISTS messages_fts_update AFTER UPDATE OF content ON messages BEGIN
+    DELETE FROM messages_fts WHERE rowid = old.id;
+    INSERT INTO messages_fts (rowid, content) VALUES (new.id, new.content);
+END;
+"""
+
+_fts_logger = logging.getLogger("astrbot_plugin_webchat.fts")
+
+
+def logger_fts_unavailable(exc: Exception) -> None:
+    """FTS5 不可用时只提示一次级别很低的日志——LIKE 回退仍然可用。"""
+    _fts_logger.info("FTS5 索引不可用，检索将回退到 LIKE: %s", exc)
+
+# 旧库升级：列名 → 建列 DDL 片段
+_SESSION_COLUMNS = {
+    "platform_id": "TEXT NOT NULL DEFAULT ''",
+    "peer_id": "TEXT NOT NULL DEFAULT ''",
+    "peer_name": "TEXT NOT NULL DEFAULT ''",
+    "pinned": "INTEGER NOT NULL DEFAULT 0",
+    "created_at": "REAL NOT NULL DEFAULT 0",
+}
+
+_MESSAGE_COLUMNS = {
+    "segments": "TEXT NOT NULL DEFAULT '[]'",
+    "platform_id": "TEXT NOT NULL DEFAULT ''",
+    "platform_message_id": "TEXT NOT NULL DEFAULT ''",
+}
+
+
+class MessageStore:
+    """SQLite 存储。每次操作独立连接，配合 WAL + busy_timeout 保证并发安全。"""
+
+    def __init__(self, db_path: str, max_log: int = DEFAULT_MAX_LOG):
+        self.db_path = db_path
+        self.max_log = max(1, int(max_log))
+        # FTS5 索引是否可用；不可用时全部查询走 LIKE 回退
+        self.fts_enabled = False
+        os.makedirs(os.path.dirname(os.path.abspath(db_path)) or ".", exist_ok=True)
+
+    # ── 连接与建表 ──────────────────────────────────────────────
+
+    def connect(self) -> sqlite3.Connection:
+        conn = sqlite3.connect(self.db_path, timeout=10.0)
+        conn.row_factory = sqlite3.Row
+        try:
+            conn.execute("PRAGMA journal_mode=WAL")
+            conn.execute("PRAGMA synchronous=NORMAL")
+            conn.execute("PRAGMA busy_timeout=5000")
+            conn.execute("PRAGMA foreign_keys=ON")
+        except sqlite3.DatabaseError:
+            pass
+        return conn
+
+    def init_schema(self) -> None:
+        """建表 + 旧库补列 + 回填历史数据。可重复调用。"""
+        conn = self.connect()
+        try:
+            conn.executescript(_SCHEMA_SQL)
+            self._ensure_columns(conn, "sessions", _SESSION_COLUMNS)
+            self._ensure_columns(conn, "messages", _MESSAGE_COLUMNS)
+            conn.execute(
+                "UPDATE sessions SET peer_id = COALESCE(NULLIF(group_id, ''), id) "
+                "WHERE is_group = 1 AND peer_id = ''"
+            )
+            conn.execute(
+                "UPDATE sessions SET peer_id = COALESCE(("
+                "SELECT sender_id FROM messages WHERE session_id = sessions.id "
+                "AND sender_id != '' ORDER BY id DESC LIMIT 1), id) "
+                "WHERE is_group = 0 AND peer_id = ''"
+            )
+            conn.execute(
+                "UPDATE sessions SET peer_name = group_name "
+                "WHERE peer_name = '' AND group_name != ''"
+            )
+            conn.execute("UPDATE sessions SET created_at = 0 WHERE created_at IS NULL")
+            conn.commit()
+            # 从历史消息回填联系人昵称（幂等）
+            conn.execute(
+                "INSERT OR IGNORE INTO contacts (platform, user_id, nickname, updated_at) "
+                "SELECT platform, sender_id, sender, MAX(timestamp) FROM messages "
+                "WHERE sender_id != '' AND sender != '' GROUP BY platform, sender_id"
+            )
+            self._init_fts(conn)
+            conn.execute(
+                "INSERT OR REPLACE INTO meta (key, value) VALUES ('schema_version', ?)",
+                (str(SCHEMA_VERSION),),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+    def _init_fts(self, conn: sqlite3.Connection) -> None:
+        """建 FTS5 索引并回填；SQLite 不支持时静默降级到 LIKE。"""
+        try:
+            conn.executescript(_FTS_SQL)
+            conn.executescript(_FTS_TRIGGERS_SQL)
+        except sqlite3.DatabaseError as exc:
+            self.fts_enabled = False
+            logger_fts_unavailable(exc)
+            return
+        self.fts_enabled = True
+        try:
+            indexed = conn.execute("SELECT COUNT(*) FROM messages_fts").fetchone()[0]
+            total = conn.execute("SELECT COUNT(*) FROM messages").fetchone()[0]
+            if indexed != total:
+                conn.execute("DELETE FROM messages_fts")
+                conn.execute(
+                    "INSERT INTO messages_fts (rowid, content) "
+                    "SELECT id, content FROM messages WHERE content != ''"
+                )
+        except sqlite3.DatabaseError as exc:
+            self.fts_enabled = False
+            logger_fts_unavailable(exc)
+
+    @staticmethod
+    def _ensure_columns(conn: sqlite3.Connection, table: str, columns: dict[str, str]) -> None:
+        existing = {row["name"] for row in conn.execute(f"PRAGMA table_info({table})")}
+        for name, ddl in columns.items():
+            if name not in existing:
+                conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {ddl}")
+
+    # ── 会话 ───────────────────────────────────────────────────
+
+    def upsert_session(self, session_id: str, meta: dict) -> None:
+        """幂等写入会话；已存在时只更新提供的非空字段。"""
+        conn = self.connect()
+        try:
+            conn.execute(
+                "INSERT INTO sessions (id, platform, platform_id, group_id, group_name, "
+                "is_group, send_target, peer_id, peer_name, pinned, display_order, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, "
+                "COALESCE((SELECT display_order FROM sessions WHERE id = ?), "
+                "         (SELECT COALESCE(MAX(display_order), 0) + 1 FROM sessions)), "
+                "COALESCE((SELECT created_at FROM sessions WHERE id = ?), ?)) "
+                "ON CONFLICT(id) DO UPDATE SET "
+                "platform = COALESCE(NULLIF(excluded.platform, ''), sessions.platform), "
+                "platform_id = COALESCE(NULLIF(excluded.platform_id, ''), sessions.platform_id), "
+                "group_id = COALESCE(NULLIF(excluded.group_id, ''), sessions.group_id), "
+                "group_name = COALESCE(NULLIF(excluded.group_name, ''), sessions.group_name), "
+                "is_group = excluded.is_group, "
+                "send_target = COALESCE(NULLIF(excluded.send_target, ''), sessions.send_target), "
+                "peer_id = COALESCE(NULLIF(excluded.peer_id, ''), sessions.peer_id), "
+                "peer_name = COALESCE(NULLIF(excluded.peer_name, ''), sessions.peer_name)",
+                (
+                    session_id,
+                    str(meta.get("platform", "") or ""),
+                    str(meta.get("platform_id", "") or ""),
+                    str(meta.get("group_id", "") or ""),
+                    str(meta.get("group_name", "") or ""),
+                    1 if meta.get("is_group") else 0,
+                    str(meta.get("send_target", "") or ""),
+                    str(meta.get("peer_id", "") or ""),
+                    str(meta.get("peer_name", "") or ""),
+                    1 if meta.get("pinned") else 0,
+                    session_id,
+                    session_id,
+                    coerce_float(meta.get("created_at"), now_ts()),
+                ),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+    def load_sessions(self) -> list[dict]:
+        conn = self.connect()
+        try:
+            rows = conn.execute(
+                "SELECT id, platform, platform_id, group_id, group_name, is_group, "
+                "send_target, peer_id, peer_name, pinned, display_order, created_at "
+                "FROM sessions ORDER BY pinned DESC, display_order, id"
+            ).fetchall()
+        finally:
+            conn.close()
+        return [self._session_row_to_dict(row) for row in rows]
+
+    @staticmethod
+    def _session_row_to_dict(row: sqlite3.Row) -> dict:
+        return {
+            "id": row["id"],
+            "platform": row["platform"] or "",
+            "platform_id": row["platform_id"] or "",
+            "group_id": row["group_id"] or "",
+            "group_name": row["group_name"] or "",
+            "is_group": bool(row["is_group"]),
+            "send_target": row["send_target"] or "",
+            "peer_id": row["peer_id"] or "",
+            "peer_name": row["peer_name"] or "",
+            "pinned": bool(row["pinned"]),
+            "display_order": row["display_order"] or 0,
+            "created_at": coerce_float(row["created_at"]),
+        }
+
+    def set_pinned(self, session_id: str, pinned: bool) -> bool:
+        conn = self.connect()
+        try:
+            cursor = conn.execute(
+                "UPDATE sessions SET pinned = ? WHERE id = ?",
+                (1 if pinned else 0, session_id),
+            )
+            conn.commit()
+            return cursor.rowcount > 0
+        finally:
+            conn.close()
+
+    def rename_session(self, session_id: str, peer_name: str) -> bool:
+        conn = self.connect()
+        try:
+            cursor = conn.execute(
+                "UPDATE sessions SET peer_name = ? WHERE id = ?",
+                (peer_name, session_id),
+            )
+            conn.commit()
+            return cursor.rowcount > 0
+        finally:
+            conn.close()
+
+    def delete_session(self, session_id: str) -> bool:
+        """删除会话及其全部消息。"""
+        conn = self.connect()
+        try:
+            conn.execute("DELETE FROM messages WHERE session_id = ?", (session_id,))
+            cursor = conn.execute("DELETE FROM sessions WHERE id = ?", (session_id,))
+            conn.commit()
+            return cursor.rowcount > 0
+        finally:
+            conn.close()
+
+    # ── 消息写入 ────────────────────────────────────────────────
+
+    def add_message(self, session_id: str, message: dict) -> dict:
+        """写入一条消息并裁剪；返回可直接下发给前端的消息字典。"""
+        timestamp = coerce_float(message.get("timestamp"), now_ts()) or now_ts()
+        sender = str(message.get("sender") or "")
+        sender_id = str(message.get("sender_id") or "")
+        platform = str(message.get("platform") or "")
+        platform_id = str(message.get("platform_id") or "")
+        segments = message.get("segments")
+        segments = segments if isinstance(segments, list) else []
+        content = str(message.get("content") or "") or segments_to_text(segments)
+        msg_type = str(message.get("type") or "received")
+        if msg_type not in MESSAGE_TYPES:
+            msg_type = "received"
+
+        conn = self.connect()
+        try:
+            cursor = conn.execute(
+                "INSERT INTO messages (session_id, type, sender, sender_id, content, segments, "
+                "group_id, platform, platform_id, platform_message_id, timestamp) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    session_id,
+                    msg_type,
+                    sender,
+                    sender_id,
+                    content,
+                    dumps_segments(segments),
+                    str(message.get("group_id") or ""),
+                    platform,
+                    platform_id,
+                    str(message.get("platform_message_id") or ""),
+                    timestamp,
+                ),
+            )
+            message_id = cursor.lastrowid
+            if sender_id and sender:
+                conn.execute(
+                    "INSERT INTO contacts (platform, user_id, nickname, updated_at) "
+                    "VALUES (?, ?, ?, ?) "
+                    "ON CONFLICT(platform, user_id) DO UPDATE SET "
+                    "nickname = excluded.nickname, updated_at = excluded.updated_at",
+                    (platform, sender_id, sender, timestamp),
+                )
+            self._trim(conn, session_id)
+            conn.commit()
+        finally:
+            conn.close()
+
+        return {
+            "id": message_id,
+            "session_id": session_id,
+            "type": msg_type,
+            "sender": sender,
+            "sender_name": sender or sender_id,
+            "sender_id": sender_id,
+            "content": content,
+            "segments": segments,
+            "preview": segments_to_text(segments) or content or "[非文本消息]",
+            "group_id": str(message.get("group_id") or ""),
+            "platform": platform,
+            "platform_id": platform_id,
+            "platform_message_id": str(message.get("platform_message_id") or ""),
+            "timestamp": timestamp,
+            "pending": bool(message.get("pending")),
+        }
+
+    def _trim(self, conn: sqlite3.Connection, session_id: str) -> None:
+        """按自增 id 保留最新 max_log 条（与游标分页口径一致）。"""
+        conn.execute(
+            "DELETE FROM messages WHERE session_id = ? AND id NOT IN "
+            "(SELECT id FROM messages WHERE session_id = ? ORDER BY id DESC LIMIT ?)",
+            (session_id, session_id, self.max_log),
+        )
+
+    # ── 消息读取 ────────────────────────────────────────────────
+
+    def _rows_to_messages(self, rows: Sequence[sqlite3.Row]) -> list[dict]:
+        messages = [self._message_row_to_dict(row) for row in rows]
+        return self._enrich(messages)
+
+    @staticmethod
+    def _message_row_to_dict(row: sqlite3.Row) -> dict:
+        keys = row.keys()
+        segments = loads_segments(row["segments"] if "segments" in keys else None)
+        content = row["content"] or ""
+        return {
+            "id": row["id"],
+            "session_id": row["session_id"],
+            "type": row["type"] or "received",
+            "sender": row["sender"] or "",
+            "sender_name": row["sender"] or row["sender_id"] or "未知用户",
+            "sender_id": row["sender_id"] or "",
+            "content": content,
+            "segments": segments,
+            "preview": segments_to_text(segments) or content or "[非文本消息]",
+            "group_id": row["group_id"] or "",
+            "platform": row["platform"] or "",
+            "platform_id": (row["platform_id"] if "platform_id" in keys else "") or "",
+            "platform_message_id": (
+                row["platform_message_id"] if "platform_message_id" in keys else ""
+            )
+            or "",
+            "timestamp": coerce_float(row["timestamp"]),
+        }
+
+    def _enrich(self, messages: list[dict]) -> list[dict]:
+        """用 contacts 表补齐历史消息的当前昵称。"""
+        if not messages:
+            return messages
+        keys = {
+            (message["platform"], message["sender_id"])
+            for message in messages
+            if message.get("sender_id")
+        }
+        if not keys:
+            return messages
+        conn = self.connect()
+        try:
+            nicknames = {
+                (row["platform"], row["user_id"]): row["nickname"]
+                for row in conn.execute(
+                    "SELECT platform, user_id, nickname FROM contacts WHERE nickname != ''"
+                )
+            }
+        finally:
+            conn.close()
+        for message in messages:
+            key = (message.get("platform", ""), message.get("sender_id", ""))
+            nickname = nicknames.get(key)
+            if nickname:
+                message["sender_name"] = nickname
+        return messages
+
+    def query_messages(self, session_id: str, since: float = 0.0, limit: int = 0) -> list[dict]:
+        """按时间正序取消息；limit>0 时取最新 limit 条。"""
+        conn = self.connect()
+        try:
+            if limit > 0:
+                rows = conn.execute(
+                    "SELECT * FROM (SELECT * FROM messages WHERE session_id = ? AND timestamp > ? "
+                    "ORDER BY timestamp DESC, id DESC LIMIT ?) sub ORDER BY timestamp, id",
+                    (session_id, since, clamp_int(limit, 1, MAX_PAGE_SIZE, 50)),
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    "SELECT * FROM messages WHERE session_id = ? AND timestamp > ? "
+                    "ORDER BY timestamp, id",
+                    (session_id, since),
+                ).fetchall()
+        finally:
+            conn.close()
+        return self._rows_to_messages(rows)
+
+    def mention_resolver(self, session_id: str) -> Callable[[str], str | None]:
+        """构造「昵称 / QQ 号 → 用户 ID」的解析器，供 text_to_segments 使用。
+
+        优先当前会话的参与者（同名时避免 @ 错人），再用全局联系人兜底，
+        这样换个群 @ 以前聊过的人也能命中。
+        """
+        names: dict[str, str] = {}
+        ids: set[str] = set()
+
+        conn = self.connect()
+        try:
+            rows = conn.execute(
+                "SELECT m.sender_id, "
+                "COALESCE(NULLIF(c.nickname, ''), NULLIF(m.sender, '')) AS name, "
+                "CASE WHEN m.session_id = ? THEN 1 ELSE 0 END AS local, "
+                "MAX(m.timestamp) AS last_seen "
+                "FROM messages m LEFT JOIN contacts c "
+                "  ON c.platform = m.platform AND c.user_id = m.sender_id "
+                "WHERE m.sender_id != '' "
+                "GROUP BY m.sender_id, name, local "
+                "ORDER BY local ASC, last_seen ASC",
+                (session_id or "",),
+            ).fetchall()
+        except sqlite3.OperationalError:
+            rows = []
+        finally:
+            conn.close()
+
+        for row in rows:
+            user_id = str(row["sender_id"] or "").strip()
+            if not user_id:
+                continue
+            ids.add(user_id)
+            label = str(row["name"] or "").strip()
+            # 后写入的覆盖先写入的：local 与 last_seen 升序，最终留下最新的本地昵称
+            if label:
+                names[label] = user_id
+
+        def resolve(name: str) -> str | None:
+            key = str(name or "").strip().lstrip("@").strip()
+            if not key:
+                return None
+            if key in ids:
+                return key
+            if key.isdigit() and 5 <= len(key) <= 12:
+                return key
+            return names.get(key)
+
+        return resolve
+
+    def query_page(
+        self, session_id: str, limit: int = 50, before_id: int = 0
+    ) -> tuple[list[dict], bool, int | None]:
+        """按消息 id 游标向前翻页，返回（正序消息, 是否还有更早, 下一页游标）。"""
+        safe_limit = clamp_int(limit, 1, MAX_PAGE_SIZE, 50)
+        before = clamp_int(before_id, 0, 2**62, 0)
+        conn = self.connect()
+        try:
+            rows = conn.execute(
+                "SELECT * FROM messages WHERE session_id = ? AND (? <= 0 OR id < ?) "
+                "ORDER BY id DESC LIMIT ?",
+                (session_id, before, before, safe_limit + 1),
+            ).fetchall()
+        finally:
+            conn.close()
+        has_more = len(rows) > safe_limit
+        page = list(rows[:safe_limit])
+        page.reverse()
+        messages = self._rows_to_messages(page)
+        next_cursor = messages[0]["id"] if (messages and has_more) else None
+        return messages, has_more, next_cursor
+
+    def count_messages(self, session_id: str) -> int:
+        conn = self.connect()
+        try:
+            row = conn.execute(
+                "SELECT COUNT(*) AS cnt FROM messages WHERE session_id = ?", (session_id,)
+            ).fetchone()
+        finally:
+            conn.close()
+        return int(row["cnt"]) if row else 0
+
+    def query_participants(self, limit_per_session: int = 50) -> dict[str, list[dict]]:
+        """一次查出所有会话的参与者，按会话分组（避免每会话一次查询）。"""
+        cap = clamp_int(limit_per_session, 1, MAX_PAGE_SIZE, 50)
+        conn = self.connect()
+        try:
+            rows = conn.execute(
+                "SELECT m.session_id, m.sender_id, "
+                "COALESCE(NULLIF(c.nickname, ''), NULLIF(m.sender, ''), m.sender_id) AS name, "
+                "COUNT(*) AS message_count, MAX(m.timestamp) AS last_seen "
+                "FROM messages m LEFT JOIN contacts c "
+                "  ON c.platform = m.platform AND c.user_id = m.sender_id "
+                "WHERE m.sender_id != '' "
+                "GROUP BY m.session_id, m.sender_id "
+                "ORDER BY m.session_id, last_seen DESC"
+            ).fetchall()
+        finally:
+            conn.close()
+        grouped: dict[str, list[dict]] = {}
+        for row in rows:
+            bucket = grouped.setdefault(row["session_id"], [])
+            if len(bucket) >= cap:
+                continue
+            bucket.append(
+                {
+                    "id": row["sender_id"],
+                    "name": row["name"] or row["sender_id"],
+                    "message_count": row["message_count"],
+                    "last_seen": coerce_float(row["last_seen"]),
+                }
+            )
+        return grouped
+
+    def session_summaries(self) -> dict[str, dict]:
+        """一次查出每个会话的消息数与最后一条消息。"""
+        conn = self.connect()
+        try:
+            counts = {
+                row["session_id"]: (int(row["cnt"]), coerce_float(row["last_ts"]))
+                for row in conn.execute(
+                    "SELECT session_id, COUNT(*) AS cnt, MAX(timestamp) AS last_ts "
+                    "FROM messages GROUP BY session_id"
+                )
+            }
+            latest_rows = conn.execute(
+                "SELECT * FROM (SELECT *, ROW_NUMBER() OVER ("
+                "  PARTITION BY session_id ORDER BY timestamp DESC, id DESC) AS rn "
+                "FROM messages) WHERE rn = 1"
+            ).fetchall()
+        finally:
+            conn.close()
+        latest = {
+            row["session_id"]: self._message_row_to_dict(row) for row in latest_rows
+        }
+        enriched = dict(latest.items())
+        if enriched:
+            by_id = self._enrich(list(enriched.values()))
+            enriched = {message["session_id"]: message for message in by_id}
+        result: dict[str, dict] = {}
+        for session_id in set(counts) | set(enriched):
+            count, last_ts = counts.get(session_id, (0, 0.0))
+            result[session_id] = {
+                "message_count": count,
+                "last_message": enriched.get(session_id),
+                "last_activity": last_ts,
+            }
+        return result
+
+    # ── 检索 ────────────────────────────────────────────────────
+
+    def search_messages(
+        self, query: str, session_id: str = "", limit: int = 50
+    ) -> list[dict]:
+        """按关键词检索消息正文。
+
+        策略：
+          * 关键词 >= ``FTS_MIN_CHARS`` 且 FTS5 可用 → 走 trigram 索引
+          * 更短的关键词（中文双字检索很常见）→ 回退 LIKE
+          * FTS5 不可用 → 全部回退 LIKE
+
+        两条路径都做通配符转义，避免 ``%``/``_`` 被当作模式。
+        """
+        keyword = str(query or "").strip()
+        if not keyword:
+            return []
+        cap = clamp_int(limit, 1, MAX_SEARCH_LIMIT, 50)
+
+        if self.fts_enabled and len(keyword) >= FTS_MIN_CHARS:
+            try:
+                results = self._search_fts(keyword, session_id, cap)
+                if results is not None:
+                    return results
+            except sqlite3.DatabaseError:
+                # 索引异常时本次降级，后续仍会尝试 FTS
+                pass
+        return self._search_like(keyword, session_id, cap)
+
+    def _search_fts(
+        self, keyword: str, session_id: str, cap: int
+    ) -> list[dict] | None:
+        """trigram 索引检索。返回 None 表示索引不可用，应回退。"""
+        # 双引号内是短语查询；内部引号需转义成两个双引号
+        phrase = '"' + keyword.replace('"', '""') + '"'
+        sql = (
+            "SELECT m.* FROM messages_fts f JOIN messages m ON m.id = f.rowid "
+            "WHERE messages_fts MATCH ?"
+        )
+        params: list[Any] = [phrase]
+        if session_id:
+            sql += " AND m.session_id = ?"
+            params.append(session_id)
+        sql += " ORDER BY m.timestamp DESC, m.id DESC LIMIT ?"
+        params.append(cap)
+        conn = self.connect()
+        try:
+            rows = conn.execute(sql, params).fetchall()
+        except sqlite3.OperationalError:
+            return None
+        finally:
+            conn.close()
+        return self._rows_to_messages(rows)
+
+    def _search_like(self, keyword: str, session_id: str, cap: int) -> list[dict]:
+        escaped = (
+            keyword.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+        )
+        pattern = f"%{escaped}%"
+        sql = "SELECT * FROM messages WHERE content LIKE ? ESCAPE '\\'"
+        params: list[Any] = [pattern]
+        if session_id:
+            sql += " AND session_id = ?"
+            params.append(session_id)
+        sql += " ORDER BY timestamp DESC, id DESC LIMIT ?"
+        params.append(cap)
+        conn = self.connect()
+        try:
+            rows = conn.execute(sql, params).fetchall()
+        finally:
+            conn.close()
+        return self._rows_to_messages(rows)
+
+    # ── 删除 ────────────────────────────────────────────────────
+
+    def delete_message(self, message_id: int) -> dict | None:
+        """删除单条消息，返回被删消息（用于撤回/广播）。"""
+        conn = self.connect()
+        try:
+            row = conn.execute(
+                "SELECT * FROM messages WHERE id = ?", (message_id,)
+            ).fetchone()
+            if row is None:
+                return None
+            message = self._message_row_to_dict(row)
+            conn.execute("DELETE FROM messages WHERE id = ?", (message_id,))
+            conn.commit()
+            return message
+        finally:
+            conn.close()
+
+    def get_message(self, message_id: int) -> dict | None:
+        conn = self.connect()
+        try:
+            row = conn.execute(
+                "SELECT * FROM messages WHERE id = ?", (message_id,)
+            ).fetchone()
+            if row is None:
+                return None
+            return self._rows_to_messages([row])[0]
+        finally:
+            conn.close()
+
+    def delete_session_messages(self, session_id: str) -> int:
+        conn = self.connect()
+        try:
+            cursor = conn.execute("DELETE FROM messages WHERE session_id = ?", (session_id,))
+            conn.commit()
+            return cursor.rowcount
+        finally:
+            conn.close()
+
+    def delete_all_messages(self) -> int:
+        conn = self.connect()
+        try:
+            cursor = conn.execute("DELETE FROM messages")
+            conn.commit()
+            return cursor.rowcount
+        finally:
+            conn.close()
+
+    # ── 导出 ────────────────────────────────────────────────────
+
+    def export_session(self, session_id: str, fmt: str = "json") -> dict:
+        """导出会话内容，供前端下载。"""
+        sessions = {item["id"]: item for item in self.load_sessions()}
+        session = sessions.get(session_id)
+        messages = self.query_messages(session_id)
+        if fmt == "txt":
+            lines = []
+            for message in messages:
+                stamp = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(message["timestamp"]))
+                lines.append(f"[{stamp}] {message['sender_name']}: {message['preview']}")
+            return {"session": session, "text": "\n".join(lines)}
+        return {"session": session, "messages": messages}
+
+
+# ── 片段里的图片地址提取 ────────────────────────────────────────────
+
+_URL_RE = re.compile(r"^https?://", re.IGNORECASE)
+
+
+def is_http_url(value: Any) -> bool:
+    return bool(_URL_RE.match(str(value or "").strip()))
+
+
+def collect_image_urls(segments: Sequence[dict] | None) -> list[str]:
+    """取出片段中的图片可访问地址，供媒体代理使用。"""
+    urls: list[str] = []
+    for segment in segments or []:
+        if segment.get("type") != "image":
+            continue
+        for key in ("url", "file"):
+            value = str(segment.get(key) or "").strip()
+            if value and is_http_url(value):
+                urls.append(value)
+                break
+    return urls

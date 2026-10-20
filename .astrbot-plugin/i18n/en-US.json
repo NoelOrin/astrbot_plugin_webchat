@@ -1,0 +1,41 @@
+{
+  "metadata": {
+    "display_name": "WebChat Terminal",
+    "short_desc": "Send, receive and search messages across every session from the WebUI.",
+    "desc": "Adds a web terminal page to AstrBot: it discovers connected groups and private chats, sends and receives messages in real time, and records both bot replies and manual sends as a complete conversation."
+  },
+  "config": {
+    "max_log_per_session": {
+      "description": "Maximum messages kept per session",
+      "hint": "Oldest messages are trimmed automatically; both paging and trimming use message IDs"
+    },
+    "capture_bot_messages": {
+      "description": "Record outgoing bot and plugin messages",
+      "hint": "When enabled the terminal shows bot replies, forming a complete conversation; when disabled only incoming messages are stored"
+    },
+    "bot_display_name": {
+      "description": "Display name for bot messages",
+      "hint": "Outgoing bot messages appear under this name in the terminal"
+    },
+    "convert_mention_tags": {
+      "description": "Turn <mention> tags in replies into real @ mentions",
+      "hint": "An LLM output like <mention id=\"123\"/> becomes a real At segment; when off the tag is sent literally"
+    },
+    "parse_bare_at": {
+      "description": "Turn typed @nickname / @QQ into real @ mentions",
+      "hint": "Resolves @nickname against this session's participants; unresolvable names stay as plain text"
+    }
+  },
+  "views": {
+    "terminal": {
+      "title": "Terminal",
+      "description": "Send messages, search history and manage sessions."
+    }
+  },
+  "pages": {
+    "terminal": {
+      "title": "Terminal",
+      "description": "Send messages, search history and manage sessions."
+    }
+  }
+}

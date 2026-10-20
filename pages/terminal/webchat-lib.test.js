@@ -1,0 +1,428 @@
+/**
+ * webchat-lib 单元测试：node --test pages/terminal/webchat-lib.test.js
+ *
+ * 这些断言锁住的是“容易被重构悄悄改掉”的行为：
+ * 去重键、排序稳定性、预览文案、时间分组、高亮切分。
+ */
+
+import assert from "node:assert/strict";
+import { test } from "node:test";
+
+import {
+  compactId,
+  compareSessions,
+  dayKey,
+  dedupeMessages,
+  formatDateLabel,
+  formatSessionTime,
+  getInitials,
+  getSessionPreview,
+  imageSources,
+  isNearBottom,
+  matchesSession,
+  mergeMessages,
+  messageKey,
+  messageText,
+  normalizeHistory,
+  normalizeMessage,
+  normalizeSession,
+  planMessages,
+  diffPlan,
+  segmentsToText,
+  shouldGroupWithPrevious,
+  splitHighlight,
+  str,
+  stripMentionMarkup,
+  unreadLabel,
+} from "./webchat-lib.js";
+
+const T = 1700000000; // 固定时间戳，避免测试依赖当前时间
+
+// ── 归一化 ──────────────────────────────────────────────
+
+test("normalizeMessage 填充缺省值并保持类型合法", () => {
+  const message = normalizeMessage({ id: 7, session_id: "s1", content: "hi" }, "s1");
+  assert.equal(message.id, "7");
+  assert.equal(message.sessionId, "s1");
+  assert.equal(message.type, "received");
+  assert.equal(message.senderName, "未知用户");
+  assert.deepEqual(message.segments, []);
+});
+
+test("normalizeMessage 保留三种消息类型，非法类型降级", () => {
+  for (const type of ["received", "sent", "bot"]) {
+    assert.equal(normalizeMessage({ type }, "s").type, type);
+  }
+  assert.equal(normalizeMessage({ type: "weird" }, "s").type, "received");
+});
+
+test("normalizeMessage 过滤坏片段", () => {
+  const message = normalizeMessage(
+    { segments: [{ type: "text", text: "a" }, null, "junk", { type: "image", url: "u" }] },
+    "s",
+  );
+  assert.equal(message.segments.length, 2);
+  assert.equal(message.segments[1].url, "u");
+});
+
+test("normalizeSession 从参与者推断名称", () => {
+  const session = normalizeSession({
+    id: "s1",
+    is_group: true,
+    participants: [{ id: "1", name: "小明", message_count: 3, last_seen: T }],
+  });
+  assert.equal(session.peerName, "小明");
+  assert.equal(session.messageCount, 0);
+  assert.equal(session.participants[0].name, "小明");
+});
+
+test("normalizeSession 在无名称时回退到 ID", () => {
+  const session = normalizeSession({ id: "group:99", peer_id: "99", is_group: true });
+  assert.equal(session.peerId, "99");
+  assert.equal(session.peerName, "99");
+});
+
+// ── 去重与排序 ──────────────────────────────────────────
+
+test("messageKey 优先用 id，缺 id 时用内容指纹", () => {
+  assert.equal(messageKey({ id: "5", sessionId: "s" }), "id:5");
+  const fingerprint = messageKey({ id: null, sessionId: "s", timestamp: 1, type: "sent", senderId: "u", content: "x" });
+  assert.match(fingerprint, /^local:s:1:sent:u:x$/);
+});
+
+test("dedupeMessages 按 id 去重且保持时间升序", () => {
+  const messages = dedupeMessages([
+    { id: "2", sessionId: "s", timestamp: T + 10 },
+    { id: "1", sessionId: "s", timestamp: T },
+    { id: "2", sessionId: "s", timestamp: T + 10 },
+  ]);
+  assert.deepEqual(messages.map((m) => m.id), ["1", "2"]);
+});
+
+test("dedupeMessages 丢弃缺 sessionId 的脏数据", () => {
+  const messages = dedupeMessages([{ id: "1" }, { id: "2", sessionId: "s", timestamp: T }]);
+  assert.equal(messages.length, 1);
+});
+
+test("dedupeMessages 相同时间戳按 id 稳定排序", () => {
+  const messages = dedupeMessages([
+    { id: "10", sessionId: "s", timestamp: T },
+    { id: "9", sessionId: "s", timestamp: T },
+  ]);
+  assert.deepEqual(messages.map((m) => m.id), ["9", "10"]);
+});
+
+test("mergeMessages 幂等合并历史与实时消息", () => {
+  const existing = [{ id: "1", sessionId: "s", timestamp: T }];
+  const incoming = [{ id: "1", sessionId: "s", timestamp: T }, { id: "2", sessionId: "s", timestamp: T + 1 }];
+  assert.equal(mergeMessages(existing, incoming).length, 2);
+  assert.equal(mergeMessages([], []).length, 0);
+});
+
+// ── 会话排序与匹配 ──────────────────────────────────────
+
+test("compareSessions 置顶优先", () => {
+  const pinned = { peerName: "a", pinned: true, lastActivity: 1 };
+  const normal = { peerName: "b", pinned: false, lastActivity: 999 };
+  assert.ok(compareSessions(pinned, normal) < 0);
+});
+
+test("compareSessions 按最后活跃时间倒序", () => {
+  const newer = { peerName: "a", lastActivity: 0, lastMessage: { timestamp: T + 100 } };
+  const older = { peerName: "b", lastActivity: 0, lastMessage: { timestamp: T } };
+  assert.ok(compareSessions(newer, older) < 0);
+});
+
+test("matchesSession 空查询匹配全部", () => {
+  assert.equal(matchesSession({ peerName: "群" }, ""), true);
+  assert.equal(matchesSession({ peerName: "群" }, "   "), true);
+});
+
+test("matchesSession 覆盖名称、ID 与平台，忽略大小写", () => {
+  const session = { peerName: "技术群", peerId: "123", platform: "Aiocqhttp" };
+  assert.equal(matchesSession(session, "技术"), true);
+  assert.equal(matchesSession(session, "123"), true);
+  assert.equal(matchesSession(session, "aiocqhttp"), true);
+  assert.equal(matchesSession(session, "不存在"), false);
+});
+
+// ── 预览与文本 ──────────────────────────────────────────
+
+test("getSessionPreview 区分 sent / bot / received", () => {
+  const base = { peerName: "群", peerId: "1", isGroup: true };
+  assert.equal(
+    getSessionPreview({ ...base, lastMessage: { type: "sent", content: "hi", senderName: "你" } }),
+    "你: hi",
+  );
+  assert.equal(
+    getSessionPreview({ ...base, lastMessage: { type: "bot", content: "在", senderName: "Bot" } }),
+    "Bot: 在",
+  );
+  assert.equal(
+    getSessionPreview({ ...base, lastMessage: { type: "received", content: "喂", senderName: "小明" } }),
+    "小明: 喂",
+  );
+});
+
+test("getSessionPreview 无消息时展示群号/ID", () => {
+  assert.equal(getSessionPreview({ isGroup: true, groupId: "88", peerId: "88" }), "群号 88");
+  assert.equal(getSessionPreview({ isGroup: false, peerId: "u1" }), "ID u1");
+});
+
+test("segmentsToText 拼接文本与占位符", () => {
+  const text = segmentsToText([
+    { type: "text", text: "看图" },
+    { type: "image", url: "u" },
+    { type: "at", target: "9" },
+  ]);
+  assert.equal(text, "看图@9");
+  assert.equal(segmentsToText([]), "");
+  assert.equal(segmentsToText(null), "");
+});
+
+test("messageText 在无片段时回退 content", () => {
+  assert.equal(messageText({ segments: [], content: "原文" }), "原文");
+  assert.equal(messageText({ segments: [], content: "" }), "[非文本消息]");
+  assert.equal(messageText({ segments: [{ type: "text", text: "片段" }], content: "原文" }), "片段");
+});
+
+test("stripMentionMarkup 把历史残留标签降级成可读文本", () => {
+  // 修复前已经入库的老消息，界面上不能再显示尖括号
+  assert.equal(stripMentionMarkup('<mention id="42"/> 在吗'), "@某人 在吗");
+  assert.equal(stripMentionMarkup("<mention>小明</mention>你好"), "@小明你好");
+  assert.equal(stripMentionMarkup("<mention:88>你好"), "@某人你好");
+  assert.equal(stripMentionMarkup("普通消息"), "普通消息");
+  assert.equal(stripMentionMarkup(""), "");
+  assert.equal(stripMentionMarkup(null), "");
+});
+
+test("segmentsToText 清洗文本片段里的标签", () => {
+  const text = segmentsToText([
+    { type: "text", text: '<mention id="1"/>看图' },
+    { type: "at", target: "9", text: "小红" },
+  ]);
+  assert.equal(text, "@某人看图@小红");
+});
+
+test("imageSources 只取图片片段且有值", () => {
+  const sources = imageSources({
+    segments: [
+      { type: "image", url: "https://a/1.png" },
+      { type: "image", file: "/tmp/2.png" },
+      { type: "image" },
+      { type: "text", text: "x" },
+    ],
+  });
+  assert.deepEqual(sources, ["https://a/1.png", "/tmp/2.png"]);
+  assert.deepEqual(imageSources({ segments: null }), []);
+});
+
+// ── 头像与 ID ───────────────────────────────────────────
+
+test("getInitials 中文取首字，英文取首字母", () => {
+  assert.equal(getInitials("张三"), "张");
+  assert.equal(getInitials("John Doe"), "JD");
+  assert.equal(getInitials("alice"), "AL");
+  assert.equal(getInitials(""), "?");
+  assert.equal(getInitials(null), "?");
+});
+
+test("compactId 仅在超长时折叠", () => {
+  assert.equal(compactId("123"), "123");
+  assert.match(compactId("123456789012345678"), /^123456…/);
+});
+
+test("unreadLabel 上限 99+", () => {
+  assert.equal(unreadLabel(0), "");
+  assert.equal(unreadLabel(3), "3");
+  assert.equal(unreadLabel(100), "99+");
+});
+
+// ── 时间 ────────────────────────────────────────────────
+
+test("dayKey 同一时刻不同日期返回不同键", () => {
+  assert.equal(dayKey(0), "unknown");
+  assert.notEqual(dayKey(T), dayKey(T + 86400));
+});
+
+test("formatDateLabel 识别今天与昨天", () => {
+  const now = T * 1000;
+  assert.equal(formatDateLabel(T, now), "今天");
+  assert.equal(formatDateLabel(T - 86400, now), "昨天");
+  assert.match(formatDateLabel(T - 86400 * 20, now), /\d{4}/);
+});
+
+test("formatSessionTime 今天只显示时刻", () => {
+  const now = T * 1000;
+  assert.match(formatSessionTime(T, now), /^\d{2}:\d{2}$/);
+  assert.equal(formatSessionTime(0, now), "");
+});
+
+// ── 高亮与分组 ──────────────────────────────────────────
+
+test("splitHighlight 切出命中片段", () => {
+  const parts = splitHighlight("我有三个苹果", "苹果");
+  assert.deepEqual(parts, [
+    { text: "我有三个", hit: false },
+    { text: "苹果", hit: true },
+  ]);
+});
+
+test("splitHighlight 支持多处命中与无命中", () => {
+  const parts = splitHighlight("aXbXc", "X");
+  assert.equal(parts.filter((p) => p.hit).length, 2);
+  assert.deepEqual(splitHighlight("abc", "z"), [{ text: "abc", hit: false }]);
+  assert.deepEqual(splitHighlight("abc", ""), [{ text: "abc", hit: false }]);
+});
+
+test("shouldGroupWithPrevious 同人相邻短时间才合并", () => {
+  const a = { type: "received", senderId: "1", senderName: "小明", timestamp: T };
+  const close = { ...a, timestamp: T + 60 };
+  const far = { ...a, timestamp: T + 3600 };
+  const otherUser = { ...close, senderId: "2" };
+  assert.equal(shouldGroupWithPrevious(close, a), true);
+  assert.equal(shouldGroupWithPrevious(far, a), false);
+  assert.equal(shouldGroupWithPrevious(otherUser, a), false);
+  assert.equal(shouldGroupWithPrevious(a, null), false);
+});
+
+test("isNearBottom 用阈值判断", () => {
+  assert.equal(isNearBottom({ scrollHeight: 1000, scrollTop: 900, clientHeight: 100 }), true);
+  assert.equal(isNearBottom({ scrollHeight: 1000, scrollTop: 100, clientHeight: 100 }), false);
+});
+
+test("normalizeHistory 统一游标类型", () => {
+  assert.deepEqual(normalizeHistory({ has_more: true, next_cursor: 5 }), {
+    hasMore: true,
+    nextCursor: "5",
+  });
+  assert.deepEqual(normalizeHistory(null), { hasMore: false, nextCursor: null });
+});
+
+test("str 处理 null/undefined", () => {
+  assert.equal(str(null), "");
+  assert.equal(str(undefined, "d"), "d");
+  assert.equal(str(0), "0");
+});
+
+// ── 渲染计划与差异 ──────────────────────────────────────
+
+test("planMessages 生成日期分隔符与消息节点", () => {
+  const plan = planMessages(
+    [
+      { id: "1", sessionId: "s", type: "received", senderName: "A", senderId: "a",
+        content: "x", timestamp: T },
+      { id: "2", sessionId: "s", type: "received", senderName: "B", senderId: "b",
+        content: "y", timestamp: T + 10 },
+    ],
+    "s",
+  );
+  assert.deepEqual(plan.map((p) => p.kind), ["date", "message", "message"]);
+  assert.equal(plan[0].label, formatDateLabel(T));
+});
+
+test("planMessages 跨天时插入第二个分隔符", () => {
+  const plan = planMessages(
+    [
+      { id: "1", sessionId: "s", type: "received", senderName: "A", senderId: "a",
+        content: "x", timestamp: T },
+      { id: "2", sessionId: "s", type: "received", senderName: "A", senderId: "a",
+        content: "y", timestamp: T + 86400 },
+    ],
+    "s",
+  );
+  assert.equal(plan.filter((p) => p.kind === "date").length, 2);
+});
+
+test("planMessages 相邻同人短消息标记为 grouped", () => {
+  const plan = planMessages(
+    [
+      { id: "1", sessionId: "s", type: "received", senderName: "A", senderId: "a",
+        content: "x", timestamp: T },
+      { id: "2", sessionId: "s", type: "received", senderName: "A", senderId: "a",
+        content: "y", timestamp: T + 30 },
+      { id: "3", sessionId: "s", type: "received", senderName: "B", senderId: "b",
+        content: "z", timestamp: T + 40 },
+    ],
+    "s",
+  );
+  const messages = plan.filter((p) => p.kind === "message");
+  assert.deepEqual(messages.map((m) => m.grouped), [false, true, false]);
+});
+
+test("planMessages 空列表返回空计划", () => {
+  assert.deepEqual(planMessages([], "s"), []);
+  assert.deepEqual(planMessages(null, "s"), []);
+});
+
+test("diffPlan 检测纯追加", () => {
+  const first = planMessages(
+    [{ id: "1", sessionId: "s", type: "received", senderName: "A", senderId: "a",
+       content: "x", timestamp: T }],
+    "s",
+  );
+  const second = planMessages(
+    [
+      { id: "1", sessionId: "s", type: "received", senderName: "A", senderId: "a",
+        content: "x", timestamp: T },
+      { id: "2", sessionId: "s", type: "received", senderName: "A", senderId: "a",
+        content: "y", timestamp: T + 10 },
+    ],
+    "s",
+  );
+  assert.deepEqual(diffPlan(first, second), { mode: "append", start: first.length, end: second.length });
+});
+
+test("diffPlan 检测纯截断", () => {
+  const full = planMessages(
+    [
+      { id: "1", sessionId: "s", type: "received", senderName: "A", senderId: "a",
+        content: "x", timestamp: T },
+      { id: "2", sessionId: "s", type: "received", senderName: "A", senderId: "a",
+        content: "y", timestamp: T + 10 },
+    ],
+    "s",
+  );
+  const trimmed = full.slice(0, 2);
+  assert.deepEqual(diffPlan(full, trimmed), { mode: "truncate", start: 2, end: full.length });
+});
+
+test("diffPlan 中间修改需要重建", () => {
+  const a = planMessages(
+    [
+      { id: "1", sessionId: "s", type: "received", senderName: "A", senderId: "a",
+        content: "x", timestamp: T },
+      { id: "2", sessionId: "s", type: "received", senderName: "A", senderId: "a",
+        content: "y", timestamp: T + 10 },
+    ],
+    "s",
+  );
+  const b = planMessages(
+    [
+      { id: "1", sessionId: "s", type: "received", senderName: "A", senderId: "a",
+        content: "改了", timestamp: T },
+      { id: "2", sessionId: "s", type: "received", senderName: "A", senderId: "a",
+        content: "y", timestamp: T + 10 },
+    ],
+    "s",
+  );
+  assert.equal(diffPlan(a, b).mode, "rebuild");
+});
+
+test("diffPlan 相同计划视为无需变更的 append", () => {
+  const plan = planMessages(
+    [{ id: "1", sessionId: "s", type: "received", senderName: "A", senderId: "a",
+       content: "x", timestamp: T }],
+    "s",
+  );
+  assert.deepEqual(diffPlan(plan, plan), { mode: "append", start: plan.length, end: plan.length });
+});
+
+test("diffPlan 首次渲染走 append（旧计划为空）", () => {
+  const plan = planMessages(
+    [{ id: "1", sessionId: "s", type: "received", senderName: "A", senderId: "a",
+       content: "x", timestamp: T }],
+    "s",
+  );
+  assert.deepEqual(diffPlan([], plan), { mode: "append", start: 0, end: plan.length });
+});

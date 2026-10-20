@@ -3,6 +3,30 @@
     "description": "每个会话最大消息记录数",
     "type": "int",
     "default": 200,
-    "hint": "超出后自动裁剪最早的消息"
+    "hint": "超出后自动裁剪最早的消息；分页与裁剪均按消息 ID 计算"
+  },
+  "capture_bot_messages": {
+    "description": "记录 Bot 与插件的出站消息",
+    "type": "bool",
+    "default": true,
+    "hint": "开启后终端可以看到 Bot 的回复，形成完整对话；关闭则只记录收到的消息"
+  },
+  "bot_display_name": {
+    "description": "Bot 消息的显示名称",
+    "type": "string",
+    "default": "Bot",
+    "hint": "出站消息在终端里显示为这个名字"
+  },
+  "convert_mention_tags": {
+    "description": "把回复里的 <mention> 标签还原成真实 @",
+    "type": "bool",
+    "default": true,
+    "hint": "LLM 输出的 <mention id=\"123\"/> 会被转换成真正的 At 消息段；关闭后标签会原样发出"
+  },
+  "parse_bare_at": {
+    "description": "把文本里的 @昵称 / @QQ号 还原成真实 @",
+    "type": "bool",
+    "default": true,
+    "hint": "按本会话参与者把 @昵称 解析成 QQ 号；查不到时保留 @昵称 原文"
   }
 }

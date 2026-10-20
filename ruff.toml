@@ -1,0 +1,18 @@
+line-length = 100
+target-version = "py310"
+extend-exclude = ["data", "__pycache__", "docs"]
+
+[lint]
+select = [
+    "E",   # pycodestyle
+    "F",   # pyflakes
+    "I",   # isort
+    "UP",  # pyupgrade
+    "B",   # bugbear
+    "SIM", # simplify
+    "C4",  # comprehensions
+]
+
+[lint.per-file-ignores]
+# 插件需要与未知版本的宿主适配，宽泛捕获是刻意的降级策略
+"main.py" = ["BLE001"]

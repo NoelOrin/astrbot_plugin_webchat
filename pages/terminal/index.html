@@ -3,29 +3,253 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>WebChat Terminal</title>
+    <meta name="color-scheme" content="light dark" />
+    <script>
+      (() => {
+        const key = "astrbot_plugin_webchat_theme";
+        let theme = "";
+        try {
+          theme = localStorage.getItem(key) || "";
+        } catch {}
+        if (theme !== "light" && theme !== "dark") {
+          theme = window.matchMedia("(prefers-color-scheme: light)").matches ? "light" : "dark";
+        }
+        document.documentElement.dataset.theme = theme;
+
+        const compactKey = "astrbot_plugin_webchat_compact";
+        const savedCompact = (() => {
+          try {
+            return localStorage.getItem(compactKey);
+          } catch {
+            return null;
+          }
+        })();
+        const compact =
+          savedCompact === "true" || savedCompact === "false"
+            ? savedCompact === "true"
+            : window.matchMedia("(max-width: 720px), (max-height: 620px)").matches;
+        document.documentElement.dataset.compact = String(compact);
+      })();
+    </script>
+    <title>WebChat</title>
     <link rel="stylesheet" href="./style.css" />
   </head>
   <body>
     <div id="app">
-      <div id="header">
-        <span class="title">webchat://terminal</span>
-        <div class="actions">
-          <select id="session-select">
-            <option value="">-- 选择会话 --</option>
-          </select>
-          <button id="btn-refresh" title="刷新会话">↻</button>
-          <button id="btn-clear" title="清空消息">清空</button>
-          <span id="status" class="status">● 就绪</span>
+      <header class="topbar">
+        <div class="brand">
+          <button id="btn-mobile-menu" class="icon-button mobile-menu-button" type="button" aria-label="打开会话列表">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 6h16M4 12h16M4 18h16" /></svg>
+          </button>
+          <span class="brand-mark" aria-hidden="true">
+            <svg viewBox="0 0 24 24">
+              <path d="M21 15a4 4 0 0 1-4 4H8l-5 3V7a4 4 0 0 1 4-4h10a4 4 0 0 1 4 4z" />
+              <path d="M8 9h8M8 13h5" />
+            </svg>
+          </span>
+          <div class="brand-copy">
+            <strong>WebChat</strong>
+            <span>消息终端</span>
+          </div>
         </div>
-      </div>
-      <div id="output"></div>
-      <div id="input-area">
-        <span class="prompt">&gt;</span>
-        <input type="text" id="input" placeholder="输入消息..." autocomplete="off" />
-        <button id="btn-send">发送</button>
+
+        <div class="topbar-actions">
+          <div id="status" class="status-pill" role="status" aria-live="polite">
+            <span class="status-dot"></span>
+            <span id="status-text">正在连接</span>
+          </div>
+          <button id="btn-theme" class="icon-button theme-toggle" type="button" aria-label="切换到亮色主题" title="切换到亮色主题">
+            <svg class="theme-icon theme-icon-sun" viewBox="0 0 24 24" aria-hidden="true">
+              <circle cx="12" cy="12" r="4" />
+              <path d="M12 2v2M12 20v2M4.93 4.93l1.42 1.42M17.66 17.66l1.41 1.41M2 12h2M20 12h2M6.34 17.66l-1.41 1.41M19.07 4.93l-1.41 1.41" />
+            </svg>
+            <svg class="theme-icon theme-icon-moon" viewBox="0 0 24 24" aria-hidden="true">
+              <path d="M12.5 3.5a8.5 8.5 0 1 0 8 10.2 7 7 0 0 1-8-10.2Z" />
+            </svg>
+          </button>
+          <button id="btn-compact" class="icon-button compact-toggle" type="button" aria-label="切换紧凑模式" title="切换紧凑模式">
+            <svg class="compact-icon compact-icon-collapse" viewBox="0 0 24 24" aria-hidden="true">
+              <path d="M8 3v3a2 2 0 0 1-2 2H3M16 3v3a2 2 0 0 0 2 2h3M8 21v-3a2 2 0 0 0-2-2H3M16 21v-3a2 2 0 0 1 2-2h3" />
+            </svg>
+            <svg class="compact-icon compact-icon-expand" viewBox="0 0 24 24" aria-hidden="true">
+              <path d="M15 3h6v6M9 21H3v-6M21 3l-7 7M3 21l7-7" />
+            </svg>
+          </button>
+          <button id="btn-refresh" class="icon-button" type="button" aria-label="刷新会话" title="刷新会话">
+            <svg viewBox="0 0 24 24" aria-hidden="true">
+              <path d="M20 6v5h-5M4 18v-5h5" />
+              <path d="M18.5 9A7 7 0 0 0 6 6.5L4 9M5.5 15A7 7 0 0 0 18 17.5l2-2.5" />
+            </svg>
+          </button>
+          <button id="btn-clear" class="button button-ghost" type="button" title="清空当前会话消息">
+            <svg viewBox="0 0 24 24" aria-hidden="true">
+              <path d="M3 6h18M8 6V4h8v2M19 6l-1 15H6L5 6M10 11v6M14 11v6" />
+            </svg>
+            <span>清空</span>
+          </button>
+        </div>
+      </header>
+
+      <div class="workspace">
+        <aside id="sidebar" class="sidebar" aria-label="会话列表">
+          <div class="sidebar-head">
+            <div class="sidebar-title-row">
+              <h2>会话</h2>
+              <span id="session-count" class="count-badge">0</span>
+              <button id="btn-open-session" class="icon-button sidebar-action" type="button" aria-label="新建会话" title="新建会话">
+                <svg viewBox="0 0 24 24" aria-hidden="true">
+                  <path d="M12 5v14M5 12h14" />
+                </svg>
+              </button>
+            </div>
+            <label class="search-field" for="session-search">
+              <svg viewBox="0 0 24 24" aria-hidden="true">
+                <circle cx="11" cy="11" r="7" />
+                <path d="m20 20-3.5-3.5" />
+              </svg>
+              <input id="session-search" type="search" placeholder="搜索会话或 ID" autocomplete="off" />
+            </label>
+            <label class="search-field" for="message-search">
+              <svg viewBox="0 0 24 24" aria-hidden="true">
+                <circle cx="11" cy="11" r="7" />
+                <path d="m20 20-3.5-3.5" />
+              </svg>
+              <input id="message-search" type="search" placeholder="搜索消息内容" autocomplete="off" />
+              <span id="search-count" class="search-count"></span>
+            </label>
+            <p id="search-status" class="search-status" role="status"></p>
+          </div>
+
+          <div id="search-results" class="search-results" hidden></div>
+
+          <div id="session-list" class="session-list" role="listbox" aria-label="可用会话"></div>
+          <div id="sidebar-empty" class="sidebar-empty" hidden>
+            <svg viewBox="0 0 24 24" aria-hidden="true">
+              <path d="M21 15a4 4 0 0 1-4 4H8l-5 3V7a4 4 0 0 1 4-4h10a4 4 0 0 1 4 4z" />
+            </svg>
+            <p>暂无匹配会话</p>
+          </div>
+        </aside>
+
+        <button id="sidebar-backdrop" class="sidebar-backdrop" type="button" aria-label="关闭会话列表"></button>
+
+        <main class="chat-panel">
+          <header class="conversation-header">
+            <div id="conversation-avatar" class="avatar avatar-large" aria-hidden="true">#</div>
+            <div class="conversation-copy">
+              <div class="conversation-title-row">
+                <h1 id="conversation-title">选择一个会话</h1>
+                <span id="conversation-kind" class="badge" hidden></span>
+              </div>
+              <div class="conversation-meta">
+                <span id="conversation-id" class="meta-item">尚未连接会话</span>
+                <span id="conversation-platform" class="meta-item" hidden></span>
+              </div>
+            </div>
+            <div class="conversation-actions">
+              <button id="btn-pin" class="icon-button" type="button" aria-label="置顶会话" title="置顶会话" aria-pressed="false">
+                <svg viewBox="0 0 24 24" aria-hidden="true">
+                  <path d="M9 3h6l-1 6 4 4v2H6v-2l4-4-1-6Z" />
+                  <path d="M12 15v6" />
+                </svg>
+              </button>
+              <button id="btn-export" class="icon-button" type="button" aria-label="导出会话记录" title="导出会话记录">
+                <svg viewBox="0 0 24 24" aria-hidden="true">
+                  <path d="M12 3v12M7 10l5 5 5-5" />
+                  <path d="M4 20h16" />
+                </svg>
+              </button>
+              <button id="btn-details" class="icon-button details-button" type="button" aria-label="查看会话详情" title="会话详情" aria-expanded="false">
+                <svg viewBox="0 0 24 24" aria-hidden="true">
+                  <circle cx="12" cy="12" r="9" />
+                  <path d="M12 11v5M12 8h.01" />
+                </svg>
+              </button>
+            </div>
+          </header>
+
+          <div class="chat-workspace">
+            <section id="messages" class="message-list" aria-label="消息列表" tabindex="-1">
+              <button id="load-more" class="load-more" type="button" hidden>
+                <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m18 15-6-6-6 6" /></svg>
+                <span>加载更早消息</span>
+              </button>
+              <div id="empty-state" class="empty-state">
+                <span class="empty-icon" aria-hidden="true">
+                  <svg viewBox="0 0 24 24">
+                    <path d="M21 15a4 4 0 0 1-4 4H8l-5 3V7a4 4 0 0 1 4-4h10a4 4 0 0 1 4 4z" />
+                    <path d="M8 10h8M8 14h5" />
+                  </svg>
+                </span>
+                <h3>选择会话开始聊天</h3>
+                <p>历史消息与实时消息会显示在这里</p>
+              </div>
+              <div id="message-content"></div>
+            </section>
+
+            <aside id="details-panel" class="details-panel" aria-label="会话详情">
+              <div class="details-head">
+                <div>
+                  <span class="eyebrow">会话详情</span>
+                  <h2 id="details-title">暂未选择</h2>
+                </div>
+                <button id="btn-details-close" class="icon-button" type="button" aria-label="关闭详情">
+                  <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M18 6 6 18M6 6l12 12" /></svg>
+                </button>
+              </div>
+
+              <dl class="detail-list">
+                <div><dt>类型</dt><dd id="detail-kind">-</dd></div>
+                <div><dt>ID</dt><dd id="detail-id" class="mono">-</dd></div>
+                <div><dt>平台</dt><dd id="detail-platform">-</dd></div>
+                <div><dt>消息数</dt><dd id="detail-count">0</dd></div>
+              </dl>
+
+              <div class="participants-section">
+                <div class="section-title-row">
+                  <h3>参与者</h3>
+                  <span id="participant-count" class="count-badge">0</span>
+                </div>
+                <p class="section-hint">点击参与者可 @ 他；输入框里手打 @昵称 也会变成真 @</p>
+                <div id="participant-list" class="participant-list"></div>
+              </div>
+            </aside>
+          </div>
+
+          <div class="composer-shell">
+            <button id="new-message-pill" class="new-message-pill" type="button" hidden>
+              <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 5v14M18 13l-6 6-6-6" /></svg>
+              <span id="new-message-text">有新消息</span>
+            </button>
+
+            <div id="attachment-preview" class="attachment-preview" hidden></div>
+
+            <form id="composer" class="composer">
+              <button id="btn-attach" class="icon-button attach-button" type="button" aria-label="添加图片" title="添加图片（也可直接粘贴）">
+                <svg viewBox="0 0 24 24" aria-hidden="true">
+                  <path d="M21 12.5 12.5 21a5 5 0 0 1-7-7l8-8a3.5 3.5 0 0 1 5 5l-8 8a2 2 0 0 1-3-3l7-7" />
+                </svg>
+              </button>
+              <input id="attachment-input" type="file" accept="image/*" hidden />
+              <textarea id="input" rows="1" placeholder="选择一个会话后输入消息" aria-label="消息内容" disabled></textarea>
+              <button id="btn-send" class="send-button" type="submit" aria-label="发送消息" disabled>
+                <svg viewBox="0 0 24 24" aria-hidden="true">
+                  <path d="m22 2-7 20-4-9-9-4Z" />
+                  <path d="M22 2 11 13" />
+                </svg>
+              </button>
+            </form>
+          </div>
+        </main>
       </div>
     </div>
+
+    <div id="lightbox" class="lightbox" hidden role="dialog" aria-label="图片预览">
+      <img id="lightbox-image" alt="图片预览" />
+    </div>
+
+    <div id="dialog-region" class="dialog-region"></div>
+    <div id="toast-region" class="toast-region" aria-live="polite" aria-atomic="true"></div>
     <script type="module" src="./app.js"></script>
   </body>
 </html>
