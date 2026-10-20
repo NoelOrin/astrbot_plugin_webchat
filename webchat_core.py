@@ -261,18 +261,31 @@ def serialize_chain(chain: Iterable[Any] | None) -> list[dict]:
 # 用户看到的是字面的 "<mention>"，被 @ 的人当然收不到提醒。
 _TAG = r"(?:mention|at)"
 
+# 标签名后必须紧跟空白、"/" 或 ">"。少了这个边界，`<atom>` / `<attachment>` /
+# `<at most 3 items>` 这类普通文本会被整段当成标签吞掉。
+_TAG_END = r"(?=[\s/>:])"
+
+# 属性段只认 `key=value` 形式。`<at most 3 items>` 这种不是标签，必须原样留在正文里。
+_ATTRS = r"""(?P<attrs>(?:\s+[A-Za-z_][\w-]*\s*=\s*(?:"[^"<>]*"|'[^'<>]*'|[^\s"'<>/>]+))*)"""
+
 _MENTION_TOKEN_RE = re.compile(
     rf"""
-    <(?P<paired_tag>{_TAG})\s*>\s*(?P<paired_name>[^<>]{{1,64}}?)\s*</(?P=paired_tag)\s*>
-  | <(?P<colon_tag>{_TAG})\s*:\s*(?P<colon_id>[^<>\s]+)\s*>
-  | <(?P<attr_tag>{_TAG})(?P<attrs>[^<>]*?)/?>
-  | </?(?P<stray_tag>{_TAG})\s*/?>
+    <(?P<paired_tag>{_TAG}){_TAG_END}\s*>\s*(?P<paired_name>[^<>]{{1,64}}?)\s*</(?P=paired_tag)\s*>
+  | <(?P<colon_tag>{_TAG}){_TAG_END}\s*:\s*(?P<colon_id>[^<>\s]+)\s*>
+  | <(?P<attr_tag>{_TAG}){_TAG_END}{_ATTRS}\s*/?>
+  | </?(?P<stray_tag>{_TAG}){_TAG_END}\s*/?>
     """,
     re.VERBOSE | re.IGNORECASE,
 )
 
 _MENTION_ID_ATTR_RE = re.compile(
     r"""(?:^|\s)(?:id|qq|user_id|uid|qq_id|target)\s*=\s*["']?\s*([^"'\s/>]+)""",
+    re.IGNORECASE,
+)
+
+# 只带昵称、没给 ID 的写法（`<at name="小明"/>`）也能靠名字解析出 ID。
+_MENTION_NAME_ATTR_RE = re.compile(
+    r"""(?:^|\s)(?:name|nickname|nick)\s*=\s*(?:"([^"<>]*)"|'([^'<>]*)'|([^\s"'<>/>]+))""",
     re.IGNORECASE,
 )
 
@@ -294,17 +307,25 @@ def text_to_segments(
     resolve: Callable[[str], str | None] | None = None,
     *,
     allow_bare_at: bool = True,
+    allow_tags: bool = True,
 ) -> list[dict]:
     """把一段出站文本拆成片段，把 @ 语义还原成 at 片段。
 
     ``resolve`` 把昵称 / QQ 号映射成用户 ID；查不到时**保留人类可读的 @昵称**，
     绝不会把尖括号标签原样留在消息里。
+
+    ``allow_tags`` 为 False 时完全不认 ``<mention>``/``<at>`` 标记（对应配置项
+    ``convert_mention_tags``），只处理手打 ``@``。
     """
     raw = "" if text is None else str(text)
     if not raw:
         return []
 
     segments: list[dict] = []
+    if not allow_tags:
+        _append_text(segments, raw, resolve, allow_bare_at)
+        return segments
+
     cursor = 0
     for match in _MENTION_TOKEN_RE.finditer(raw):
         _append_text(segments, raw[cursor:match.start()], resolve, allow_bare_at)
@@ -356,11 +377,19 @@ def _mention_segment(
     if colon_id:
         return _at_segment(colon_id)
 
-    attrs = match.group("attrs")
+    attrs = match.group("attrs") or ""
     if attrs:
         found = _MENTION_ID_ATTR_RE.search(attrs)
         if found:
             return _at_segment(found.group(1))
+        named = _MENTION_NAME_ATTR_RE.search(attrs)
+        if named:
+            name = next((group for group in named.groups() if group), "").strip()
+            if name:
+                target = _resolve_mention(name, resolve)
+                if target:
+                    return _at_segment(target, name)
+                return {"type": "text", "text": f"@{name}"}
     return None
 
 
@@ -419,7 +448,9 @@ def segments_to_text(segments: Sequence[dict] | None) -> str:
             parts.append(str(segment.get("text") or f"[{kind}]"))
         elif kind in ("face", "reply"):
             parts.append(str(segment.get("text") or ""))
-    return "".join(parts).strip()
+    # 纯 @ 消息会补一个 \u200b 明文段保证发得出去，那是投递用的，
+    # 不能混进落库的纯文本预览（复制/搜索都会看见一个看不见的字符）。
+    return "".join(parts).replace("\u200b", "").strip()
 
 
 def dumps_segments(segments: Sequence[dict] | None) -> str:
@@ -492,6 +523,9 @@ def _history_segment(part: dict) -> dict | None:
     if kind == "at":
         target = str(part.get("user_id") or "").strip()
         name = str(part.get("name") or "").strip()
+        if not target:
+            # 没有 ID 就还原不出 At：留成 @昵称 明文，别生成一个空的 at 片段
+            return {"type": "text", "text": f"@{name}"} if name else None
         return {"type": "at", "target": target, "text": name or target}
     if kind == "reply":
         snippet = str(part.get("text") or "").strip()
@@ -726,10 +760,11 @@ class MessageStore:
             indexed = conn.execute("SELECT COUNT(*) FROM messages_fts").fetchone()[0]
             total = conn.execute("SELECT COUNT(*) FROM messages").fetchone()[0]
             if indexed != total:
+                # 触发器会索引空 content（与下面这条语句保持同一口径），
+                # 两边口径一旦不一致，每次启动都会判定「索引不全」并整表重建。
                 conn.execute("DELETE FROM messages_fts")
                 conn.execute(
-                    "INSERT INTO messages_fts (rowid, content) "
-                    "SELECT id, content FROM messages WHERE content != ''"
+                    "INSERT INTO messages_fts (rowid, content) SELECT id, content FROM messages"
                 )
         except sqlite3.DatabaseError as exc:
             self.fts_enabled = False
@@ -1003,6 +1038,24 @@ class MessageStore:
             conn.close()
         return self._rows_to_messages(rows)
 
+    def messages_after(self, after_id: int, limit: int = MAX_PAGE_SIZE) -> list[dict]:
+        """按全局 id 游标取「比 after_id 新」的消息，跨会话、id 升序。
+
+        轮询降级用：一次请求带回所有会话的新消息，既不用逐会话发 N 次请求，
+        也不依赖 timestamp——同一秒多条、或发送端时钟回拨都不会漏。
+
+        裁剪与分页都以 id 为准，这里的游标和它们同口径。
+        """
+        conn = self.connect()
+        try:
+            rows = conn.execute(
+                "SELECT * FROM messages WHERE id > ? ORDER BY id ASC LIMIT ?",
+                (max(0, int(after_id)), clamp_int(limit, 1, MAX_PAGE_SIZE, MAX_PAGE_SIZE)),
+            ).fetchall()
+        finally:
+            conn.close()
+        return self._rows_to_messages(rows)
+
     # ── 导入水位：保证 AstrBot 历史只导一次 ──────────────────────
 
     @staticmethod
@@ -1027,21 +1080,64 @@ class MessageStore:
             return 0
 
     def set_import_watermark(self, platform_id: str, scope: str, value: int) -> None:
-        """只升不降：乱序回放旧记录时不能把水位拉回去。"""
+        """只升不降：乱序回放旧记录时不能把水位拉回去。
+
+        单调性由 SQL 的 ``WHERE`` 条件保证（单语句原子），
+        不要拆成「先读再写」——两个并发导入会互相覆盖。
+        """
         target = max(0, int(value))
-        current = self.get_import_watermark(platform_id, scope)
-        if target <= current:
-            return
         conn = self.connect()
         try:
             conn.execute(
                 "INSERT INTO meta (key, value) VALUES (?, ?) "
-                "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                "ON CONFLICT(key) DO UPDATE SET value = excluded.value "
+                "WHERE CAST(meta.value AS INTEGER) < CAST(excluded.value AS INTEGER)",
                 (self._watermark_key(platform_id, scope), str(target)),
             )
             conn.commit()
         finally:
             conn.close()
+
+    def has_recent_duplicate(
+        self,
+        session_id: str,
+        sender_id: str,
+        content: str,
+        timestamp: float,
+        window: float = 8.0,
+        ignore_sender: bool = False,
+    ) -> bool:
+        """乐观锁：同会话 + 同发送者 + 同内容 + 时间窗内已存在，视为重复。
+
+        不做类型区分——终端发出的 sent、Bot 回推的 received 都要能互相命中，
+        否则同一条消息会被不同来源各记一次。
+
+        ``ignore_sender``：Bot 自身消息在「终端发出（sender_id 为空）」与
+        「平台回推（sender_id 是 Bot）」两种形态下发送者不同，此时只比内容与时间。
+        """
+        text = str(content or "").strip()
+        if not session_id or not text:
+            return False
+        try:
+            moment = float(timestamp)
+        except (TypeError, ValueError):
+            return False
+        span = max(0.0, float(window))
+        sql = "SELECT 1 FROM messages WHERE session_id = ? AND TRIM(content) = ? "
+        params: list[Any] = [session_id, text]
+        if not ignore_sender:
+            sql += "AND sender_id = ? "
+            params.append(str(sender_id or ""))
+        sql += "AND timestamp >= ? AND timestamp <= ? LIMIT 1"
+        params.extend([moment - span, moment + span])
+        conn = self.connect()
+        try:
+            row = conn.execute(sql, params).fetchone()
+        except sqlite3.OperationalError:
+            return False
+        finally:
+            conn.close()
+        return row is not None
 
     def has_astrbot_message(self, session_id: str, row_id: int) -> bool:
         """这条 AstrBot 历史是否已经导进来过（按 platform_message_id 留痕）。"""
@@ -1071,6 +1167,7 @@ class MessageStore:
         """
         names: dict[str, str] = {}
         ids: set[str] = set()
+        local_ids: dict[str, set[str]] = {}
 
         conn = self.connect()
         try:
@@ -1086,6 +1183,16 @@ class MessageStore:
                 "ORDER BY local ASC, last_seen ASC",
                 (session_id or "",),
             ).fetchall()
+            # 联系人表里有 ID 但没有消息记录的也要能 @ 到（手打 QQ 号场景）。
+            # 单独 try：表不存在时不能把上面已经查到的 rows 一起丢掉。
+            try:
+                contact_ids = [
+                    str(contact["user_id"] or "").strip()
+                    for contact in conn.execute("SELECT user_id FROM contacts")
+                ]
+            except sqlite3.OperationalError:
+                contact_ids = []
+            ids.update(user_id for user_id in contact_ids if user_id)
         except sqlite3.OperationalError:
             rows = []
         finally:
@@ -1100,15 +1207,23 @@ class MessageStore:
             # 后写入的覆盖先写入的：local 与 last_seen 升序，最终留下最新的本地昵称
             if label:
                 names[label] = user_id
+                if row["local"]:
+                    local_ids.setdefault(label, set()).add(user_id)
+
+        # 本会话里同名但不同人：宁可退化成 @昵称 明文，也不能 @ 错人
+        ambiguous = {label for label, users in local_ids.items() if len(users) > 1}
 
         def resolve(name: str) -> str | None:
             key = str(name or "").strip().lstrip("@").strip()
             if not key:
                 return None
+            # 手打的 QQ 号（5~12 位）本身就是 ID，不用查表；更短的当正文处理，避免误 @
             if key in ids:
                 return key
             if key.isdigit() and 5 <= len(key) <= 12:
                 return key
+            if key in ambiguous:
+                return None
             return names.get(key)
 
         return resolve
@@ -1255,7 +1370,7 @@ class MessageStore:
         if session_id:
             sql += " AND m.session_id = ?"
             params.append(session_id)
-        sql += " ORDER BY m.timestamp DESC, m.id DESC LIMIT ?"
+        sql += " ORDER BY m.id DESC LIMIT ?"
         params.append(cap)
         conn = self.connect()
         try:
@@ -1276,7 +1391,7 @@ class MessageStore:
         if session_id:
             sql += " AND session_id = ?"
             params.append(session_id)
-        sql += " ORDER BY timestamp DESC, id DESC LIMIT ?"
+        sql += " ORDER BY id DESC LIMIT ?"
         params.append(cap)
         conn = self.connect()
         try:

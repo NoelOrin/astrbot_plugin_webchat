@@ -11,6 +11,7 @@
 from __future__ import annotations
 
 import asyncio
+import enum
 import os
 import sys
 import types
@@ -19,6 +20,15 @@ import pytest
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
+
+
+class EventMessageType(enum.Flag):
+    """镜像宿主的 astrbot.core.star.filter.event_message_type.EventMessageType。"""
+
+    GROUP_MESSAGE = enum.auto()
+    PRIVATE_MESSAGE = enum.auto()
+    OTHER_MESSAGE = enum.auto()
+    ALL = GROUP_MESSAGE | PRIVATE_MESSAGE | OTHER_MESSAGE
 
 
 # ── 假 AstrBot 宿主 ────────────────────────────────────────
@@ -88,6 +98,21 @@ class At:
         self.name = name
 
 
+class AtAll(At):
+    """宿主的 @全体成员 组件：qq 固定为 "all"。"""
+
+    def __init__(self, qq="all", name=""):
+        super().__init__(qq=qq, name=name)
+
+
+class Reply:
+    """宿主 Reply（引用）组件。respond 阶段会把它和 At 一起当「头部」剥离。"""
+
+    def __init__(self, id="", sender_id=None):
+        self.id = id
+        self.sender_id = sender_id
+
+
 def _install_fake_astrbot():
     """构造最小 astrbot 包，只包含 main.py 用到的符号。"""
     pkg = types.ModuleType("astrbot")
@@ -116,9 +141,10 @@ def _install_fake_astrbot():
             return wrapper
 
         @staticmethod
-        def event_message_type(*args, **kwargs):
+        def event_message_type(message_type, **kwargs):
             def wrapper(fn):
                 fn._is_message_listener = True
+                fn._event_message_type = message_type
                 return fn
 
             return wrapper
@@ -140,6 +166,7 @@ def _install_fake_astrbot():
             return self
 
     event_mod.filter = _Filter
+    event_mod.filter.EventMessageType = EventMessageType
     event_mod.AstrMessageEvent = FakeEvent
     event_mod.MessageChain = MessageChain
 
@@ -157,6 +184,8 @@ def _install_fake_astrbot():
     comp.Plain = FakePlain
     comp.Image = _Image
     comp.At = At
+    comp.AtAll = AtAll
+    comp.Reply = Reply
 
     star = types.ModuleType("astrbot.api.star")
 
@@ -222,16 +251,31 @@ class FakeContext:
 
 
 class FakeHistoryManager:
-    """stand-in for PlatformMessageHistoryManager：按 (platform_id, user_id) 存历史。"""
+    """stand-in for PlatformMessageHistoryManager：按 (platform_id, user_id) 存历史。
+
+    分页语义与宿主一致：page=1 是**最新**的一页（DB 里按 id DESC 取），
+    取回来之后再反转成时间正序。忽略 page_size 的桩会让「只导第一页」的
+    缺陷测不出来。
+    """
 
     def __init__(self):
         self.rows = {}
+        self.calls = []
 
     def seed(self, platform_id, user_id, rows):
         self.rows[(platform_id, user_id)] = list(rows)
 
     async def get(self, platform_id, user_id, page=1, page_size=200):
-        return list(self.rows.get((platform_id, user_id), []))
+        self.calls.append((platform_id, user_id, page, page_size))
+        ordered = sorted(
+            self.rows.get((platform_id, user_id), []),
+            key=lambda row: int(row["id"]),
+            reverse=True,
+        )
+        start = max(0, (int(page) - 1) * int(page_size))
+        chunk = ordered[start : start + int(page_size)]
+        chunk.reverse()
+        return chunk
 
 
 class FakePlatform:
@@ -282,6 +326,96 @@ def plugin(tmp_path, monkeypatch):
 
 def inbound(plugin, **kwargs):
     plugin._record_inbound(FakeEvent(**kwargs))
+
+
+def test_inbound_listener_is_registered(plugin):
+    """入站监听必须带 @filter.event_message_type。
+
+    宿主 waking_check 会跳过 ``event_filters`` 为空的 handler，没有这个
+    装饰器时 ``on_message`` 一次都不会被调用：终端只剩启动时导入的历史，
+    群里的新消息永远到不了——用户感知就是「信息没有及时接收」。
+    """
+    handler = type(plugin).on_message
+    assert getattr(handler, "_is_message_listener", False), (
+        "on_message 缺少 @filter.event_message_type，AstrBot 不会把入站消息派发给它"
+    )
+    assert getattr(handler, "_event_message_type", None) == EventMessageType.ALL, (
+        "监听范围必须是 ALL，否则群聊/私聊只会收到一半"
+    )
+
+
+def test_broadcast_soon_keeps_task_reference(plugin, monkeypatch):
+    """广播任务要挂到 _bg_tasks 上：裸 create_task 可能被 GC，事件就丢了。"""
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def fake_broadcast(event_type, data):
+        started.set()
+        await release.wait()
+
+    monkeypatch.setattr(plugin, "_sse_broadcast", fake_broadcast)
+
+    async def scenario():
+        plugin._broadcast_soon("message", {"session_id": "group:1"})
+        await started.wait()
+        return len(plugin._bg_tasks)
+
+    try:
+        assert _run(scenario()) == 1, "广播任务没有被 _bg_tasks 持有，可能被 GC 丢弃"
+    finally:
+        for task in list(plugin._bg_tasks):
+            task.cancel()
+
+
+def test_sse_keepalive_emits_ping(plugin):
+    """空闲时也要发真正的 ping 事件：注释行在 bridge 里会被丢掉，
+    前端就分不清「连接还活着但没消息」和「连接已经死了」。"""
+    plugin.SSE_KEEPALIVE = 0.01
+    queue: asyncio.Queue = asyncio.Queue()
+    gen = plugin._sse_generate("cli-test", queue)
+
+    async def scenario():
+        frames = [await gen.__anext__() for _ in range(3)]
+        await gen.aclose()
+        return frames
+
+    frames = _run(scenario())
+    assert frames[0].startswith("event: connected")
+    assert frames[2].startswith("event: ping"), f"空闲帧不是 ping: {frames[2]!r}"
+    assert "data:" in frames[2]
+    assert "cli-test" not in plugin._sse_clients
+
+
+def test_messages_after_walks_all_sessions_by_id(plugin):
+    """轮询游标必须按全局 id、跨会话：只轮询当前会话会漏掉别人的消息，
+    按 timestamp 则同一秒的多条会互相覆盖。"""
+    inbound(plugin, umo="aiocqhttp:GroupMessage:1", group_id="1",
+            sender_id="u1", sender_name="小明", text="群里第一条")
+    inbound(plugin, umo="aiocqhttp:FriendMessage:9", sender_id="9",
+            sender_name="小红", text="私聊第一条")
+
+    rows = plugin.store.messages_after(0, limit=10)
+    assert [m["content"] for m in rows] == ["群里第一条", "私聊第一条"]
+    assert [m["content"] for m in plugin.store.messages_after(rows[0]["id"], limit=10)] == [
+        "私聊第一条"
+    ]
+
+
+def test_updates_endpoint_uses_id_cursor(plugin, monkeypatch):
+    """轮询端点：after_id 之后的全部新消息 + last_id + has_more。"""
+    inbound(plugin, umo="aiocqhttp:GroupMessage:1", group_id="1",
+            sender_id="u1", sender_name="小明", text="一")
+    inbound(plugin, umo="aiocqhttp:FriendMessage:9", sender_id="9",
+            sender_name="小红", text="二")
+
+    quart = sys.modules["quart"]
+    monkeypatch.setattr(quart.request, "args", {"after_id": "1", "limit": "10"})
+
+    payload = _run(plugin.api_updates())
+    assert [m["id"] for m in payload["messages"]] == [2]
+    assert payload["last_id"] == 2
+    assert payload["has_more"] is False
+    assert any(path.endswith("/updates") for path in plugin.context.routes)
 
 
 # ── 入站 ──────────────────────────────────────────────────
@@ -815,6 +949,34 @@ def test_import_history_incremental_after_watermark():
     assert contents == ["旧", "新"]
 
 
+def test_import_history_pages_through_all_rows():
+    """超过一页的历史必须全量导入：只取 page=1 会漏掉更早的记录，
+    而水位一旦推到最新 id，那些记录就永远补不回来了。"""
+    plugin, _, ctx = _plugin_with_platform()
+    manager = ctx.message_history_manager
+    manager.seed(
+        "aiocqhttp-inst", "aiocqhttp-inst:GroupMessage:111",
+        [
+            {"id": i, "created_at": 1700000000 + i, "sender_id": "u1", "sender_name": "小明",
+             "content": {"type": "user", "message": [{"type": "plain", "text": f"m{i}"}]}}
+            for i in range(1, 1201)
+        ],
+    )
+    plugin.max_log = 5000
+    plugin.store.max_log = 5000
+
+    _run(plugin.discover_and_import())
+
+    assert plugin.store.count_messages("group:111") == 1200
+    assert plugin.store.has_astrbot_message("group:111", 1), "最早的一条也被导入了"
+    assert plugin.store.get_import_watermark(
+        "aiocqhttp-inst", "aiocqhttp-inst:GroupMessage:111"
+    ) == 1200
+    # 第二遍不再重复导入
+    _run(plugin.discover_and_import())
+    assert plugin.store.count_messages("group:111") == 1200
+
+
 def test_import_history_survives_missing_manager():
     """老版本宿主没有 message_history_manager 时不能崩。"""
     plugin, _, ctx = _plugin_with_platform()
@@ -855,3 +1017,197 @@ def test_discover_keeps_pinned_and_custom_names():
     row = {s["id"]: s for s in plugin.store.load_sessions()}["group:111"]
     assert row["pinned"] is True
     assert row["peer_name"] == "我的自定义群名"
+
+
+# ── 入站乐观锁：同一消息不重复入库 ────────────────────────
+
+
+def test_self_inbound_message_is_recorded_once(plugin):
+    """平台把 Bot 自己发的消息当 received 回推时，同一条不能被记两次。"""
+    inbound(plugin, umo="aiocqhttp-inst:GroupMessage:111", group_id="111",
+            sender_id="u1", sender_name="小明", text="在吗", self_id="bot-1")
+    before = plugin.store.count_messages("group:111")
+
+    for _ in range(2):  # 同样的回推来两次
+        inbound(plugin, umo="aiocqhttp-inst:GroupMessage:111", group_id="111",
+                sender_id="bot-1", sender_name="Bot", text="还真是", self_id="bot-1")
+
+    # 不忽略 Bot 自己的消息：第一次要记下来，只吞掉重复的
+    assert plugin.store.count_messages("group:111") == before + 1
+    assert [m["content"] for m in plugin.store.query_messages("group:111")][-1] == "还真是"
+
+
+def test_self_inbound_private_message_is_recorded_once(plugin):
+    inbound(plugin, umo="aiocqhttp-inst:FriendMessage:9", sender_id="9", sender_name="好友",
+            text="你好", self_id="bot-1")
+    key = plugin.session_index[0]
+    before = plugin.store.count_messages(key)
+
+    for _ in range(3):
+        inbound(plugin, umo="aiocqhttp-inst:FriendMessage:9", sender_id="bot-1",
+                sender_name="Bot", text="我在", self_id="bot-1")
+
+    assert plugin.store.count_messages(key) == before + 1
+
+
+def test_other_users_are_still_recorded(plugin):
+    """正常用户的入站消息不能被误伤。"""
+    inbound(plugin, umo="aiocqhttp-inst:GroupMessage:111", group_id="111",
+            sender_id="u1", sender_name="小明", text="你好", self_id="bot-1")
+    inbound(plugin, umo="aiocqhttp-inst:GroupMessage:111", group_id="111",
+            sender_id="u2", sender_name="小红", text="大家好", self_id="bot-1")
+    assert plugin.store.count_messages("group:111") == 2
+
+
+def test_same_user_repeating_same_text_is_kept(plugin):
+    """用户真的连发两次同样的话，不能当成重复吞掉（时间不同）。"""
+    inbound(plugin, umo="aiocqhttp-inst:GroupMessage:111", group_id="111",
+            sender_id="u1", sender_name="小明", text="刷屏", self_id="bot-1")
+    second = FakeEvent(umo="aiocqhttp-inst:GroupMessage:111", group_id="111",
+                       sender_id="u1", sender_name="小明", text="刷屏", self_id="bot-1")
+    second.message_obj.timestamp = 1700000000.0 + 60  # 一分钟后
+    plugin._record_inbound(second)
+
+    assert plugin.store.count_messages("group:111") == 2
+
+
+def test_terminal_send_then_platform_echo_is_not_duplicated(plugin, monkeypatch):
+    """截图场景：终端发一条，平台把它回推 → 只能出现一条。"""
+    import time
+
+    inbound(plugin, umo="aiocqhttp-inst:GroupMessage:111", group_id="111",
+            sender_id="u1", sender_name="小明", text="在吗")
+    _send(plugin, monkeypatch, "group:111", "还真是")
+
+    # 平台回推：sender 是 Bot 自己，时间在发送后 1~2 秒
+    now = time.time()
+    for offset in (1.0, 2.0):
+        echo = FakeEvent(umo="aiocqhttp-inst:GroupMessage:111", group_id="111",
+                         sender_id="bot-1", sender_name="Bot", text="还真是")
+        echo.message_obj.timestamp = now + offset
+        plugin._record_inbound(echo)
+
+    rows = [m for m in plugin.store.query_messages("group:111") if m["content"] == "还真是"]
+    assert len(rows) == 1, f"重复了 {len(rows)} 条"
+    assert rows[0]["type"] == "sent"
+
+
+def test_other_users_duplicates_are_always_kept(plugin):
+    """去重只对 Bot 自己生效：别人在窗口内连发相同内容必须都保留。"""
+    import time
+
+    inbound(plugin, umo="aiocqhttp-inst:GroupMessage:111", group_id="111",
+            sender_id="u1", sender_name="小明", text="在吗")
+    now = time.time()
+    for offset in (0.5, 1.0, 1.5):  # 1.5 秒内连发三次相同内容
+        ev = FakeEvent(umo="aiocqhttp-inst:GroupMessage:111", group_id="111",
+                       sender_id="u1", sender_name="小明", text="刷屏")
+        ev.message_obj.timestamp = now + offset
+        plugin._record_inbound(ev)
+
+    rows = [m for m in plugin.store.query_messages("group:111") if m["content"] == "刷屏"]
+    assert len(rows) == 3, f"只保留了 {len(rows)} 条，用户的重复消息被吞了"
+
+
+# ── @ 标记改写：只含 Reply/At 的链不能被 respond 阶段丢掉 ──────────
+
+
+def test_mention_rewrite_keeps_header_only_chain_deliverable():
+    """上游 respond 阶段会跳过「只含 Reply/At」的链（#2670）。
+
+    引用 + @ 改写后正好只剩这两类，必须补一个零宽明文段，否则消息静默丢失。
+    """
+    from astrbot.api.message_components import Plain, Reply
+
+    plugin, _, _ = _plugin_with_platform()
+    event = FakeEvent(
+        "aiocqhttp-inst:GroupMessage:111",
+        group_id="111",
+        chain=[Reply(id="9", sender_id=1), Plain('<mention id="123"/>')],
+    )
+
+    assert plugin._rewrite_mentions(event) is True
+
+    chain = event.get_result().chain
+    assert [type(item).__name__ for item in chain] == ["Reply", "At", "FakePlain"]
+    assert chain[-1].text == "\u200b"
+
+
+def test_mention_rewrite_uses_at_all_for_everyone():
+    """@全体成员 要用宿主的 AtAll，不能塞一个 qq="all" 的普通 At。"""
+    from astrbot.api.message_components import Plain
+
+    plugin, _, _ = _plugin_with_platform()
+    event = FakeEvent(
+        "aiocqhttp-inst:GroupMessage:111",
+        group_id="111",
+        chain=[Plain("<mention>全体成员</mention> 开会")],
+    )
+
+    plugin._rewrite_mentions(event)
+
+    chain = event.get_result().chain
+    assert type(chain[0]).__name__ == "AtAll"
+    assert chain[0].qq == "all"
+
+
+def test_mention_rewrite_leaves_plain_angle_brackets_alone():
+    """`<atom>` 这类正文不是标签，改写阶段必须原样放过。"""
+    from astrbot.api.message_components import Plain
+
+    plugin, _, _ = _plugin_with_platform()
+    event = FakeEvent(
+        "aiocqhttp-inst:GroupMessage:111",
+        group_id="111",
+        chain=[Plain("<attachment> 附件在这")],
+    )
+
+    assert plugin._rewrite_mentions(event) is False
+    assert event.get_result().chain[0].text == "<attachment> 附件在这"
+
+
+def test_mention_rewrite_respects_tag_and_bare_at_flags():
+    """convert_mention_tags / parse_bare_at 必须互相独立。"""
+    from astrbot.api.message_components import Plain
+
+    plugin, _, _ = _plugin_with_platform()
+    plugin._record_inbound(
+        FakeEvent(umo="aiocqhttp-inst:GroupMessage:111", group_id="111",
+                  sender_id="u1", sender_name="小明", text="我叫小明")
+    )
+
+    # 只关标签：手打 @ 仍然要解析
+    only_bare = FakeEvent("aiocqhttp-inst:GroupMessage:111", group_id="111",
+                          chain=[Plain("@小明 看这个")])
+    assert plugin._rewrite_mentions(only_bare, allow_tags=False, allow_bare=True) is True
+    assert [type(item).__name__ for item in only_bare.get_result().chain] == ["At", "FakePlain"]
+
+    # 只关手打 @：标签仍然要解析
+    only_tags = FakeEvent("aiocqhttp-inst:GroupMessage:111", group_id="111",
+                          chain=[Plain('<mention id="42"/> 看这个')])
+    assert plugin._rewrite_mentions(only_tags, allow_tags=True, allow_bare=False) is True
+    assert [type(item).__name__ for item in only_tags.get_result().chain] == ["At", "FakePlain"]
+
+
+# ── 平台列表 / 版本号 ────────────────────────────────────────
+
+
+def test_api_platforms_returns_real_ids():
+    """宿主里 meta 是方法，不调用就只能拿到空串，前端平台下拉框会永远空着。"""
+    plugin, _, _ = _plugin_with_platform()
+
+    payload = _run(plugin.api_platforms())
+
+    assert payload["platforms"] == [
+        {"id": "aiocqhttp-inst", "name": "aiocqhttp", "adapter": "aiocqhttp"}
+    ]
+
+
+def test_health_version_matches_metadata():
+    """api_health 的版本号必须来自 metadata.yaml，不能再硬编码。"""
+    import main as main_module
+
+    payload = _run(_plugin_with_platform()[0].api_health())
+
+    assert payload["version"] == main_module.PLUGIN_VERSION
+    assert payload["version"] != "unknown"

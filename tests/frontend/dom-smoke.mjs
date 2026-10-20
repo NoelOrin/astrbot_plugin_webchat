@@ -59,6 +59,14 @@ window.AstrBotPluginView = {
     if (endpoint === "search") return { results: [
       { id: 1, session_id: "group:111", type: "received", sender_name: "小明",
         content: "第一条", segments: [{type:"text",text:"第一条"}], timestamp: 1700000400 }] };
+    if (endpoint === "updates") {
+      // 轮询降级：新消息来自**另一个会话**，用来验证不再只轮询当前会话
+      return { messages: [
+        { id: 200, session_id: "aiocqhttp:FriendMessage:9", type: "received",
+          sender: "轮询", sender_id: "u8", sender_name: "轮询", content: "轮询新消息",
+          segments: [{type:"text",text:"轮询新消息"}], timestamp: 1700000900 }],
+        last_id: 200, has_more: false };
+    }
     if (endpoint === "platforms") return { platforms: [{ id: "p1", name: "OneBot", adapter: "aiocqhttp" }] };
     if (endpoint === "peers") return { peers: [{ id: "222", name: "另一个群" }] };
     if (endpoint === "export") return { text: "导出内容" };
@@ -156,6 +164,14 @@ check("切换会话后标题更新", doc.getElementById("conversation-title").te
   doc.getElementById("conversation-title").textContent);
 check("bot 消息有专属样式类", doc.querySelectorAll(".message-row.bot").length === 1,
   doc.querySelectorAll(".message-row.bot").length);
+// 切换会话必须清掉上一个会话的消息，不能残留
+{
+  const texts = [...doc.querySelectorAll("#message-content .message-row")]
+    .map((el) => el.textContent || "");
+  const leaked = texts.filter((t) => t.includes("第一条") || t.includes("看图"));
+  check("切换会话后不残留上个会话的消息", leaked.length === 0, `残留 ${leaked.length} 条: ${leaked.join(" | ")}`);
+  check("切换会话后只显示新会话消息", texts.length === 1, `实际 ${texts.length} 条`);
+}
 
 // 搜索
 const searchInput = doc.getElementById("message-search");
@@ -221,6 +237,15 @@ const pillVisible = !doc.getElementById("new-message-pill").hidden;
 check("SSE 新消息进入当前会话或计入未读", totalMessages >= 1 || unreadBadges >= 1 || pillVisible,
   JSON.stringify({ totalMessages, unreadBadges, pillVisible }));
 
+// 心跳帧只用于判活，不能产生任何消息或重渲染
+{
+  const rowsBefore = doc.querySelectorAll(".message-row").length;
+  window.__sseHandlers.onMessage({ eventType: "ping", parsed: {} });
+  await new Promise((r) => setTimeout(r, 30));
+  const rowsAfter = doc.querySelectorAll(".message-row").length;
+  check("ping 心跳不改变消息列表", rowsAfter === rowsBefore, `${rowsBefore} -> ${rowsAfter}`);
+}
+
 // ── 增量渲染：追加时不应重建已有节点 ──────────────────────
 // 先切回群会话，确保追加消息落在当前渲染的会话上
 const groupButton = [...doc.querySelectorAll(".session-item")]
@@ -249,6 +274,19 @@ window.__sseHandlers.onMessage({ eventType: "message_removed",
 await new Promise((r) => setTimeout(r, 120));
 const afterRemove = doc.querySelectorAll('[data-message-id="101"]').length;
 check("message_removed 后节点被清掉", afterRemove === 0, afterRemove);
+
+// 轮询降级：SSE 断开后，非当前会话的新消息也要及时到达并计入未读
+window.__sseHandlers.onError();
+await new Promise((r) => setTimeout(r, 200));
+{
+  const pollCalls = calls.filter((c) => c[0] === "GET" && c[1] === "updates");
+  const friendRow = [...doc.querySelectorAll(".session-item")]
+    .find((el) => el.textContent.includes("小红"));
+  const friendUnread = Number(friendRow?.querySelector(".unread-badge")?.textContent || 0);
+  check("SSE 断开后启动全局轮询", pollCalls.length >= 1, `updates 调用 ${pollCalls.length} 次`);
+  check("轮询到非当前会话的新消息并计入未读", friendUnread >= 1,
+    `未读 ${friendUnread}，会话项 ${friendRow?.textContent?.trim()}`);
+}
 
 // session_removed 事件
 window.__sseHandlers.onMessage({ eventType: "session_removed", parsed: { id: "group:111" } });

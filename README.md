@@ -113,6 +113,7 @@ astrbot_plugin_webchat/
 | `/api/plug/astrbot_plugin_webchat/sessions` | GET | 会话列表（`with_history=1` 附带最新一页消息） |
 | `/api/plug/astrbot_plugin_webchat/send` | POST | 发送消息（支持 `segments` 附带图片/@） |
 | `/api/plug/astrbot_plugin_webchat/history` | GET | 历史：`since` 增量，或 `limit` + `before_id` 游标分页 |
+| `/api/plug/astrbot_plugin_webchat/updates` | GET | 轮询降级：`after_id` 全局消息 id 游标，一次带回所有会话的新消息 |
 | `/api/plug/astrbot_plugin_webchat/search` | GET | 关键词检索消息 |
 | `/api/plug/astrbot_plugin_webchat/clear` | POST | 清空历史（不带 `session_id` 需 `confirm_all=true`） |
 | `/api/plug/astrbot_plugin_webchat/stream` | GET | SSE 实时推送 |
@@ -130,6 +131,7 @@ astrbot_plugin_webchat/
 | 事件 | 触发时机 |
 |------|----------|
 | `connected` / `hello` | 连接建立 |
+| `ping` | 空闲心跳（15 秒），前端据此判断连接是否假死并自动重连 |
 | `message` | 收到消息 / Bot 发出消息 / 终端发送成功 |
 | `session` | 发现新会话 |
 | `session_updated` | 会话置顶或改名 |
@@ -144,7 +146,7 @@ astrbot_plugin_webchat/
 3. **@ 还原** — `@filter.on_decorating_result()` 在发送前把 `<mention>` 标签改写成真实 At 段
 4. **会话归并** — 群聊统一用 `group:<group_id>` 作为键，同群所有人归一个会话
 5. **片段存储** — 消息链序列化为 JSON 片段，前端逐段渲染
-6. **实时推送** — bridge SSE 优先，失败降级轮询
+6. **实时推送** — bridge SSE 优先（15 秒 `ping` 判活，假死自动重连），失败降级为按全局 id 游标的轮询（2.5 秒）
 7. **身份映射** — 按平台与用户 ID 记录最新昵称，历史消息自动补全显示名
 
 ### 技术栈

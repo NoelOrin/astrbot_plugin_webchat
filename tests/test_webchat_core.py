@@ -9,6 +9,7 @@ import pytest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+import webchat_core  # noqa: E402
 from webchat_core import (  # noqa: E402
     MessageStore,
     astrbot_history_to_message,
@@ -139,6 +140,12 @@ def test_segments_to_text_renders_placeholders():
     assert segments_to_text(segments) == "看这个[图片]@9"
     assert segments_to_text([]) == ""
     assert segments_to_text(None) == ""
+    # 纯 @ 消息补的零宽空格是投递用的，不能混进正文预览
+    assert segments_to_text([{"type": "text", "text": "\u200b"}]) == ""
+    assert (
+        segments_to_text([{"type": "at", "target": "9"}, {"type": "text", "text": "\u200b"}])
+        == "@9"
+    )
 
 
 def test_at_component_keeps_nickname_from_text_attribute():
@@ -227,6 +234,48 @@ def test_bare_at_respects_allow_flag_and_all_alias():
 def test_plain_text_passes_through_as_single_segment():
     assert text_to_segments("你好 @ 一下") == [{"type": "text", "text": "你好 @ 一下"}]
     assert text_to_segments("") == []
+
+
+def test_angle_bracket_words_are_not_treated_as_mention_tags():
+    """`<atom>` / `<attachment>` / `<at most 3>` 是正文，不能被当标签吞掉。"""
+    for text in (
+        "<atom>",
+        "<attachment> 附件在这",
+        "<at most 3 items> 可以吗",
+        "<attempt> 失败",
+        "<mentionable>",
+    ):
+        assert not has_mention_markup(text), text
+        assert text_to_segments(text) == [{"type": "text", "text": text}], text
+
+
+def test_stray_mention_tag_is_stripped_but_text_survives():
+    """落单的标签本身要去掉，但同一段里的正文必须原样保留。"""
+    assert text_to_segments("看看 </at> 这个") == [{"type": "text", "text": "看看  这个"}]
+    assert text_to_segments("<mention>") == []
+    assert text_to_segments("<at/>") == []
+
+
+def test_mention_name_attribute_resolves_like_paired_form():
+    assert text_to_segments('<at name="小明"/>', lambda name: {"小明": "u1"}.get(name)) == [
+        {"type": "at", "target": "u1", "text": "小明"}
+    ]
+    # 解析不出 ID 时退化成明文
+    assert text_to_segments('<at name="外星人"/>', lambda name: None) == [
+        {"type": "text", "text": "@外星人"}
+    ]
+
+
+def test_allow_tags_false_leaves_markup_alone():
+    """convert_mention_tags=false 时只处理手打 @，标签原样保留。"""
+    resolve = lambda name: {"小明": "u1"}.get(name)  # noqa: E731
+    assert text_to_segments("<mention id='42'/> hi", resolve, allow_tags=False) == [
+        {"type": "text", "text": "<mention id='42'/> hi"}
+    ]
+    assert text_to_segments("@小明 hi", resolve, allow_tags=False) == [
+        {"type": "at", "target": "u1", "text": "小明"},
+        {"type": "text", "text": " hi"},
+    ]
     assert text_to_segments(None) == []
 
 
@@ -278,6 +327,24 @@ def test_astrbot_history_maps_plain_at_and_reply():
     assert message["segments"][1] == {"type": "at", "target": "9", "text": "小红"}
     assert message["platform_message_id"] == "astrbot:7"
     assert message["timestamp"] > 0
+
+
+def test_astrbot_history_at_without_user_id_degrades_to_text():
+    """历史里的 at 只有昵称、没有 user_id 时不能生成空 target 的 at 片段。"""
+    message = astrbot_history_to_message(
+        {
+            "id": 2,
+            "content": {
+                "type": "user",
+                "message": [
+                    {"type": "at", "name": "小红"},
+                    {"type": "plain", "text": "在吗"},
+                ],
+            },
+        }
+    )
+    assert message["segments"] == [{"type": "text", "text": "@小红在吗"}]
+    assert message["content"] == "@小红在吗"
 
 
 def test_astrbot_history_bot_role_becomes_bot_message():
@@ -775,6 +842,41 @@ def test_fts_rebuild_on_reopen(store, tmp_path):
     assert [m["content"] for m in reopened.search_messages("持久化内容")] == ["持久化内容"]
 
 
+def test_fts_does_not_rebuild_on_every_boot(tmp_path):
+    """旧库（有数据、没索引）回填一次后必须收敛，不能每次启动都整表重建。
+
+    触发器会把空 content 也写进索引，回填语句如果过滤掉空内容，
+    行数永远对不上，于是每次启动都 DELETE + 全量重建。
+    """
+    db_path = str(tmp_path / "legacy.db")
+    legacy = MessageStore(db_path)
+    conn = legacy.connect()
+    try:
+        conn.executescript(webchat_core._SCHEMA_SQL)
+        conn.execute(
+            "INSERT INTO messages (session_id, type, sender, sender_id, content, "
+            "segments, timestamp) VALUES ('s', 'received', 'a', '1', '', '[]', 1)"
+        )
+        conn.execute(
+            "INSERT INTO messages (session_id, type, sender, sender_id, content, "
+            "segments, timestamp) VALUES ('s', 'received', 'a', '1', 'hello', '[]', 2)"
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    for _ in range(3):
+        store = MessageStore(db_path)
+        store.init_schema()
+        conn = store.connect()
+        try:
+            indexed = conn.execute("SELECT COUNT(*) FROM messages_fts").fetchone()[0]
+            total = conn.execute("SELECT COUNT(*) FROM messages").fetchone()[0]
+        finally:
+            conn.close()
+        assert indexed == total
+
+
 def test_search_survives_fts_unavailable(store, monkeypatch):
     """FTS 建表失败时必须静默降级，检索仍然可用。"""
     store.init_schema()
@@ -798,3 +900,70 @@ def test_search_escapes_fts_syntax(store):
     assert store.search_messages("AND OR NOT") == []
     # 通配符在 LIKE 回退路径下要被转义成字面量
     assert store.search_messages("普通%") == []
+
+
+# ── 入站乐观锁：同一条消息短窗口内只入库一次 ──────────────
+
+
+def test_recent_duplicate_detects_same_message(store):
+    """同一会话、同一发送者、同一内容、时间相近 → 视为重复。"""
+    store.init_schema()
+    assert store.has_recent_duplicate("group:1", "u1", "还真是", 1000.0, window=8) is False
+    store.add_message(
+        "group:1",
+        {"type": "received", "sender_id": "u1", "content": "还真是", "timestamp": 1000.0},
+    )
+    assert store.has_recent_duplicate("group:1", "u1", "还真是", 1002.0, window=8) is True
+
+
+def test_recent_duplicate_respects_window(store):
+    """超出时间窗口就不算重复，避免把用户真的连发两次吞掉。"""
+    store.init_schema()
+    store.add_message(
+        "group:1",
+        {"type": "received", "sender_id": "u1", "content": "还真是", "timestamp": 1000.0},
+    )
+    assert store.has_recent_duplicate("group:1", "u1", "还真是", 1030.0, window=8) is False
+
+
+def test_recent_duplicate_ignores_different_sender_or_text(store):
+    store.init_schema()
+    store.add_message(
+        "group:1",
+        {"type": "received", "sender_id": "u1", "content": "还真是", "timestamp": 1000.0},
+    )
+    assert store.has_recent_duplicate("group:1", "u2", "还真是", 1001.0) is False
+    assert store.has_recent_duplicate("group:1", "u1", "别的", 1001.0) is False
+    assert store.has_recent_duplicate("group:2", "u1", "还真是", 1001.0) is False
+
+
+def test_recent_duplicate_covers_text_and_bot_types(store):
+    """终端发出的 sent 与 Bot 回推的 received 都要能命中，才能拦住重复。"""
+    store.init_schema()
+    store.add_message(
+        "group:1",
+        {"type": "sent", "sender_id": "", "content": "还真是", "timestamp": 1000.0},
+    )
+    # sent 没有 sender_id，空与空匹配
+    assert store.has_recent_duplicate("group:1", "", "还真是", 1001.0) is True
+
+
+def test_recent_duplicate_empty_text_is_never_duplicate(store):
+    store.init_schema()
+    store.add_message("group:1", {"content": "", "sender_id": "u1", "timestamp": 1000.0})
+    assert store.has_recent_duplicate("group:1", "u1", "", 1001.0) is False
+
+
+def test_recent_duplicate_ignore_sender_for_bot_echoes(store):
+    """Bot 回推时发送者与终端发送时不同，需要能忽略发送者匹配。"""
+    store.init_schema()
+    store.add_message(
+        "group:1",
+        {"type": "sent", "sender_id": "", "content": "还真是", "timestamp": 1000.0},
+    )
+    # 默认按发送者比较：不匹配
+    assert store.has_recent_duplicate("group:1", "bot-1", "还真是", 1001.0) is False
+    # 明确是 Bot 自身消息时放宽发送者条件
+    assert store.has_recent_duplicate(
+        "group:1", "bot-1", "还真是", 1001.0, ignore_sender=True
+    ) is True

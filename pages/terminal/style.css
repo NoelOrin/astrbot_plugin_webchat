@@ -38,13 +38,14 @@
 }
 
 /*
- * 尺寸断点只在这两处定义，媒体查询与紧凑模式共用同一组阈值：
- * - --compact：小窗（半屏/分屏/手机）自动进入紧凑模式，侧栏变抽屉
- * - --tiny：极小的 iframe 再压一层（隐藏品牌文字、压缩头部）
+ * 尺寸断点，媒体查询与紧凑模式共用同一组阈值：
+ * - compact：小窗（半屏/分屏/手机）自动进入紧凑模式，侧栏变抽屉
+ * - tiny：极小的 iframe 再压一层（隐藏品牌文字、压缩头部）
  * app.js 里的 matchMedia 判定必须与这里保持一致。
+ *
+ * ⚠️ 不要用 @custom-media / @media --名字：那是 PostCSS 语法，
+ * 本插件没有构建步骤，浏览器会整块丢弃。媒体查询一律写内联条件。
  */
-@custom-media --compact (max-width: 900px), (max-height: 720px);
-@custom-media --tiny (max-width: 420px), (max-height: 440px);
 
 html[data-theme="light"] {
   --background: #fafafa;
@@ -1603,7 +1604,7 @@ html[data-compact="true"] .compact-icon-expand {
 }
 
 /* 极窄或极矮时进一步收掉品牌文字与头像 */
-@media --tiny {
+@media (width <= 420px), (height <= 440px) {
   .brand-copy {
     display: none;
   }

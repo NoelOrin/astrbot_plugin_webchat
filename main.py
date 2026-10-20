@@ -15,6 +15,7 @@ import contextlib
 import json
 import logging
 import os
+import re
 import shutil
 import time
 
@@ -26,6 +27,7 @@ from quart import Response, jsonify, request
 try:  # 正常情况：以 data.plugins.<dir>.main 包路径加载
     from .webchat_core import (
         DEFAULT_MAX_LOG,
+        MAX_PAGE_SIZE,
         MessageStore,
         astrbot_history_to_message,
         clamp_int,
@@ -45,6 +47,7 @@ except ImportError:  # 兜底：宿主以裸模块名加载时走同目录导入
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
     from webchat_core import (  # type: ignore[no-redef]
         DEFAULT_MAX_LOG,
+        MAX_PAGE_SIZE,
         MessageStore,
         astrbot_history_to_message,
         clamp_int,
@@ -63,6 +66,26 @@ PLUGIN_NAME = "astrbot_plugin_webchat"
 LEGACY_DB_NAME = f"{PLUGIN_NAME}.db"
 
 logger = logging.getLogger(PLUGIN_NAME)
+
+
+def _read_plugin_version() -> str:
+    """从 metadata.yaml 读版本号，避免和 api_health 里的硬编码漂移。
+
+    运行时零外部依赖，所以不引入 yaml——版本号格式固定，正则足够。
+    """
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "metadata.yaml")
+    try:
+        with open(path, encoding="utf-8") as handle:
+            for line in handle:
+                matched = re.match(r"""^\s*version\s*:\s*["']?([^"'\s#]+)""", line)
+                if matched:
+                    return matched.group(1)
+    except OSError as exc:
+        logger.debug(f"读取 metadata.yaml 失败（忽略）: {exc}")
+    return "unknown"
+
+
+PLUGIN_VERSION = _read_plugin_version()
 
 
 def _resolve_data_dir() -> str:
@@ -94,7 +117,34 @@ def _optional_hook(name: str):
     return decorator
 
 
+def _message_listener():
+    """注册「所有入站消息」监听器。
+
+    AstrBot 只派发**带 filter** 的 handler：``waking_check`` 里明确有
+    ``if len(handler.event_filters) == 0: continue``。所以 ``on_message``
+    必须显式声明 ``@filter.event_message_type(EventMessageType.ALL)``，
+    否则它永远不会被调用——终端只能看到启动时导入的历史，新消息收不到。
+
+    老版本宿主缺少该 API 时退化成空装饰器并告警，至少不影响插件加载。
+    """
+    register = getattr(filter, "event_message_type", None)
+    all_types = getattr(getattr(filter, "EventMessageType", None), "ALL", None)
+    if callable(register) and all_types is not None:
+        return register(all_types)
+    logger.warning("当前 AstrBot 版本不支持 filter.event_message_type，入站消息将不会被记录")
+
+    def decorator(fn):
+        return fn
+
+    return decorator
+
+
 class Plugin(Star):
+    # 入站乐观锁的短窗口（秒）：平台回推 / 多路径推送的同一条消息会被合并
+    INBOUND_DEDUPE_WINDOW = 8.0
+    # SSE 空闲心跳间隔（秒）：前端拿它判断连接是否假死
+    SSE_KEEPALIVE = 15
+
     def __init__(self, context: Context, config: AstrBotConfig = None):
         super().__init__(context)
         self.config = config or {}
@@ -123,6 +173,10 @@ class Plugin(Star):
         self._sse_counter = 0
         # 终端发出消息的短时指纹，用于抑制 after_message_sent 的重复入库
         self._recent_sends: dict[str, tuple[str, float]] = {}
+        # 后台任务必须持引用：只丢给 loop 的话可能被 GC 掉
+        self._bg_tasks: set[asyncio.Task] = set()
+        # 自动发现串行化：启动任务与 POST /discover 同时跑会重复导入
+        self._discovery_lock = asyncio.Lock()
 
         self._register_web_apis()
 
@@ -158,6 +212,7 @@ class Plugin(Star):
             ("sessions", self.api_sessions, ["GET"], "会话列表（可带历史）"),
             ("send", self.api_send, ["POST"], "向指定会话发送消息"),
             ("history", self.api_history, ["GET"], "会话消息历史 / 游标分页"),
+            ("updates", self.api_updates, ["GET"], "全局 id 游标拉新消息（轮询降级）"),
             ("clear", self.api_clear, ["POST"], "清空消息历史"),
             ("stream", self.api_stream, ["GET"], "SSE 实时消息推送"),
             ("search", self.api_search, ["GET"], "消息全文检索"),
@@ -206,12 +261,16 @@ class Plugin(Star):
             self._sse_clients.pop(cid, None)
 
     def _broadcast_soon(self, event_type: str, data: dict) -> None:
-        """在可能没有事件循环的上下文里安全地广播。"""
+        """在可能没有事件循环的上下文里安全地广播。
+
+        走 ``_spawn`` 而不是裸 ``create_task``：任务必须持有引用，
+        否则事件可能在真正推送前被 GC 掉，前端就会「消息来得不及时」。
+        """
         try:
-            loop = asyncio.get_running_loop()
+            asyncio.get_running_loop()
         except RuntimeError:
             return
-        loop.create_task(self._sse_broadcast(event_type, data))
+        self._spawn(self._sse_broadcast(event_type, data))
 
     async def _sse_generate(self, cid: str, queue: asyncio.Queue):
         try:
@@ -220,10 +279,14 @@ class Plugin(Star):
             yield f"event: hello\ndata: {hello}\n\n"
             while True:
                 try:
-                    event_type, payload = await asyncio.wait_for(queue.get(), timeout=15)
+                    event_type, payload = await asyncio.wait_for(
+                        queue.get(), timeout=self.SSE_KEEPALIVE
+                    )
                     yield f"event: {event_type}\ndata: {payload}\n\n"
                 except asyncio.TimeoutError:
-                    yield ": keepalive\n\n"
+                    # 用 ping 事件而不是注释行：注释在 bridge 里会被丢掉，
+                    # 前端就分不清「连接还在、只是没人说话」和「连接已经死了」。
+                    yield "event: ping\ndata: {}\n\n"
         except asyncio.CancelledError:
             raise
         finally:
@@ -285,6 +348,35 @@ class Plugin(Star):
             pass
         return group_id or "私聊"
 
+    def _is_duplicate_inbound(
+        self, session_key: str, sender_id: str, content: str, timestamp: float
+    ) -> bool:
+        """Bot 自身消息的乐观锁：短窗口内已有同内容就跳过。
+
+        只用于「发送者是 Bot 自己」的回推——平台会把 Bot 在其它端发出的消息
+        也当作入站事件下发，一次发送可能因此被记成两条。
+
+        这里刻意忽略发送者：终端发出时 sender_id 为空，平台回推时是 Bot 的 ID，
+        只比发送者会漏判。其他用户的消息不经过这里，不会互相吞掉。
+        """
+        return self.store.has_recent_duplicate(
+            session_key,
+            sender_id,
+            content,
+            timestamp,
+            window=self.INBOUND_DEDUPE_WINDOW,
+            ignore_sender=True,
+        )
+
+    def _sender_is_self(self, event: AstrMessageEvent, sender_id: str) -> bool:
+        """发送者是不是 Bot 自己（平台把自身消息回推的情况）。"""
+        if not sender_id:
+            return False
+        self_id = ""
+        with contextlib.suppress(Exception):
+            self_id = str(event.get_self_id() or "")
+        return bool(self_id) and sender_id == self_id
+
     def _group_id_of(self, event: AstrMessageEvent) -> str:
         message_obj = event.message_obj
         group_id = getattr(message_obj, "group_id", "") or ""
@@ -329,6 +421,7 @@ class Plugin(Star):
             "pinned": bool(meta.get("pinned")),
         }
 
+    @_message_listener()
     async def on_message(self, event: AstrMessageEvent):
         """记录所有入站消息。"""
         try:
@@ -364,6 +457,16 @@ class Plugin(Star):
         if not session_key:
             return None
 
+        # 不忽略 Bot 自身的消息（部分平台只在回推里才看得到自己发的消息），
+        # 但只对 Bot 自己做的去重：别人连发两条相同的话必须都保留。
+        content = str(getattr(event, "message_str", "") or "")
+        timestamp = coerce_float(getattr(message_obj, "timestamp", 0), now_ts()) or now_ts()
+        if self._sender_is_self(event, sender_id) and self._is_duplicate_inbound(
+            session_key, sender_id, content, timestamp
+        ):
+            logger.debug(f"忽略 Bot 自身消息的重复回推: {session_key} / {content[:20]}")
+            return None
+
         self._ensure_session(
             session_key,
             {
@@ -385,14 +488,13 @@ class Plugin(Star):
                 "type": "received",
                 "sender": sender_name or sender_id,
                 "sender_id": sender_id,
-                "content": str(getattr(event, "message_str", "") or ""),
+                "content": content,
                 "segments": segments,
                 "group_id": group_id,
                 "platform": platform,
                 "platform_id": platform_id,
                 "platform_message_id": str(getattr(message_obj, "message_id", "") or ""),
-                "timestamp": coerce_float(getattr(message_obj, "timestamp", 0), now_ts())
-                or now_ts(),
+                "timestamp": timestamp,
             },
         )
         self._broadcast_soon("message", saved)
@@ -405,8 +507,17 @@ class Plugin(Star):
         """AstrBot 加载完成后，后台补齐会话列表与历史，不阻塞启动。"""
         if not self._discovery_enabled():
             return
-        with contextlib.suppress(RuntimeError):
-            asyncio.get_running_loop().create_task(self.discover_and_import())
+        self._spawn(self.discover_and_import())
+
+    def _spawn(self, coro) -> None:
+        """跑一个后台任务，并持有引用直到结束（避免任务被 GC 中断）。"""
+        try:
+            task = asyncio.get_running_loop().create_task(coro)
+        except RuntimeError:
+            coro.close()
+            return
+        self._bg_tasks.add(task)
+        task.add_done_callback(self._bg_tasks.discard)
 
     def _discovery_enabled(self) -> bool:
         return coerce_bool(self.config.get("auto_discover_sessions", True), True) or coerce_bool(
@@ -419,6 +530,10 @@ class Plugin(Star):
         群全部自动建；好友按活跃度（有历史才建），避免上千好友把列表撑爆。
         任何一步失败都只记在该步骤的结果里，不影响其它来源。
         """
+        async with self._discovery_lock:
+            return await self._discover_and_import_locked()
+
+    async def _discover_and_import_locked(self) -> dict:
         result = {
             "groups_created": 0,
             "friends_created": 0,
@@ -578,7 +693,9 @@ class Plugin(Star):
         if manager is None:
             return False
         try:
-            rows = await self._fetch_history(manager, platform_id, send_target, page_size=1)
+            rows = await self._fetch_history(
+                manager, platform_id, send_target, page_size=1, max_pages=1
+            )
         except Exception:
             return False
         return bool(rows)
@@ -611,16 +728,12 @@ class Plugin(Star):
             return 0
 
         watermark = self.store.get_import_watermark(platform_id, scope)
-        highest = watermark
         imported = 0
-        for row in rows:
-            row_dict = row if isinstance(row, dict) else self._history_row_dict(row)
-            row_id = row_dict.get("id")
+        for row_dict in rows:
             try:
-                row_id = int(row_id)
+                row_id = int(row_dict.get("id"))
             except (TypeError, ValueError):
                 continue
-            highest = max(highest, row_id)
             if row_id <= watermark:
                 continue
             if self.store.has_astrbot_message(session_key, row_id):
@@ -639,19 +752,48 @@ class Plugin(Star):
             self.store.add_message(session_key, message)
             imported += 1
 
+        # 水位推到「本轮真正见到过的最新 id」。_fetch_history 会翻完所有页，
+        # 所以这里不会跳过任何更早的记录。
+        highest = max([int(row_dict["id"]) for row_dict in rows] + [watermark])
         self.store.set_import_watermark(platform_id, scope, highest)
         return imported
 
     async def _fetch_history(
-        self, manager, platform_id: str, scope: str, page_size: int = 500
-    ) -> list:
-        try:
-            rows = manager.get(platform_id=platform_id, user_id=scope, page=1, page_size=page_size)
-        except TypeError:  # 老签名
-            rows = manager.get(platform_id, scope)
-        if asyncio.iscoroutine(rows):
-            rows = await rows
-        return list(rows or [])
+        self,
+        manager,
+        platform_id: str,
+        scope: str,
+        page_size: int = 500,
+        max_pages: int = 40,
+    ) -> list[dict]:
+        """按页取回历史，直到取空或达到页数上限；结果按 id 升序。
+
+        AstrBot 的 ``page=1`` 是**最新**的一页，只取第一页会漏掉更早的记录，
+        而水位一旦推上去，那些漏掉的记录就永远补不回来了。
+        """
+        collected: dict[int, dict] = {}
+        for page in range(1, max(1, max_pages) + 1):
+            try:
+                rows = manager.get(
+                    platform_id=platform_id, user_id=scope, page=page, page_size=page_size
+                )
+            except TypeError:  # 老签名，不支持分页
+                if page > 1:
+                    break
+                rows = manager.get(platform_id, scope)
+            if asyncio.iscoroutine(rows):
+                rows = await rows
+            batch = list(rows or [])
+            for row in batch:
+                row_dict = row if isinstance(row, dict) else self._history_row_dict(row)
+                try:
+                    row_id = int(row_dict.get("id"))
+                except (TypeError, ValueError):
+                    continue
+                collected[row_id] = row_dict
+            if len(batch) < page_size:
+                break
+        return [collected[row_id] for row_id in sorted(collected)]
 
     @staticmethod
     def _history_row_dict(row) -> dict:
@@ -674,14 +816,22 @@ class Plugin(Star):
         LLM 写出 <mention id="123"/> 时会原样发到平台，用户看到字面标签、
         被 @ 的人也收不到提醒。在消息真正发出前改写，平台才会收到 At 段。
         """
-        if not coerce_bool(self.config.get("convert_mention_tags", True), True):
+        allow_tags = coerce_bool(self.config.get("convert_mention_tags", True), True)
+        allow_bare = coerce_bool(self.config.get("parse_bare_at", True), True)
+        if not (allow_tags or allow_bare):
             return
         try:
-            self._rewrite_mentions(event)
+            self._rewrite_mentions(event, allow_tags=allow_tags, allow_bare=allow_bare)
         except Exception as exc:
             logger.debug(f"改写 @ 标记失败（忽略）: {exc}")
 
-    def _rewrite_mentions(self, event: AstrMessageEvent) -> bool:
+    def _rewrite_mentions(
+        self,
+        event: AstrMessageEvent,
+        *,
+        allow_tags: bool | None = None,
+        allow_bare: bool | None = None,
+    ) -> bool:
         """就地重写 event 结果链：文本里的 @ 标记 → At，标签绝不外泄。"""
         result = event.get_result()
         chain = getattr(result, "chain", None) if result is not None else None
@@ -690,8 +840,19 @@ class Plugin(Star):
 
         from astrbot.api.message_components import At, Plain
 
+        if allow_tags is None:
+            allow_tags = coerce_bool(self.config.get("convert_mention_tags", True), True)
+        if allow_bare is None:
+            allow_bare = coerce_bool(self.config.get("parse_bare_at", True), True)
+        # respond 阶段会跳过「只有 Reply/At」的消息链（#2670），
+        # 改写后只剩这两类时必须补一个零宽明文段。
+        header_types: tuple[type, ...] = (At,)
+        with contextlib.suppress(ImportError):
+            from astrbot.api.message_components import Reply as _Reply
+
+            header_types = (At, _Reply)
+
         resolve = self.store.mention_resolver(self._session_key_of(event))
-        allow_bare = coerce_bool(self.config.get("parse_bare_at", True), True)
 
         rewritten: list = []
         changed = False
@@ -700,31 +861,50 @@ class Plugin(Star):
             if not isinstance(component, Plain) or not isinstance(text, str) or not text:
                 rewritten.append(component)
                 continue
-            if not (has_mention_markup(text) or (allow_bare and "@" in text)):
+            tagged = allow_tags and has_mention_markup(text)
+            if not (tagged or (allow_bare and "@" in text)):
                 rewritten.append(component)
                 continue
-            segments = text_to_segments(text, resolve, allow_bare_at=allow_bare)
-            if not has_mention_markup(text) and not any(
+            segments = text_to_segments(
+                text, resolve, allow_bare_at=allow_bare, allow_tags=allow_tags
+            )
+            if not tagged and not any(
                 segment.get("type") == "at" for segment in segments
             ):
                 rewritten.append(component)  # 没有真的解析出 @，原样保留
                 continue
+            if not segments:
+                # 整段就是占位标签（如 `<mention>`），改写后什么都不剩。
+                # 直接丢掉这一段：宁可这条消息不发，也不能让标签外泄。
+                changed = True
+                continue
             for segment in segments:
                 target = str(segment.get("target") or "")
                 if segment.get("type") == "at" and target:
-                    rewritten.append(At(qq=target, name=str(segment.get("text") or "")))
+                    rewritten.append(self._at_component(target, str(segment.get("text") or "")))
                 else:
                     rewritten.append(Plain(str(segment.get("text") or "")))
             changed = True
 
         if changed:
-            # AstrBot 的 respond 阶段会跳过「只有 Reply/At」的消息链，
-            # 改写后若只剩 At，这条消息就会被静默丢弃；
-            # 补一个零宽空格明文段，保证 @ 真的发得出去。
-            if rewritten and all(isinstance(item, At) for item in rewritten):
+            if rewritten and all(isinstance(item, header_types) for item in rewritten):
                 rewritten.append(Plain("\u200b"))
             chain[:] = rewritten
         return changed
+
+    @staticmethod
+    def _at_component(target: str, name: str = ""):
+        """构造 At 组件；@全体成员用宿主专门的 AtAll。"""
+        from astrbot.api.message_components import At
+
+        if target == "all":
+            try:
+                from astrbot.api.message_components import AtAll
+
+                return AtAll()
+            except Exception:  # 老宿主没有 AtAll，或构造签名不同
+                pass
+        return At(qq=target, name=name)
 
     def _session_key_of(self, event: AstrMessageEvent) -> str:
         """事件 → 本插件的会话键，用于把昵称解析到正确的群成员。"""
@@ -745,9 +925,11 @@ class Plugin(Star):
         try:
             # 兜底：流式输出等场景不会经过 on_decorating_result，
             # 这里再改写一次，至少保证终端里存下来的是 @ 而不是字面标签。
-            if coerce_bool(self.config.get("convert_mention_tags", True), True):
+            allow_tags = coerce_bool(self.config.get("convert_mention_tags", True), True)
+            allow_bare = coerce_bool(self.config.get("parse_bare_at", True), True)
+            if allow_tags or allow_bare:
                 with contextlib.suppress(Exception):
-                    self._rewrite_mentions(event)
+                    self._rewrite_mentions(event, allow_tags=allow_tags, allow_bare=allow_bare)
             result = event.get_result()
             chain = getattr(result, "chain", None) if result is not None else None
             segments = serialize_chain(chain)
@@ -757,7 +939,10 @@ class Plugin(Star):
                 str(segment.get("text") or "")
                 for segment in segments
                 if segment.get("type") == "text"
-            ).strip()
+            )
+            # 纯 @ 的消息会被补一个零宽空格保证发得出去，
+            # 但它是投递用的，不能混进入库的纯文本预览里。
+            text = text.replace("\u200b", "").strip()
 
             group_id = self._group_id_of(event)
             is_group = bool(group_id)
@@ -948,6 +1133,9 @@ class Plugin(Star):
                     message,
                     self.store.mention_resolver(session_id),
                     allow_bare_at=coerce_bool(self.config.get("parse_bare_at", True), True),
+                    allow_tags=coerce_bool(
+                        self.config.get("convert_mention_tags", True), True
+                    ),
                 )
             )
         if isinstance(extra_segments, list):
@@ -985,8 +1173,7 @@ class Plugin(Star):
         await self._sse_broadcast("message", saved)
         return jsonify({"status": "ok", "data": saved})
 
-    @staticmethod
-    def _build_chain(segments: list[dict]):
+    def _build_chain(self, segments: list[dict]):
         """把片段还原成 AstrBot 消息链，图片按可访问地址尽力还原。"""
         from astrbot.api.message_components import Image
 
@@ -1007,18 +1194,20 @@ class Plugin(Star):
                 except Exception as exc:
                     logger.warning(f"图片还原失败: {exc}")
             elif kind == "at":
-                try:
-                    from astrbot.api.message_components import At
-
-                    target = str(segment.get("target") or "")
-                    if target:
-                        # 带上昵称：出站钩子折回文本时才能与原文对上，
-                        # 也便于平台侧展示「@小明」而不是「@123456」
-                        chain.chain.append(At(qq=target, name=str(segment.get("text") or "")))
-                except Exception as exc:
-                    logger.warning(f"@ 还原失败: {exc}")
+                target = str(segment.get("target") or "")
+                if target:
+                    # 带上昵称：出站钩子折回文本时才能与原文对上，
+                    # 也便于平台侧展示「@小明」而不是「@123456」
+                    try:
+                        chain.chain.append(
+                            self._at_component(target, str(segment.get("text") or ""))
+                        )
+                    except Exception as exc:
+                        logger.warning(f"@ 还原失败: {exc}")
             elif kind == "plain" and segment.get("text"):
                 chain.message(str(segment["text"]))
+            elif kind not in ("reply", "plain", "text"):
+                logger.debug(f"发送时跳过不支持的片段类型: {kind}")
         return chain
 
     async def api_history(self):
@@ -1049,6 +1238,24 @@ class Plugin(Star):
             if messages:
                 all_messages[session_key] = messages
         return jsonify({"messages": all_messages})
+
+    async def api_updates(self):
+        """?after_id=N&limit= —— 轮询降级：一次带回所有会话的新消息。
+
+        前端拿全局消息 id 做游标（不是 timestamp）：同一秒的多条消息、
+        发送端时钟回拨都不会漏；一次请求覆盖所有会话，冷会话也会更新未读数。
+        """
+        after_id = clamp_int(request.args.get("after_id", 0), 0, 2**62, 0)
+        limit = clamp_int(request.args.get("limit", MAX_PAGE_SIZE), 1, MAX_PAGE_SIZE, MAX_PAGE_SIZE)
+        messages = self.store.messages_after(after_id, limit=limit)
+        last_id = messages[-1]["id"] if messages else after_id
+        return jsonify(
+            {
+                "messages": messages,
+                "last_id": last_id,
+                "has_more": len(messages) >= limit,
+            }
+        )
 
     async def api_search(self):
         """?q=关键词 &session_id=（可选）&limit="""
@@ -1121,7 +1328,10 @@ class Plugin(Star):
         platforms: list[dict] = []
         try:
             for platform in self.context.platform_manager.get_insts():
+                # 宿主里 meta 是**方法**（Platform.meta），不调用只能拿到 bound method，
+                # 结果 id/name 全是空串，前端平台下拉框就永远是空的。
                 meta = getattr(platform, "meta", None)
+                meta = meta() if callable(meta) else meta
                 platforms.append(
                     {
                         "id": str(getattr(meta, "id", "") or ""),
@@ -1274,7 +1484,7 @@ class Plugin(Star):
         return jsonify(
             {
                 "plugin": PLUGIN_NAME,
-                "version": "0.4.0",
+                "version": PLUGIN_VERSION,
                 "db": self.db_path,
                 "sessions": len(self.session_index),
                 "sse_clients": len(self._sse_clients),
@@ -1288,7 +1498,10 @@ class Plugin(Star):
     # ── 生命周期 ──────────────────────────────────────────────
 
     async def terminate(self):
-        """插件卸载/重载时清理 SSE 与缓存。"""
+        """插件卸载/重载时清理 SSE、后台任务与缓存。"""
+        for task in list(self._bg_tasks):
+            task.cancel()
+        self._bg_tasks.clear()
         self._sse_clients.clear()
         self._recent_sends.clear()
         logger.info(f"{PLUGIN_NAME} 已卸载")

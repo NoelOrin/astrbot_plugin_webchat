@@ -40,7 +40,14 @@ const STORAGE_KEY = `${PLUGIN_NAME}_last_session`;
 const THEME_KEY = `${PLUGIN_NAME}_theme`;
 const COMPACT_KEY = `${PLUGIN_NAME}_compact`;
 const POLL_INTERVAL_MS = 2500;
+/** 轮询一次最多带回多少条新消息（与后端 MAX_PAGE_SIZE 对齐）。 */
+const POLL_MESSAGE_LIMIT = 200;
+/** 一次轮询取满时最多连续补几次，避免消息洪峰时无限递归。 */
+const POLL_MAX_DRAIN = 5;
 const HISTORY_LIMIT = HISTORY_PAGE_SIZE;
+/** SSE 心跳：后端每 15 秒发一个 ping，超过 45 秒没收到就认为连接已死。 */
+const STREAM_STALE_MS = 45000;
+const STREAM_CHECK_MS = 20000;
 /** 小窗自动紧凑阈值：必须与 style.css 顶部的 --compact 保持一致。 */
 const COMPACT_MEDIA = "(max-width: 900px), (max-height: 720px)";
 
@@ -110,6 +117,10 @@ const state = {
   pollTimer: null,
   polling: false,
   connected: false,
+  /** 最近一次收到任何 SSE 帧（含 ping）的时间，用于判断连接是否假死。 */
+  lastStreamAt: 0,
+  /** 轮询游标：已确认收到的最大消息 id（全局自增，跨会话）。 */
+  updatesCursor: 0,
   loadingHistory: false,
   sending: false,
   detailsOpen: false,
@@ -140,6 +151,7 @@ async function boot() {
     syncThemeFromBridge();
     await loadSessions({ selectInitial: true });
     connectStream();
+    window.setInterval(checkStreamHealth, STREAM_CHECK_MS);
   } catch (error) {
     console.error("初始化失败:", error);
     setStatus("加载失败", "error");
@@ -513,11 +525,16 @@ function renderMessages({ scrollToBottom: shouldScroll = false } = {}) {
   }
 
   const nextPlan = planMessages(messages, sessionId);
-  // 切换会话时旧计划无意义，强制整体重建
-  const previousPlan = state.renderSessionId === sessionId ? state.renderPlan : [];
-  const diff = diffPlan(previousPlan, nextPlan);
 
-  applyPlanDiff(diff, previousPlan, nextPlan, session);
+  if (state.renderSessionId !== sessionId) {
+    // 切换会话：DOM 里是上一个会话的节点，diff 无法推断（空计划会被判成 append），
+    // 必须直接清空后整树重建，否则旧会话的消息会残留在新会话里。
+    const fragment = document.createDocumentFragment();
+    for (const item of nextPlan) fragment.append(buildPlanNode(item, session));
+    elements.messageContent.replaceChildren(fragment);
+  } else {
+    applyPlanDiff(diffPlan(state.renderPlan, nextPlan), state.renderPlan, nextPlan, session);
+  }
 
   state.renderPlan = nextPlan;
   state.renderSessionId = sessionId;
@@ -1146,6 +1163,9 @@ async function runDiscovery() {
     const history = Number(result.history_imported) || 0;
     const errors = Array.isArray(result.errors) ? result.errors : [];
 
+    // loadSessions 只在「没有缓存」时才写 state.messages，
+    // 不清缓存的话，新导入的历史对当前已缓存的会话永远不可见。
+    clearMessageCaches();
     await loadSessions({ selectInitial: false });
     if (errors.length) {
       // 部分来源失败（常见于协议端不支持列表接口），如实提示而不是假装成功
@@ -1158,6 +1178,12 @@ async function runDiscovery() {
   } finally {
     elements.btnDiscover.disabled = false;
   }
+}
+
+/** 丢掉消息缓存，强制下一次 loadSessions 重新拉历史（发现/导入后用）。 */
+function clearMessageCaches() {
+  state.messages.clear();
+  state.history.clear();
 }
 
 // ── 新建会话 ────────────────────────────────────────────────
@@ -1296,10 +1322,12 @@ async function connectBridgeSSE() {
     const subscriptionId = await bridge.subscribeSSE("stream", {
       onOpen() {
         state.connected = true;
+        state.lastStreamAt = Date.now();
         stopPolling();
         setStatus("实时连接", "connected");
       },
       onMessage(event) {
+        state.lastStreamAt = Date.now();
         handleStreamEvent(event.eventType, event.parsed ?? safeParse(event.raw));
       },
       onError() {
@@ -1322,8 +1350,13 @@ function connectNativeSSE() {
 
     source.addEventListener("connected", () => {
       state.connected = true;
+      state.lastStreamAt = Date.now();
       stopPolling();
       setStatus("实时连接", "connected");
+    });
+    // 心跳只用来证明连接还活着，不触发任何渲染
+    source.addEventListener("ping", () => {
+      state.lastStreamAt = Date.now();
     });
     for (const type of [
       "message",
@@ -1332,8 +1365,10 @@ function connectNativeSSE() {
       "session_removed",
       "message_removed",
       "cleared",
+      "sessions_discovered",
     ]) {
       source.addEventListener(type, (event) => {
+        state.lastStreamAt = Date.now();
         handleStreamEvent(type, safeParse(event.data));
       });
     }
@@ -1357,6 +1392,24 @@ function disposeStream() {
     state.stream.source.close();
   }
   state.stream = null;
+  state.lastStreamAt = 0;
+}
+
+/**
+ * SSE 假死自愈。
+ *
+ * 插件重载 / 服务重启会掐断流，但 bridge 收到 `sse_state: closed` 时只转发
+ * open/error——iframe 侧完全无感，`state.connected` 一直是 true，也不降级轮询，
+ * 于是界面要手动刷新才会再收到消息。后端每 15 秒发一个 ping，
+ * 这里超过 45 秒没收到任何帧就主动重连。
+ */
+function checkStreamHealth() {
+  if (!state.stream || !state.connected || !state.lastStreamAt) return;
+  if (Date.now() - state.lastStreamAt < STREAM_STALE_MS) return;
+  console.warn("SSE 心跳超时，主动重连");
+  setStatus("正在重连", "loading");
+  state.connected = false;
+  connectStream();
 }
 
 function safeParse(text) {
@@ -1387,6 +1440,14 @@ function handleStreamEvent(type, payload) {
       break;
     case "cleared":
       handleCleared(payload);
+      break;
+    case "sessions_discovered":
+      // 启动时的自动发现在后台跑完后会广播这个事件，其它窗口要跟着刷新；
+      // 自己点按钮触发的（按钮禁用中）已经在 runDiscovery 里刷新过了。
+      if (!elements.btnDiscover.disabled) {
+        clearMessageCaches();
+        loadSessions({ selectInitial: false });
+      }
       break;
     default:
       break;
@@ -1529,6 +1590,9 @@ function hideNewMessagePill() {
 function startPolling() {
   if (state.connected || state.polling) return;
   state.polling = true;
+  // 游标只从「已知的最大 id」起跳，之后只由轮询结果推进：
+  // 本地发送 / SSE 到达的消息不推进游标，否则可能跳过并发插入的那几条。
+  state.updatesCursor = maxKnownMessageId();
   setStatus("轮询连接", "loading");
   state.pollTimer = window.setInterval(pollNewMessages, POLL_INTERVAL_MS);
   pollNewMessages();
@@ -1542,18 +1606,43 @@ function stopPolling() {
   }
 }
 
-async function pollNewMessages() {
-  const sessionId = state.currentSessionId;
-  if (!sessionId || !state.polling || state.connected) return;
-  const messages = state.messages.get(sessionId) || [];
-  const lastTimestamp = messages.length ? messages[messages.length - 1].timestamp : 0;
+/** 当前已知的所有消息里最大的 id（含会话摘要里的最后一条）。 */
+function maxKnownMessageId() {
+  let max = 0;
+  const consider = (value) => {
+    const id = Number(value);
+    if (Number.isFinite(id) && id > max) max = id;
+  };
+  for (const session of state.sessions.values()) consider(session.lastMessage?.id);
+  for (const list of state.messages.values()) {
+    for (const message of list) consider(message.id);
+  }
+  return max;
+}
+
+/**
+ * 轮询降级：一次请求带回**所有会话**的新消息。
+ *
+ * 旧实现只轮询当前会话、且用 timestamp 当游标——别的会话有新消息时
+ * 列表和未读数都不会动，同一秒的多条消息还可能被漏掉。
+ */
+async function pollNewMessages(drain = 0) {
+  if (!state.polling || state.connected) return;
   try {
-    const data = await bridge.apiGet("history", {
-      session_id: sessionId,
-      since: String(Math.max(0, lastTimestamp - 0.000001)),
+    const data = await bridge.apiGet("updates", {
+      after_id: String(state.updatesCursor || 0),
+      limit: String(POLL_MESSAGE_LIMIT),
     });
-    for (const raw of data?.messages || []) handleIncomingMessage(raw);
+    const messages = Array.isArray(data?.messages) ? data.messages : [];
+    for (const raw of messages) handleIncomingMessage(raw);
+    const lastId = Number(data?.last_id);
+    if (Number.isFinite(lastId) && lastId > state.updatesCursor) {
+      state.updatesCursor = lastId;
+    }
     setStatus("轮询连接", "loading");
+    if (data?.has_more && drain < POLL_MAX_DRAIN) {
+      window.setTimeout(() => pollNewMessages(drain + 1), 50);
+    }
   } catch (error) {
     console.warn("轮询失败:", error);
     setStatus("连接异常", "error");
