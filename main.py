@@ -139,6 +139,31 @@ def _message_listener():
     return decorator
 
 
+def _streaming_response(generator, headers: dict[str, str]):
+    """给 SSE 生成器挑一个「不会被宿主缓冲」的响应类型。
+
+    AstrBot 4.x 的插件 API 由 dashboard 统一分发，返回的 Quart ``Response``
+    会被 ``_coerce_view_result`` 认成 Quart 响应，再走
+    ``_quart_response_to_starlette``——里面是 ``await response.get_data()``，
+    也就是**把整个响应体读成一个 bytes**。SSE 生成器永不结束，于是请求永久挂起，
+    一个字节都到不了浏览器（前端表现为一直「正在连接」）。
+
+    宿主自己的 ``stream_response`` 返回 Starlette ``StreamingResponse``，
+    分发层对 Starlette Response 是原样透传的，这才真正流式。
+
+    老宿主没有该 API 时退回 Quart Response（那里本来就直接吃生成器）。
+    """
+    try:
+        from astrbot.api.web import stream_response
+    except ImportError:
+        stream_response = None  # type: ignore[assignment]
+    if stream_response is not None:
+        return stream_response(
+            generator, content_type="text/event-stream", headers=headers
+        )
+    return Response(generator, mimetype="text/event-stream", headers=headers)
+
+
 class Plugin(Star):
     # 入站乐观锁的短窗口（秒）：平台回推 / 多路径推送的同一条消息会被合并
     INBOUND_DEDUPE_WINDOW = 8.0
@@ -299,15 +324,12 @@ class Plugin(Star):
         queue: asyncio.Queue = asyncio.Queue(maxsize=512)
         self._sse_clients[cid] = queue
         logger.info(f"SSE 客户端连接: {cid}")
-        return Response(
-            self._sse_generate(cid, queue),
-            mimetype="text/event-stream",
-            headers={
-                "Cache-Control": "no-cache, no-transform",
-                "X-Accel-Buffering": "no",
-                "Connection": "keep-alive",
-            },
-        )
+        headers = {
+            "Cache-Control": "no-cache, no-transform",
+            "X-Accel-Buffering": "no",
+            "Connection": "keep-alive",
+        }
+        return _streaming_response(self._sse_generate(cid, queue), headers)
 
     # ── 事件：入站 ──────────────────────────────────────────────
 

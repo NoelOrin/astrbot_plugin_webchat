@@ -49,6 +49,8 @@ const HISTORY_LIMIT = HISTORY_PAGE_SIZE;
 /** SSE 心跳：后端每 15 秒发一个 ping，超过 45 秒没收到就认为连接已死。 */
 const STREAM_STALE_MS = 45000;
 const STREAM_CHECK_MS = 20000;
+/** bridge 订阅迟迟不返回就当失败：宿主缓冲 SSE 时 fetch 永远等不到响应头。 */
+const STREAM_OPEN_TIMEOUT_MS = 8000;
 /** 小窗自动紧凑阈值：必须与 style.css 顶部的 --compact 保持一致。 */
 const COMPACT_MEDIA = "(max-width: 900px), (max-height: 720px)";
 
@@ -1374,29 +1376,58 @@ function connectStream() {
 }
 
 async function connectBridgeSSE() {
+  const subscription = bridge.subscribeSSE("stream", {
+    onOpen() {
+      state.connected = true;
+      state.lastStreamAt = Date.now();
+      stopPolling();
+      setStatus("实时连接", "connected");
+    },
+    onMessage(event) {
+      state.lastStreamAt = Date.now();
+      handleStreamEvent(event.eventType, event.parsed ?? safeParse(event.raw));
+    },
+    onError() {
+      if (state.connected) setStatus("正在重连", "loading");
+      state.connected = false;
+      startPolling();
+    },
+  });
+
+  let subscriptionId;
   try {
-    const subscriptionId = await bridge.subscribeSSE("stream", {
-      onOpen() {
-        state.connected = true;
-        state.lastStreamAt = Date.now();
-        stopPolling();
-        setStatus("实时连接", "connected");
-      },
-      onMessage(event) {
-        state.lastStreamAt = Date.now();
-        handleStreamEvent(event.eventType, event.parsed ?? safeParse(event.raw));
-      },
-      onError() {
-        if (state.connected) setStatus("正在重连", "loading");
-        state.connected = false;
-        startPolling();
-      },
-    });
-    state.stream = { kind: "bridge", id: subscriptionId };
+    // 宿主若把 SSE 整段缓冲，fetch 永远等不到响应头，subscribeSSE 就不会 resolve。
+    // 加超时兜底：超时后照常退回原生 EventSource，并且先把轮询跑起来，
+    // 保证这段时间里消息仍然能到，而不是界面一直停在「正在连接」。
+    subscriptionId = await withTimeout(subscription, STREAM_OPEN_TIMEOUT_MS);
   } catch (error) {
-    console.warn("bridge SSE 不可用，退回原生 EventSource:", error);
+    console.warn("bridge SSE 未就绪，退回原生 EventSource:", error);
+    startPolling();
+    // 订阅可能稍后才成功：拿到就立刻退订，别留下一条看不见的连接
+    Promise.resolve(subscription)
+      .then((lateId) => bridge.unsubscribeSSE?.(lateId))
+      .catch(() => {});
     connectNativeSSE();
+    return;
   }
+  state.stream = { kind: "bridge", id: subscriptionId };
+}
+
+/** 给可能永不 resolve 的 Promise 加超时，超时后按失败处理。 */
+function withTimeout(promise, ms, message = "操作超时") {
+  return new Promise((resolve, reject) => {
+    const timer = window.setTimeout(() => reject(new Error(message)), ms);
+    Promise.resolve(promise).then(
+      (value) => {
+        window.clearTimeout(timer);
+        resolve(value);
+      },
+      (error) => {
+        window.clearTimeout(timer);
+        reject(error);
+      },
+    );
+  });
 }
 
 function connectNativeSSE() {

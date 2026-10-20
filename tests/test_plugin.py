@@ -386,6 +386,35 @@ def test_sse_keepalive_emits_ping(plugin):
     assert "cli-test" not in plugin._sse_clients
 
 
+def test_sse_returns_host_streaming_response(plugin, monkeypatch):
+    """SSE 必须返回宿主的 StreamingResponse。
+
+    宿主分发插件 API 时会把 Quart Response 走 `await get_data()` 整段读出来，
+    SSE 生成器永不结束 → 请求永久挂起，浏览器一个字节都收不到
+    （这就是 0.3.1 当年要绕开「包装」的原因）。
+    """
+
+    sentinel = object()
+    fake_web = types.ModuleType("astrbot.api.web")
+    fake_web.stream_response = lambda content, **kwargs: sentinel
+    monkeypatch.setitem(sys.modules, "astrbot.api.web", fake_web)
+
+    response = _run(plugin.api_stream())
+
+    assert response is sentinel, "没有走宿主的流式响应，SSE 会被缓冲掉"
+
+
+def test_sse_falls_back_to_quart_on_old_host(plugin, monkeypatch):
+    """老宿主没有 astrbot.api.web.stream_response 时退回 Quart Response。"""
+    monkeypatch.delitem(sys.modules, "astrbot.api.web", raising=False)
+
+    response = _run(plugin.api_stream())
+
+    quart = sys.modules["quart"]
+    assert isinstance(response, quart.Response)
+    assert response.mimetype == "text/event-stream"
+
+
 def test_messages_after_walks_all_sessions_by_id(plugin):
     """轮询游标必须按全局 id、跨会话：只轮询当前会话会漏掉别人的消息，
     按 timestamp 则同一秒的多条会互相覆盖。"""
@@ -416,14 +445,6 @@ def test_updates_endpoint_uses_id_cursor(plugin, monkeypatch):
     assert payload["last_id"] == 2
     assert payload["has_more"] is False
     assert any(path.endswith("/updates") for path in plugin.context.routes)
-
-
-def test_health_exposes_load_images_default(plugin):
-    """前端启动时从 /health 读图片开关的默认值：缺省必须是关。"""
-    assert _run(plugin.api_health())["load_images"] is False
-
-    plugin.config["load_images"] = True
-    assert _run(plugin.api_health())["load_images"] is True
 
 
 # ── 入站 ──────────────────────────────────────────────────

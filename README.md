@@ -7,6 +7,7 @@
 - **平台支持：仅 QQ** — OneBot v11（`aiocqhttp`）与 QQ 官方机器人（`qq_official` / `qq_official_webhook`），其它适配器未验证
 - **双向记录** — 不只是收消息：Bot 的回复、指令响应、其他插件主动推送也一并入库，一次对话两半都看得到
 - **富媒体消息** — 图片、@、表情、语音、文件、合并转发按片段保存，图片可点开大图预览
+- **图片默认折叠** — 图片只显示占位按钮，点哪张才加载哪张（也可用工具栏开关改成自动加载）
 - **@ 真正生效** — Bot/AI 回复里的 `<mention id="123"/>` 等占位标签会在发送前还原成真实 At 消息段；
   输入框手打 `@昵称` / `@QQ号` 也会解析成真 @（查不到时保留 `@昵称` 原文，绝不把标签发给用户）
 - **实时推送** — 优先使用 AstrBot 的 `bridge.subscribeSSE`，不可用时自动降级为 2.5 秒轮询
@@ -80,6 +81,12 @@ http://<你的AstrBot地址>/webui#/plugins/astrbot_plugin_webchat
 | `max_log_per_session` | int | `200` | 每个会话最大消息记录数，超出后裁剪最早的 |
 | `capture_bot_messages` | bool | `true` | 是否记录 Bot/插件主动发出的消息 |
 | `bot_display_name` | string | `Bot` | 出站消息在终端里的显示名称 |
+| `load_images` | bool | `false` | 是否自动加载消息图片；关闭时只显示占位，点一张加载一张 |
+| `convert_mention_tags` | bool | `true` | 把 `<mention>` 等标签还原成真实 @ |
+| `parse_bare_at` | bool | `true` | 把文本里的 `@昵称` / `@QQ号` 还原成真实 @ |
+| `auto_discover_sessions` | bool | `true` | 启动时自动发现平台群/好友并建会话 |
+| `auto_discover_include_friends` | bool | `true` | 自动发现时包含活跃好友 |
+| `import_astrbot_history` | bool | `true` | 增量导入 AstrBot 自身的历史消息 |
 
 ## 📁 项目结构
 

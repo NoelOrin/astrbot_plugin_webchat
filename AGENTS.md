@@ -240,6 +240,20 @@ const previousPlan = state.renderSessionId === sessionId ? state.renderPlan : []
 > （`state.connected === true`），既不重连也不降级轮询，只能手动刷新页面才能再收到消息。
 > 现在前端用 `checkStreamHealth()` 判活：超过 `STREAM_STALE_MS`（45 秒）没有任何帧就主动重连。
 
+> ⚠️ **SSE 必须返回宿主的 `astrbot.api.web.stream_response`，不能用 Quart `Response`。**
+> AstrBot 4.x 的 dashboard 统一分发插件 API，Quart Response 会被
+> `_coerce_view_result` → `_quart_response_to_starlette` 处理，而后者是
+> `await response.get_data()`——**把整个响应体读成一个 bytes**。SSE 生成器永不结束，
+> 请求就永久挂起，浏览器一个字节都收不到（前端表现为一直「正在连接」）。
+> 这是 0.3.1 当年额外 `app.add_url_rule` 想绕开的「包装」；现在宿主给了
+> `stream_response`，返回 Starlette `StreamingResponse`，分发层原样透传。
+> `test_sse_returns_host_streaming_response` 守着这条，别退回去。
+
+> ⚠️ 同理，前端 `bridge.subscribeSSE` 可能永远不 resolve（服务端被缓冲时 fetch 等不到
+> 响应头）。`connectBridgeSSE` 用 `withTimeout`（8 秒）兜底：超时即退回原生 EventSource
+> 并把轮询先跑起来，别让界面停在「正在连接」而什么都不做。
+
+
 ## 轮询降级（`/updates`）
 
 SSE 不可用时前端每 2.5 秒拉一次 `GET /updates?after_id=<全局消息 id>`，
