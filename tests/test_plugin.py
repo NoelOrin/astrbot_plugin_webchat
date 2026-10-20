@@ -812,6 +812,51 @@ def test_terminal_send_keeps_plain_text_when_at_unresolvable(plugin, monkeypatch
     assert chain.chain[0].text == "@查无此人 hi"
 
 
+def test_sent_row_is_written_before_platform_send(plugin, monkeypatch):
+    """sent 行必须在 send_message **之前**落库。
+
+    否则平台在那个 await 里回推时，库里什么都查不到 → 同一条记两份。
+    """
+    inbound(plugin, umo="aiocqhttp-inst:GroupMessage:111", group_id="111",
+            sender_id="u1", sender_name="小明", text="在吗")
+
+    context = plugin.context
+    original = context.send_message
+    seen_at_send = {}
+
+    async def inspect_then_send(target, chain):
+        seen_at_send["rows"] = [
+            m["content"] for m in plugin.store.query_messages("group:111")
+        ]
+        await original(target, chain)
+
+    monkeypatch.setattr(context, "send_message", inspect_then_send)
+
+    _send(plugin, monkeypatch, "group:111", "先入库")
+
+    assert "先入库" in seen_at_send["rows"], (
+        f"发送时库里还没有 sent 行: {seen_at_send['rows']}"
+    )
+
+
+def test_failed_send_rolls_back_prewritten_row(plugin, monkeypatch):
+    """发送失败要把预写的记录删掉，不能在终端留一条没发出去的消息。"""
+    inbound(plugin, umo="aiocqhttp-inst:GroupMessage:111", group_id="111",
+            sender_id="u1", sender_name="小明", text="在吗")
+    before = plugin.store.count_messages("group:111")
+
+    async def boom(target, chain):
+        raise RuntimeError("协议端掉线")
+
+    monkeypatch.setattr(plugin.context, "send_message", boom)
+
+    response = _send(plugin, monkeypatch, "group:111", "发不出去")
+
+    assert response[1] == 500, response
+    assert plugin.store.count_messages("group:111") == before, "失败后残留了预写的 sent 行"
+    assert "group:111" not in plugin._recent_sends, "失败后没有清掉乐观锁"
+
+
 def test_terminal_send_stores_resolved_segments(plugin, monkeypatch):
     inbound(plugin, umo="aiocqhttp:GroupMessage:1", group_id="1",
             sender_id="u1", sender_name="小明", text="我叫小明")

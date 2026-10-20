@@ -75,9 +75,19 @@ after_message_sent 钩子 → on_bot_message_sent()
 ### 发送
 ```
 前端 apiPost("send", {session_id, message, segments})
-  → api_send() → _build_chain(segments) → context.send_message(send_target, chain)
-  → 记录 _recent_sends 指纹 → store.add_message(type="sent") → 广播
+  → api_send() → _build_chain(segments)
+  → store.add_message(type="sent")      ← 必须先入库
+  → 记录 _recent_sends 指纹（乐观锁）
+  → context.send_message(send_target, chain)
+  → 失败则 delete_message 回滚 + 清锁；成功才广播 message
 ```
+
+> ⚠️ **顺序不能换：先入库，后发送。**
+> 平台会把 Bot 自己发出的消息当入站事件回推，而回推可能就发生在
+> `send_message` 的 `await` 里。若先发后存，那个窗口里库里还没有 `sent` 行，
+> 「同会话 + 同内容」的查重必然落空，同一条就被记成 `received` + `sent` 两份。
+> `test_sent_row_is_written_before_platform_send` 守着这个顺序，
+> `test_failed_send_rolls_back_prewritten_row` 守着失败时的回滚。
 
 ## 数据库
 
@@ -216,11 +226,10 @@ if self._sender_is_self(event, sender_id):
 - 窗口 `INBOUND_DEDUPE_WINDOW = 8s`，只按「同会话 + 同内容 + 时间窗」判定
 
 > ⚠️ **内存锁必须先查，且命中即释放**。
-> `api_send` 是先 `await send_message` 再写 `sent` 行，而平台回推恰好可能发生在那次
-> await 里——那一刻库里**没有** `sent` 记录，`has_recent_duplicate` 必然落空，
-> 同一条就会被记成 `received` + `sent` 两份（这就是「还是会重复发送」的根因）。
-> `_recent_sends` 在 `send_message` **之前**就设好，正好覆盖这个窗口。
-> 命中后必须 `pop()` 解锁：回声既然已经处理完，锁留在窗口里只会继续误吞后面的真实消息。
+> 平台回推可能就发生在 `api_send` 那次 `send_message` 的 `await` 里。现在
+> `sent` 行是在发送**之前**写入的（见「发送」一节的顺序约定），所以库查重也能命中；
+> 但内存锁仍然是第一道、最快的判断，且它命中后 `pop()` 立刻解锁——
+> 回声既然已经处理完，锁留在 8 秒窗口里只会继续误吞后面的真实消息。
 > `test_echo_arriving_before_sent_row_is_deduped`、`test_echo_releases_optimistic_lock`
 > 两条测试分别守着「竞态」和「自动解锁」，撤掉修复会立刻失败。
 

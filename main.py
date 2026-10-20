@@ -1204,16 +1204,13 @@ class Plugin(Star):
 
         try:
             chain = self._build_chain(segments)
-            self._recent_sends[session_id] = (
-                self._send_fingerprint(segments),
-                time.time(),
-            )
-            await self.context.send_message(send_target, chain)
         except Exception as exc:
-            self._recent_sends.pop(session_id, None)
-            logger.error(f"发送消息失败: {exc}")
+            logger.error(f"构造消息链失败: {exc}")
             return jsonify({"error": f"发送失败: {exc}"}), 500
 
+        # **先入库再发送**：平台回推可能就落在下面 send_message 的 await 里，
+        # 先写完 sent 行，任何时刻到达的回声都能被「同会话 + 同内容」查重拦下。
+        # （原先先发后存，那个 await 窗口里库里什么都没有，必然漏判成重复。）
         saved = self.store.add_message(
             session_id,
             {
@@ -1228,6 +1225,17 @@ class Plugin(Star):
                 "timestamp": now_ts(),
             },
         )
+        # 出站钩子会看到这条消息经过发送管线，用指纹把它认成「终端已入库」而跳过
+        self._recent_sends[session_id] = (self._send_fingerprint(segments), time.time())
+        try:
+            await self.context.send_message(send_target, chain)
+        except Exception as exc:
+            self._recent_sends.pop(session_id, None)
+            # 发送失败：删掉预写的记录，别在终端留一条其实没发出去的消息
+            self.store.delete_message(saved["id"])
+            logger.error(f"发送消息失败: {exc}")
+            return jsonify({"error": f"发送失败: {exc}"}), 500
+
         # 其他标签页也要看到自己发出的消息
         await self._sse_broadcast("message", saved)
         return jsonify({"status": "ok", "data": saved})
