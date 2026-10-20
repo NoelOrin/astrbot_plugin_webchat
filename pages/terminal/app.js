@@ -39,6 +39,7 @@ const PLUGIN_NAME = "astrbot_plugin_webchat";
 const STORAGE_KEY = `${PLUGIN_NAME}_last_session`;
 const THEME_KEY = `${PLUGIN_NAME}_theme`;
 const COMPACT_KEY = `${PLUGIN_NAME}_compact`;
+const IMAGES_KEY = `${PLUGIN_NAME}_load_images`;
 const POLL_INTERVAL_MS = 2500;
 /** 轮询一次最多带回多少条新消息（与后端 MAX_PAGE_SIZE 对齐）。 */
 const POLL_MESSAGE_LIMIT = 200;
@@ -56,6 +57,7 @@ const bridge = window.AstrBotPluginView || window.AstrBotPluginPage || null;
 const elements = {
   btnCompact: document.getElementById("btn-compact"),
   btnTheme: document.getElementById("btn-theme"),
+  btnImages: document.getElementById("btn-images"),
   messages: document.getElementById("messages"),
   messageContent: document.getElementById("message-content"),
   emptyState: document.getElementById("empty-state"),
@@ -132,12 +134,25 @@ const state = {
   context: null,
   renderPlan: [],
   renderSessionId: "",
+  /** 是否自动请求图片；默认关，可由插件配置或工具栏开关覆盖。 */
+  loadImages: false,
 };
 
 bindEvents();
 syncThemeControl();
 syncCompactControl();
+applyLoadImages(readInitialLoadImages(), { persist: false });
+syncImagesControl();
 boot();
+
+/**
+ * 图片开关的初值：本地记忆优先，其次插件配置（默认关）。
+ * 配置要等 boot 里的 health 才有，所以先按本地/默认值渲染，拿到配置再修正。
+ */
+function readInitialLoadImages() {
+  const stored = readStoredLoadImages();
+  return stored === null ? false : stored;
+}
 
 async function boot() {
   setStatus("正在连接", "loading");
@@ -149,6 +164,7 @@ async function boot() {
   try {
     state.context = await bridge.ready().catch(() => null);
     syncThemeFromBridge();
+    await syncImagePreferenceFromConfig();
     await loadSessions({ selectInitial: true });
     connectStream();
     window.setInterval(checkStreamHealth, STREAM_CHECK_MS);
@@ -156,6 +172,20 @@ async function boot() {
     console.error("初始化失败:", error);
     setStatus("加载失败", "error");
     toast(`初始化失败: ${errorText(error)}`, "error");
+  }
+}
+
+/** 插件配置里的 load_images 作为默认值；用户手动切过就以本地记忆为准。 */
+async function syncImagePreferenceFromConfig() {
+  if (readStoredLoadImages() !== null) return;
+  try {
+    const health = await bridge.apiGet("health");
+    if (health && typeof health.load_images === "boolean") {
+      applyLoadImages(health.load_images, { persist: false });
+      syncImagesControl();
+    }
+  } catch {
+    // health 拿不到就保持默认关，不影响终端使用
   }
 }
 
@@ -181,6 +211,7 @@ function bindEvents() {
   elements.btnClear.addEventListener("click", clearMessages);
   elements.btnCompact.addEventListener("click", toggleCompactMode);
   elements.btnTheme.addEventListener("click", toggleTheme);
+  elements.btnImages?.addEventListener("click", toggleLoadImages);
   elements.btnRefresh.addEventListener("click", () => loadSessions({ selectInitial: false }));
   elements.btnMobileMenu.addEventListener("click", () => toggleSidebar(true));
   elements.sidebarBackdrop.addEventListener("click", () => toggleSidebar(false));
@@ -656,19 +687,7 @@ function appendBubbleContent(bubble, message) {
   if (images.length) {
     const gallery = createElement("div", "message-images");
     for (const source of images) {
-      const image = document.createElement("img");
-      image.className = "message-image";
-      image.loading = "lazy";
-      image.alt = "图片消息";
-      image.src = mediaUrl(source);
-      image.addEventListener("click", (event) => {
-        event.stopPropagation();
-        openLightbox(image.src);
-      });
-      image.addEventListener("error", () => {
-        image.replaceWith(createElement("span", "message-media-fallback", "[图片加载失败]"));
-      });
-      gallery.append(image);
+      gallery.append(state.loadImages ? buildImage(source) : buildImagePlaceholder(source));
     }
     bubble.append(gallery);
   }
@@ -690,6 +709,43 @@ function appendBubbleContent(bubble, message) {
   if (fallbackText) bubble.append(createElement("span", "message-text", fallbackText));
 
   if (message.pending) bubble.append(createElement("span", "message-pending", "发送中…"));
+}
+
+function buildImage(source) {
+  const image = document.createElement("img");
+  image.className = "message-image";
+  image.loading = "lazy";
+  image.alt = "图片消息";
+  image.src = mediaUrl(source);
+  image.addEventListener("click", (event) => {
+    event.stopPropagation();
+    openLightbox(image.src);
+  });
+  image.addEventListener("error", () => {
+    image.replaceWith(createElement("span", "message-media-fallback", "[图片加载失败]"));
+  });
+  return image;
+}
+
+/**
+ * 图片占位按钮：默认不加载任何图片，点这一张才发请求。
+ *
+ * 注意不能把地址塞进 `<img src>` 后靠 CSS 隐藏——那样浏览器照样会下载。
+ */
+function buildImagePlaceholder(source) {
+  const placeholder = createElement("button", "message-image-placeholder");
+  placeholder.type = "button";
+  placeholder.title = "点击加载这张图片";
+  placeholder.append(
+    createElement("span", "message-image-placeholder-icon", "🖼"),
+    createElement("span", "message-image-placeholder-text", "点击加载图片"),
+  );
+  placeholder.addEventListener("click", (event) => {
+    event.stopPropagation();
+    // 只替换这一张，不改变全局开关
+    placeholder.replaceWith(buildImage(source));
+  });
+  return placeholder;
 }
 
 function renderSegmentChip(segment) {
@@ -1788,6 +1844,56 @@ function readStoredCompact() {
   try {
     const value = window.localStorage.getItem(COMPACT_KEY);
     return value === "true" || value === "false" ? value : null;
+  } catch {
+    return null;
+  }
+}
+
+// ── 图片加载开关 ────────────────────────────────────────────
+
+function toggleLoadImages() {
+  applyLoadImages(!state.loadImages);
+}
+
+/**
+ * 切换是否自动请求图片。
+ *
+ * 关掉时消息里的图片只渲染成占位标签，点一下才加载那一张——
+ * 群相册、表情包刷屏时不会一次性拉几十个请求，也避免走 /media 代理。
+ */
+function applyLoadImages(enabled, { persist = true } = {}) {
+  const next = Boolean(enabled);
+  if (state.loadImages === next) {
+    syncImagesControl();
+    return;
+  }
+  state.loadImages = next;
+  if (persist) {
+    try {
+      window.localStorage.setItem(IMAGES_KEY, String(next));
+    } catch {
+      // 存储不可用时开关仍然本次生效
+    }
+  }
+  syncImagesControl();
+  // 已渲染的图片/占位要跟着变，切会话时整树重建，这里同样强制重建
+  state.renderSessionId = "";
+  if (state.currentSessionId) renderMessages();
+}
+
+function syncImagesControl() {
+  if (!elements.btnImages) return;
+  const enabled = state.loadImages;
+  const label = enabled ? "关闭自动加载图片" : "自动加载图片";
+  elements.btnImages.setAttribute("aria-label", label);
+  elements.btnImages.setAttribute("aria-pressed", enabled ? "true" : "false");
+  elements.btnImages.title = enabled ? "图片自动加载（点击改为占位）" : "图片已折叠（点击自动加载）";
+}
+
+function readStoredLoadImages() {
+  try {
+    const value = window.localStorage.getItem(IMAGES_KEY);
+    return value === "true" || value === "false" ? value === "true" : null;
   } catch {
     return null;
   }

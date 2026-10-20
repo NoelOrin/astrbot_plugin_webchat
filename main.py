@@ -1492,6 +1492,8 @@ class Plugin(Star):
                 "capture_bot_messages": coerce_bool(
                     self.config.get("capture_bot_messages", True), True
                 ),
+                # 前端据此决定首屏是否直接请求图片；工具栏开关可在本地覆盖
+                "load_images": coerce_bool(self.config.get("load_images", False), False),
             }
         )
 

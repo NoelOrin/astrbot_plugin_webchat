@@ -272,9 +272,23 @@ SSE 不可用时前端每 2.5 秒拉一次 `GET /updates?after_id=<全局消息 
   "parse_bare_at": { "type": "bool", "default": true },
   "auto_discover_sessions": { "type": "bool", "default": true },
   "auto_discover_include_friends": { "type": "bool", "default": true },
-  "import_astrbot_history": { "type": "bool", "default": true }
+  "import_astrbot_history": { "type": "bool", "default": true },
+  "load_images": { "type": "bool", "default": false }
 }
 ```
+
+## 图片默认不加载
+
+图片走 `/media?url=` 代理，一张图就是一次服务端外网请求。默认**全部折叠**：
+
+- 消息里的图片渲染成 `.message-image-placeholder` 按钮，**不产生任何请求**
+- 点占位按钮只加载那一张（替换成 `<img>`），不改变全局开关
+- 工具栏 `#btn-images` 是全局开关，`aria-pressed` 反映状态，记忆在 localStorage
+- 插件配置 `load_images`（默认 false）只作为**初始默认值**；用户手动切过就以本地记忆为准
+- 前端从 `/health` 的 `load_images` 读默认值，只读一次（`syncImagePreferenceFromConfig`）
+
+> ⚠️ 占位**不能**写成 `<img src=… >` + CSS 隐藏——浏览器照样会下载，等于没省。
+> `dom-smoke.mjs` 里 `默认不自动渲染图片` 这条断言就是防这个的。
 
 ## 平台支持范围
 

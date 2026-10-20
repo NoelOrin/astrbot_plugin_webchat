@@ -418,6 +418,14 @@ def test_updates_endpoint_uses_id_cursor(plugin, monkeypatch):
     assert any(path.endswith("/updates") for path in plugin.context.routes)
 
 
+def test_health_exposes_load_images_default(plugin):
+    """前端启动时从 /health 读图片开关的默认值：缺省必须是关。"""
+    assert _run(plugin.api_health())["load_images"] is False
+
+    plugin.config["load_images"] = True
+    assert _run(plugin.api_health())["load_images"] is True
+
+
 # ── 入站 ──────────────────────────────────────────────────
 
 
@@ -1211,3 +1219,14 @@ def test_health_version_matches_metadata():
 
     assert payload["version"] == main_module.PLUGIN_VERSION
     assert payload["version"] != "unknown"
+
+
+def test_health_exposes_load_images_default_off():
+    """图片默认不自动加载：health 必须把默认值 false 告诉前端。"""
+    plugin, _, _ = _plugin_with_platform()
+
+    assert _run(plugin.api_health())["load_images"] is False
+
+    # 配置里显式打开时如实反映
+    plugin.config["load_images"] = True
+    assert _run(plugin.api_health())["load_images"] is True

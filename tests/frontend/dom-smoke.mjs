@@ -135,10 +135,42 @@ check("默认选中第一个会话", doc.getElementById("conversation-title").te
   doc.getElementById("conversation-title").textContent);
 check("消息渲染出 2 条", doc.querySelectorAll(".message-row").length === 2,
   doc.querySelectorAll(".message-row").length);
-check("图片被渲染为 img", doc.querySelectorAll(".message-image").length === 1);
-check("图片走插件代理", (doc.querySelector(".message-image")?.src || "").includes("/media?url="),
-  doc.querySelector(".message-image")?.src);
+// 默认不加载图片：只出占位按钮，绝不能出现带 src 的 img（否则浏览器照样下载）
+check("默认不自动渲染图片", doc.querySelectorAll(".message-image").length === 0,
+  doc.querySelectorAll(".message-image").length);
+check("图片渲染为占位按钮", doc.querySelectorAll(".message-image-placeholder").length === 1,
+  doc.querySelectorAll(".message-image-placeholder").length);
 check("@ 片段渲染为 chip", doc.querySelectorAll(".segment-chip.at").length === 1);
+
+// 点占位 → 只加载这一张，且走插件代理
+{
+  const placeholder = doc.querySelector(".message-image-placeholder");
+  placeholder?.dispatchEvent(new window.MouseEvent("click", { bubbles: true }));
+  await new Promise((r) => setTimeout(r, 50));
+  const image = doc.querySelector(".message-image");
+  check("点占位后加载该图", Boolean(image), image ? "有 img" : "没有 img");
+  check("图片走插件代理", (image?.src || "").includes("/media?url="), image?.src);
+}
+
+// 工具栏开关：打开后其余图片自动加载，关闭后回到占位
+{
+  const toggle = doc.getElementById("btn-images");
+  check("图片开关按钮存在", Boolean(toggle));
+  check("图片开关默认按下状态为 false", toggle?.getAttribute("aria-pressed") === "false",
+    toggle?.getAttribute("aria-pressed"));
+  toggle?.dispatchEvent(new window.MouseEvent("click", { bubbles: true }));
+  await new Promise((r) => setTimeout(r, 50));
+  check("开启后自动加载图片", doc.querySelectorAll(".message-image").length === 1,
+    doc.querySelectorAll(".message-image").length);
+  check("开启后 aria-pressed 为 true", toggle?.getAttribute("aria-pressed") === "true",
+    toggle?.getAttribute("aria-pressed"));
+  toggle?.dispatchEvent(new window.MouseEvent("click", { bubbles: true }));
+  await new Promise((r) => setTimeout(r, 50));
+  check("关闭后回到占位", doc.querySelectorAll(".message-image").length === 0 &&
+    doc.querySelectorAll(".message-image-placeholder").length === 1,
+    JSON.stringify({ img: doc.querySelectorAll(".message-image").length,
+      holder: doc.querySelectorAll(".message-image-placeholder").length }));
+}
 check("日期分隔符存在", doc.querySelectorAll(".date-separator").length >= 1);
 check("加载更早按钮可见", !doc.getElementById("load-more").hidden);
 check("参与者被渲染", doc.querySelectorAll(".participant").length === 1);

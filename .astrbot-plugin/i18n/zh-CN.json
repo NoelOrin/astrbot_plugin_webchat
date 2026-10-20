@@ -36,6 +36,10 @@
     "import_astrbot_history": {
       "description": "导入 AstrBot 自身的历史消息",
       "hint": "读取 platform_message_history（需在 AstrBot 开启“持久化群聊消息记录”），按水位增量导入，不会重复"
+    },
+    "load_images": {
+      "description": "自动加载图片",
+      "hint": "默认关闭：消息里的图片只显示占位标签，点击才加载单张，避免一次性拉取大量图片。终端工具栏里的图片开关可随时覆盖此默认值"
     }
   },
   "views": {
