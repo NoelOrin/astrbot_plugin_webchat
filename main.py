@@ -483,11 +483,15 @@ class Plugin(Star):
         # 但只对 Bot 自己做的去重：别人连发两条相同的话必须都保留。
         content = str(getattr(event, "message_str", "") or "")
         timestamp = coerce_float(getattr(message_obj, "timestamp", 0), now_ts()) or now_ts()
-        if self._sender_is_self(event, sender_id) and self._is_duplicate_inbound(
-            session_key, sender_id, content, timestamp
-        ):
-            logger.debug(f"忽略 Bot 自身消息的重复回推: {session_key} / {content[:20]}")
-            return None
+        if self._sender_is_self(event, sender_id):
+            # 先查内存里的乐观锁：平台回推可能就发生在 send_message 的 await 里，
+            # 那时 api_send 还没把 sent 行写进去，库查重一定落空 → 同一条记两次。
+            if self._consume_pending_echo(session_key, content):
+                logger.debug(f"忽略终端刚发出消息的回推: {session_key} / {content[:20]}")
+                return None
+            if self._is_duplicate_inbound(session_key, sender_id, content, timestamp):
+                logger.debug(f"忽略 Bot 自身消息的重复回推: {session_key} / {content[:20]}")
+                return None
 
         self._ensure_session(
             session_key,
@@ -1023,6 +1027,39 @@ class Plugin(Star):
             else:
                 parts.append(str(segment.get("text") or ""))
         return "".join("".join(parts).split())
+
+    @staticmethod
+    def _echo_key(text: str) -> str:
+        """回声比对用的归一化：去掉全部空白与零宽字符。"""
+        return "".join(str(text or "").split()).replace("\u200b", "")
+
+    def _consume_pending_echo(self, session_key: str, content: str) -> bool:
+        """这条入站是不是「终端刚发出去那条」的回推？命中就**释放乐观锁**。
+
+        为什么不能只靠库查重：``api_send`` 是先 ``await send_message`` 再写 sent 行，
+        而平台回推恰好可能发生在那个 await 里。这时库里还没有 sent 记录，
+        ``has_recent_duplicate`` 一定查不到，同一条就被记成 received + sent 两份。
+
+        这里是内存锁，设置发生在 send_message **之前**，正好覆盖这个窗口。
+        命中即 pop：回声已经处理完，再来的同内容消息就不是回声了，
+        不能让锁在 8 秒窗口里继续误吞真实消息。
+        """
+        record = self._recent_sends.get(session_key)
+        if not record:
+            return False
+        fingerprint, stamp = record
+        if time.time() - stamp > self.INBOUND_DEDUPE_WINDOW:
+            self._recent_sends.pop(session_key, None)
+            return False
+        inbound = self._echo_key(content)
+        if not fingerprint or not inbound:
+            return False
+        # 回声可能把 At 段折回文本（"@小明 你好"），也可能只剩正文（"你好"）
+        bare = re.sub(r"^(?:@[^\s@]+)+", "", fingerprint)
+        if inbound not in (fingerprint, bare):
+            return False
+        self._recent_sends.pop(session_key, None)
+        return True
 
     def _is_echo_of_terminal_send(self, session_key: str, fingerprint: str) -> bool:
         """终端刚发出的消息可能再次经过出站钩子，按内容+时间去重。"""

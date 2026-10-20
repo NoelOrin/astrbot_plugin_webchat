@@ -1121,6 +1121,67 @@ def test_terminal_send_then_platform_echo_is_not_duplicated(plugin, monkeypatch)
     assert rows[0]["type"] == "sent"
 
 
+def test_echo_arriving_before_sent_row_is_deduped(plugin, monkeypatch):
+    """平台回推可能比 api_send 入库更早（就发生在 send_message 的 await 里）。
+
+    那一刻库里还没有 sent 行，只靠 has_recent_duplicate 一定查不到，
+    同一条会被记成 received + sent 两份。内存乐观锁必须覆盖这个窗口。
+    """
+    inbound(plugin, umo="aiocqhttp-inst:GroupMessage:111", group_id="111",
+            sender_id="u1", sender_name="小明", text="在吗")
+
+    context = plugin.context
+    original = context.send_message
+
+    async def send_then_echo(target, chain):
+        await original(target, chain)
+        # 库里此时还没有 sent 行，模拟平台立刻回推 Bot 自己的消息
+        plugin._record_inbound(
+            FakeEvent(umo="aiocqhttp-inst:GroupMessage:111", group_id="111",
+                      sender_id="bot-1", sender_name="Bot", text="重复吗", self_id="bot-1")
+        )
+
+    monkeypatch.setattr(context, "send_message", send_then_echo)
+
+    _send(plugin, monkeypatch, "group:111", "重复吗")
+
+    rows = [m for m in plugin.store.query_messages("group:111") if m["content"] == "重复吗"]
+    assert len(rows) == 1, f"重复了 {len(rows)} 条"
+    assert rows[0]["type"] == "sent", rows[0]["type"]
+
+
+def test_echo_releases_optimistic_lock(plugin, monkeypatch):
+    """回声到达后必须自动解锁：锁留在窗口里会继续误吞之后的消息。"""
+    inbound(plugin, umo="aiocqhttp-inst:GroupMessage:111", group_id="111",
+            sender_id="u1", sender_name="小明", text="在吗")
+    _send(plugin, monkeypatch, "group:111", "解锁测试")
+    assert "group:111" in plugin._recent_sends, "发送后应当持有乐观锁"
+
+    plugin._record_inbound(
+        FakeEvent(umo="aiocqhttp-inst:GroupMessage:111", group_id="111",
+                  sender_id="bot-1", sender_name="Bot", text="解锁测试", self_id="bot-1")
+    )
+
+    assert "group:111" not in plugin._recent_sends, "回声命中后乐观锁没有释放"
+    rows = [m for m in plugin.store.query_messages("group:111") if m["content"] == "解锁测试"]
+    assert len(rows) == 1
+
+
+def test_echo_with_at_prefix_still_matches(plugin, monkeypatch):
+    """回声把 At 段折回文本（"@小明 收到"）时也要能对上锁。"""
+    inbound(plugin, umo="aiocqhttp-inst:GroupMessage:111", group_id="111",
+            sender_id="u1", sender_name="小明", text="在")
+    _send(plugin, monkeypatch, "group:111", "@小明 收到")
+
+    plugin._record_inbound(
+        FakeEvent(umo="aiocqhttp-inst:GroupMessage:111", group_id="111",
+                  sender_id="bot-1", sender_name="Bot", text="@小明 收到", self_id="bot-1")
+    )
+
+    rows = [m for m in plugin.store.query_messages("group:111") if "收到" in m["content"]]
+    assert len(rows) == 1, f"重复了 {len(rows)} 条"
+
+
 def test_other_users_duplicates_are_always_kept(plugin):
     """去重只对 Bot 自己生效：别人在窗口内连发相同内容必须都保留。"""
     import time

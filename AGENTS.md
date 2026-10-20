@@ -199,11 +199,14 @@ after_message_sent 钩子 → on_bot_message_sent()
 部分平台会把 Bot 在自己其它端发出的消息**当作入站事件再推一遍**，
 于是同一条消息被记成两条（一条 `sent`、一条 `received`），界面上就重复了。
 
-`_record_inbound()` 里的处理：
+`_record_inbound()` 里的处理（**两把锁，缺一不可**）：
 
 ```python
-if self._sender_is_self(event, sender_id) and self._is_duplicate_inbound(...):
-    return None
+if self._sender_is_self(event, sender_id):
+    if self._consume_pending_echo(session_key, content):   # 内存锁，命中即解锁
+        return None
+    if self._is_duplicate_inbound(...):                    # 库查重，兜底
+        return None
 ```
 
 - **只对 `sender_id == event.get_self_id()` 生效**：其他用户重复发同样的话必须全部保留
@@ -211,6 +214,15 @@ if self._sender_is_self(event, sender_id) and self._is_duplicate_inbound(...):
 - 查重时**忽略发送者**（`ignore_sender=True`）：终端发出时 `sender_id` 为空，
   平台回推时是 Bot 的 ID，只比发送者会漏判
 - 窗口 `INBOUND_DEDUPE_WINDOW = 8s`，只按「同会话 + 同内容 + 时间窗」判定
+
+> ⚠️ **内存锁必须先查，且命中即释放**。
+> `api_send` 是先 `await send_message` 再写 `sent` 行，而平台回推恰好可能发生在那次
+> await 里——那一刻库里**没有** `sent` 记录，`has_recent_duplicate` 必然落空，
+> 同一条就会被记成 `received` + `sent` 两份（这就是「还是会重复发送」的根因）。
+> `_recent_sends` 在 `send_message` **之前**就设好，正好覆盖这个窗口。
+> 命中后必须 `pop()` 解锁：回声既然已经处理完，锁留在窗口里只会继续误吞后面的真实消息。
+> `test_echo_arriving_before_sent_row_is_deduped`、`test_echo_releases_optimistic_lock`
+> 两条测试分别守着「竞态」和「自动解锁」，撤掉修复会立刻失败。
 
 > ⚠️ 不要把去重放宽到所有用户——会吞掉「刷屏」「+1」这类正常重复消息，
 > `test_other_users_duplicates_are_always_kept` 专门守着这条。
