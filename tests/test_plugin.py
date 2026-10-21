@@ -1051,6 +1051,57 @@ def test_import_history_pages_through_all_rows():
     assert plugin.store.count_messages("group:111") == 1200
 
 
+def test_high_watermark_does_not_block_older_history():
+    """水位被写高过（旧版本只取 page=1 就推到底）时，更早的历史仍要能补进来。
+
+    这是「没有自动同步消息」的主因：库里一行都没有，水位却已经是最新 id，
+    旧实现拿它当过滤条件，于是历史永远导不进来。
+    """
+    plugin, _, ctx = _plugin_with_platform()
+    manager = ctx.message_history_manager
+    scope = "aiocqhttp-inst:GroupMessage:111"
+    manager.seed(
+        "aiocqhttp-inst", scope,
+        [
+            {"id": i, "created_at": 1700000000 + i, "sender_id": "u1", "sender_name": "小明",
+             "content": {"type": "user", "message": [{"type": "plain", "text": f"m{i}"}]}}
+            for i in range(1, 6)
+        ],
+    )
+    # 模拟旧版本遗留的水位：已经推到 5，但一条都没入库
+    plugin.store.set_import_watermark("aiocqhttp-inst", scope, 5)
+    assert plugin.store.count_messages("group:111") == 0
+
+    result = _run(plugin.discover_and_import())
+
+    assert result["history_imported"] == 5, result
+    assert plugin.store.count_messages("group:111") == 5
+    assert plugin.store.has_astrbot_message("group:111", 1), "更早的记录仍然没补进来"
+
+
+def test_legacy_watermark_key_is_ignored():
+    """旧格式水位键（不带版本号）必须读不到。
+
+    否则升级后仍然拿着被污染的旧水位，历史还是导不进来。
+    """
+    plugin, _, _ = _plugin_with_platform()
+    scope = "aiocqhttp-inst:GroupMessage:111"
+    conn = plugin.store.connect()
+    try:
+        conn.execute(
+            "INSERT INTO meta (key, value) VALUES (?, ?)",
+            (f"history_import:aiocqhttp-inst:{scope}", "999"),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    assert plugin.store.get_import_watermark("aiocqhttp-inst", scope) == 0
+    # 新键带版本号，和旧键不会互相覆盖
+    plugin.store.set_import_watermark("aiocqhttp-inst", scope, 7)
+    assert plugin.store.get_import_watermark("aiocqhttp-inst", scope) == 7
+
+
 def test_import_history_survives_missing_manager():
     """老版本宿主没有 message_history_manager 时不能崩。"""
     plugin, _, ctx = _plugin_with_platform()

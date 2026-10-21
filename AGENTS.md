@@ -352,11 +352,18 @@ SSE 不可用时前端每 2.5 秒拉一次 `GET /updates?after_id=<全局消息 
 - `platform` 存**适配器名**（`aiocqhttp`），`platform_id` 才是实例 ID；
   `api_open_session` 曾经把两者写成同一个值，已修
 - 已存在的会话**只补空缺**（`_fill_discovered_gaps`），不覆盖用户改过的群名/置顶
-- 历史导入靠 `meta` 表的 `history_import:{platform_id}:{scope}` 水位 + `platform_message_id="astrbot:{id}"` 双保险，
-  重复跑不会重复入库
-- AstrBot 的 `platform_message_history` 默认**关闭**（`group_message_history_enable=false`），
-  多数环境导入为 0 条属正常降级
+- 历史导入**只用 `platform_message_id="astrbot:{id}"` 判重**，水位不参与「是否导入」判定：
+  `meta` 里的 `history_import:v{2}:{platform_id}:{scope}` 只记录「导到哪了」
+- `AstrBot` 的 `platform_message_history` 默认**关闭**（`group_message_history_enable=false`），
+  多数环境导入为 0 条属正常降级；插件会在导入 0 条时打一条 info 提示去开这个开关
 - `GET /sessions?with_history=1` 只对 `message_count > 0` 的会话查历史，几百个空会话不会拖慢首屏
+
+> ⚠️ **水位不能当过滤条件**。旧版本（0.4.1）只取 `page=1`（最新一页）就把水位推到最新 id，
+> 之后再用 `row_id <= watermark` 跳过——结果更早的历史**永远**补不回来，
+> 用户看到的就是「没有自动同步消息」。现在水位只写不挡，靠 `platform_message_id` 幂等去重；
+> 键名带 `v2` 让被污染的旧水位一次性失效。
+> `test_high_watermark_does_not_block_older_history`、`test_legacy_watermark_key_is_ignored`
+> 守着这两条，撤掉修复会立刻失败。
 
 手动重跑：前端会话列表的「自动发现」按钮 → `POST /discover`。
 

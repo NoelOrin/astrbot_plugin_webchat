@@ -1058,9 +1058,14 @@ class MessageStore:
 
     # ── 导入水位：保证 AstrBot 历史只导一次 ──────────────────────
 
-    @staticmethod
-    def _watermark_key(platform_id: str, scope: str) -> str:
-        return f"history_import:{platform_id}:{scope}"
+    # 水位键版本。旧版（v1）只取 page=1 就把水位推到最新 id，
+    # 更早的记录被永久挡住、再也补不回来——换版本号让那些被污染的水位失效一次，
+    # 下一次导入会全量扫一遍，重复行由 platform_message_id 去重兜住。
+    IMPORT_WATERMARK_VERSION = 2
+
+    @classmethod
+    def _watermark_key(cls, platform_id: str, scope: str) -> str:
+        return f"history_import:v{cls.IMPORT_WATERMARK_VERSION}:{platform_id}:{scope}"
 
     def get_import_watermark(self, platform_id: str, scope: str) -> int:
         """已导入到哪一条 platform_message_history（按 id），0 表示没导过。"""

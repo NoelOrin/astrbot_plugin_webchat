@@ -578,6 +578,15 @@ class Plugin(Star):
             result["history_imported"],
             f"，错误 {len(result['errors'])} 条" if result["errors"] else "",
         )
+        if result["history_imported"] == 0 and hasattr(
+            self.context, "message_history_manager"
+        ) and len(self.session_index) > 0:
+            # 0 条很常见，但只发生在宿主侧没开历史持久化时，提示一次省得反复排查
+            logger.info(
+                "未从 AstrBot 导入历史消息：请在 AstrBot 配置里开启"
+                "「持久化群聊消息记录」(provider_ltm_settings.group_message_history_enable)，"
+                "否则宿主的 platform_message_history 是空的"
+            )
         return result
 
     async def _discover_platforms(self, result: dict) -> None:
@@ -749,19 +758,20 @@ class Plugin(Star):
             result["history_imported"] += imported
 
     async def _import_scope(self, manager, session_key: str, platform_id: str, scope: str) -> int:
-        rows = await self._fetch_history(manager, platform_id, scope)
-        if not rows:
-            return 0
-
+        # 水位只用于「记录已经导到哪」，**不再用它过滤**：旧版本把水位写高过
+        # （只取 page=1 就推到底），一旦拿它跳过，更早的历史永远补不回来。
+        # 是否重复统一由 platform_message_id 判定，幂等且自愈。
         watermark = self.store.get_import_watermark(platform_id, scope)
+        rows = await self._fetch_history(manager, platform_id, scope)
+
         imported = 0
+        highest = watermark
         for row_dict in rows:
             try:
                 row_id = int(row_dict.get("id"))
             except (TypeError, ValueError):
                 continue
-            if row_id <= watermark:
-                continue
+            highest = max(highest, row_id)
             if self.store.has_astrbot_message(session_key, row_id):
                 continue
             message = astrbot_history_to_message(row_dict)
@@ -778,10 +788,8 @@ class Plugin(Star):
             self.store.add_message(session_key, message)
             imported += 1
 
-        # 水位推到「本轮真正见到过的最新 id」。_fetch_history 会翻完所有页，
-        # 所以这里不会跳过任何更早的记录。
-        highest = max([int(row_dict["id"]) for row_dict in rows] + [watermark])
-        self.store.set_import_watermark(platform_id, scope, highest)
+        if highest > watermark:
+            self.store.set_import_watermark(platform_id, scope, highest)
         return imported
 
     async def _fetch_history(
@@ -792,10 +800,13 @@ class Plugin(Star):
         page_size: int = 500,
         max_pages: int = 40,
     ) -> list[dict]:
-        """按页取回历史，直到取空或达到页数上限；结果按 id 升序。
+        """按页取回历史，结果按 id 升序。
 
-        AstrBot 的 ``page=1`` 是**最新**的一页，只取第一页会漏掉更早的记录，
-        而水位一旦推上去，那些漏掉的记录就永远补不回来了。
+        AstrBot 的 ``page=1`` 是**最新**的一页，所以要一路往旧翻。
+        这里不做「水位提前收工」的优化：宿主的 ``platform_message_history``
+        本身就按会话裁剪（默认 700 条），实际通常 1~2 页就取空了，
+        而提前收工一旦判断错（created_at 与 id 不完全同序）就会永久漏记录。
+        重复行交给 ``platform_message_id`` 去重，宁可多扫一页。
         """
         collected: dict[int, dict] = {}
         for page in range(1, max(1, max_pages) + 1):
