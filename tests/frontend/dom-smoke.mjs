@@ -44,7 +44,26 @@ window.AstrBotPluginView = {
   onContext: () => {},
   apiGet: async (endpoint, params) => {
     calls.push(["GET", endpoint, params]);
-    if (endpoint === "sessions") return sessionsPayload;
+    if (endpoint === "sessions") {
+      const offset = Number(params?.offset || 0);
+      if (offset > 0) {
+        return {
+          sessions: [{
+            id: "group:222", platform: "aiocqhttp", peer_id: "222", peer_name: "第三个群",
+            group_id: "222", is_group: true, pinned: false, message_count: 0,
+            last_activity: 1699000000, participants: [], messages: [],
+            history: { has_more: false, next_cursor: null, limit: 40 },
+          }],
+          total: 3, offset, limit: 50, has_more: false,
+        };
+      }
+      return { ...sessionsPayload, total: 3, offset: 0, limit: 50, has_more: true };
+    }
+    if (endpoint === "forward") {
+      return { available: true, messages: [
+        { name: "转发者", uin: "77", segments: [{ type: "text", text: "转发里的消息" }] },
+      ] };
+    }
     if (endpoint === "history") {
       // 尊重 since / before_id 语义，模拟真实后端
       if (params?.before_id) {
@@ -74,10 +93,17 @@ window.AstrBotPluginView = {
   },
   apiPost: async (endpoint, body) => {
     calls.push(["POST", endpoint, body]);
-    if (endpoint === "send") return { data: {
-      id: 99, session_id: body.session_id, type: body.segments?.length || body.message ? "sent" : "sent",
-      sender: "Terminal", sender_name: "你", content: body.message,
-      segments: [{type:"text",text:body.message}], timestamp: 1700000600 } };
+    if (endpoint === "send") {
+      if (body.message === "这条会失败" && !window.__failOnce) {
+        window.__failOnce = true;
+        throw new Error("模拟网络中断");
+      }
+      return { data: {
+        id: 99, session_id: body.session_id, type: "sent",
+        sender: "Terminal", sender_name: "你", content: body.message,
+        segments: body.segments?.length ? body.segments : [{type:"text",text:body.message}],
+        timestamp: 1700000600 } };
+    }
     return { status: "ok" };
   },
   subscribeSSE: async (endpoint, handlers) => {
@@ -285,7 +311,7 @@ const groupButton = [...doc.querySelectorAll(".session-item")]
 groupButton?.dispatchEvent(new window.MouseEvent("click", { bubbles: true }));
 await new Promise((r) => setTimeout(r, 120));
 
-const content = doc.getElementById("message-content");
+const content = doc.getElementById("message-items");
 const beforeNodes = [...content.children];
 window.__sseHandlers.onMessage({ eventType: "message", parsed: {
   id: 101, session_id: "group:111", type: "received", sender: "追加者",
@@ -307,6 +333,13 @@ await new Promise((r) => setTimeout(r, 120));
 const afterRemove = doc.querySelectorAll('[data-message-id="101"]').length;
 check("message_removed 后节点被清掉", afterRemove === 0, afterRemove);
 
+// 启动必须先走 SSE：boot() 先选会话再连流，selectSession 不能因为
+// connected 还是 false 就提前 startPolling()，否则一启动就降级轮询。
+{
+  const bootPolls = calls.filter((c) => c[0] === "GET" && c[1] === "updates");
+  check("启动阶段不提前降级轮询", bootPolls.length === 0, `updates 调用 ${bootPolls.length} 次`);
+}
+
 // 轮询降级：SSE 断开后，非当前会话的新消息也要及时到达并计入未读
 window.__sseHandlers.onError();
 await new Promise((r) => setTimeout(r, 200));
@@ -325,6 +358,243 @@ window.__sseHandlers.onMessage({ eventType: "session_removed", parsed: { id: "gr
 await new Promise((r) => setTimeout(r, 80));
 check("会话删除后从列表移除", doc.querySelectorAll(".session-item").length === 1,
   doc.querySelectorAll(".session-item").length);
+
+// ── 会话列表分页：底部「加载更多」 ──────────────────────────
+const sessionsBefore = doc.querySelectorAll(".session-item").length;
+check("会话列表有更多页时显示加载更多", !doc.getElementById("session-more").hidden,
+  doc.getElementById("session-more").hidden);
+doc.getElementById("session-more").dispatchEvent(new window.MouseEvent("click", { bubbles: true }));
+await new Promise((r) => setTimeout(r, 150));
+const pagedCall = calls.find((c) => c[0] === "GET" && c[1] === "sessions" && Number(c[2]?.offset) > 0);
+check("加载更多会话带 offset 参数", Boolean(pagedCall), JSON.stringify(pagedCall?.[2] || null));
+check("加载更多会话后列表追加", doc.querySelectorAll(".session-item").length === sessionsBefore + 1,
+  `${sessionsBefore} -> ${doc.querySelectorAll(".session-item").length}`);
+check("最后一页后隐藏加载更多", doc.getElementById("session-more").hidden === true,
+  doc.getElementById("session-more").hidden);
+
+// ── 合并转发：点开看聊天记录 ────────────────────────────────
+{
+  // 清掉前面「新建会话」测试遗留的弹窗，避免干扰计数
+  doc.querySelectorAll("#dialog-region .dialog-overlay").forEach((node) => node.remove());
+  const friendButton = [...doc.querySelectorAll(".session-item")]
+    .find((el) => el.textContent.includes("小红"));
+  friendButton?.dispatchEvent(new window.MouseEvent("click", { bubbles: true }));
+  await new Promise((r) => setTimeout(r, 80));
+
+  window.__sseHandlers.onMessage({ eventType: "message", parsed: {
+    id: 301, session_id: "aiocqhttp:FriendMessage:9", type: "received",
+    sender: "小红", sender_id: "u9", sender_name: "小红", content: "[聊天记录]",
+    segments: [{ type: "forward", text: "[聊天记录]", messages: [
+      { name: "小明", uin: "42", segments: [{ type: "text", text: "早" }] },
+      { name: "小红", uin: "9", segments: [{ type: "text", text: "早呀" }] },
+    ] }],
+    timestamp: 1700001000 } });
+  await new Promise((r) => setTimeout(r, 120));
+
+  const chip = doc.querySelector('[data-message-id="301"] .segment-chip.forward');
+  check("合并转发渲染为可点击 chip", Boolean(chip), chip?.textContent);
+  chip?.dispatchEvent(new window.MouseEvent("click", { bubbles: true }));
+  await new Promise((r) => setTimeout(r, 80));
+  check("点开合并转发弹出聊天记录", doc.querySelectorAll("#dialog-region .dialog-overlay").length === 1,
+    doc.querySelectorAll("#dialog-region .dialog-overlay").length);
+  check("聊天记录里渲染出嵌套消息", doc.querySelectorAll(".forward-row").length === 2,
+    doc.querySelectorAll(".forward-row").length);
+  const overlays = doc.querySelectorAll("#dialog-region .dialog-overlay");
+  overlays[overlays.length - 1]?.querySelector(".button-primary")
+    ?.dispatchEvent(new window.MouseEvent("click", { bubbles: true }));
+  await new Promise((r) => setTimeout(r, 50));
+  check("聊天记录弹窗可关闭", doc.querySelectorAll("#dialog-region .dialog-overlay").length === 0);
+}
+
+// ── 只有转发 id 的消息：点开时按需拉取内容 ──────────────────
+{
+  window.__sseHandlers.onMessage({ eventType: "message", parsed: {
+    id: 305, session_id: "aiocqhttp:FriendMessage:9", type: "received",
+    sender: "小红", sender_id: "u9", sender_name: "小红", content: "[合并转发]",
+    segments: [{ type: "forward", text: "[合并转发]", id: "f-305" }],
+    timestamp: 1700001400 } });
+  await new Promise((r) => setTimeout(r, 120));
+
+  const row = doc.querySelector('[data-message-id="305"]');
+  check("转发消息不再重复显示占位正文", !row?.querySelector(".message-text"),
+    row?.textContent?.trim());
+  const chip = row?.querySelector(".segment-chip.forward");
+  check("只有 id 的转发也是可点击 chip", Boolean(chip));
+  chip?.dispatchEvent(new window.MouseEvent("click", { bubbles: true }));
+  await new Promise((r) => setTimeout(r, 150));
+
+  const fetchCall = calls.find(
+    (c) => c[0] === "GET" && c[1] === "forward" && c[2]?.id === "f-305",
+  );
+  check("点开时按 id 拉取转发内容", Boolean(fetchCall), JSON.stringify(fetchCall?.[2] || null));
+  check("按需拉取后显示聊天记录", doc.querySelectorAll("#dialog-region .forward-row").length === 1,
+    doc.querySelectorAll("#dialog-region .forward-row").length);
+  doc.querySelectorAll("#dialog-region .dialog-overlay").forEach((node) => node.remove());
+}
+
+// ── 引用回复：引用条 + 发送 segments ────────────────────────
+{
+  window.__sseHandlers.onMessage({ eventType: "message", parsed: {
+    id: 302, session_id: "aiocqhttp:FriendMessage:9", type: "received",
+    sender: "小红", sender_id: "u9", sender_name: "小红", content: "这条要引用",
+    platform_message_id: "m-302",
+    segments: [{ type: "text", text: "这条要引用" }], timestamp: 1700001100 } });
+  await new Promise((r) => setTimeout(r, 120));
+
+  const row = doc.querySelector('[data-message-id="302"]');
+  const replyButton = [...(row?.querySelectorAll(".message-action") || [])]
+    .find((el) => el.textContent === "引用");
+  check("收到的消息有引用按钮", Boolean(replyButton));
+  replyButton?.dispatchEvent(new window.MouseEvent("click", { bubbles: true }));
+  await new Promise((r) => setTimeout(r, 50));
+  check("点击引用后出现引用条", !doc.getElementById("reply-preview").hidden,
+    doc.getElementById("reply-preview").hidden);
+  check("引用条显示被引用内容", doc.getElementById("reply-preview-text").textContent.includes("这条要引用"),
+    doc.getElementById("reply-preview-text").textContent);
+
+  const input = doc.getElementById("input");
+  input.value = "同意";
+  input.dispatchEvent(new window.Event("input", { bubbles: true }));
+  doc.getElementById("composer")
+    .dispatchEvent(new window.Event("submit", { bubbles: true, cancelable: true }));
+  await new Promise((r) => setTimeout(r, 150));
+
+  const sendCall = [...calls].reverse().find((c) => c[0] === "POST" && c[1] === "send");
+  check("引用随消息一起提交", sendCall?.[2]?.segments?.[0]?.type === "reply",
+    JSON.stringify(sendCall?.[2]?.segments || null));
+  check("引用目标带平台消息 id", sendCall?.[2]?.segments?.[0]?.target === "m-302",
+    sendCall?.[2]?.segments?.[0]?.target);
+  check("发送成功后引用条消失", doc.getElementById("reply-preview").hidden === true,
+    doc.getElementById("reply-preview").hidden);
+}
+
+// ── 收到引用消息：显示被引用的人与内容 ──────────────────────
+{
+  window.__sseHandlers.onMessage({ eventType: "message", parsed: {
+    id: 303, session_id: "aiocqhttp:FriendMessage:9", type: "received",
+    sender: "小红", sender_id: "u9", sender_name: "小红", content: "同意",
+    segments: [
+      { type: "reply", target: "m-302", text: "原消息",
+        quote: { sender: "小明", text: "原消息内容" } },
+      { type: "text", text: "同意" },
+    ], timestamp: 1700001200 } });
+  await new Promise((r) => setTimeout(r, 120));
+
+  const block = doc.querySelector('[data-message-id="303"] .quote-block');
+  check("引用消息渲染引用块", Boolean(block));
+  check("引用块显示被引用人与内容",
+    (block?.textContent || "").includes("回复 小明") &&
+      (block?.textContent || "").includes("原消息内容"),
+    block?.textContent);
+
+  const replied = doc.querySelector('[data-message-id="303"] .message-text');
+  check("引用不影响正文渲染", replied?.textContent === "同意", replied?.textContent);
+}
+
+// ── 图片原始链接：大图预览里能看到并复制 ────────────────────
+{
+  window.__sseHandlers.onMessage({ eventType: "message", parsed: {
+    id: 304, session_id: "aiocqhttp:FriendMessage:9", type: "received",
+    sender: "小红", sender_id: "u9", sender_name: "小红", content: "",
+    segments: [{ type: "image", url: "https://example.com/original.png" }],
+    timestamp: 1700001300 } });
+  await new Promise((r) => setTimeout(r, 120));
+
+  const holder = doc.querySelector('[data-message-id="304"] .message-image-placeholder');
+  holder?.dispatchEvent(new window.MouseEvent("click", { bubbles: true }));
+  await new Promise((r) => setTimeout(r, 60));
+
+  const image = doc.querySelector('[data-message-id="304"] .message-image');
+  check("长图/普通图都能点开预览", Boolean(image));
+  image?.dispatchEvent(new window.MouseEvent("click", { bubbles: true }));
+  await new Promise((r) => setTimeout(r, 60));
+
+  check("预览里显示原始链接",
+    doc.getElementById("lightbox-link").textContent === "https://example.com/original.png",
+    doc.getElementById("lightbox-link").textContent);
+  check("原始链接可打开",
+    doc.getElementById("lightbox-open").getAttribute("href") === "https://example.com/original.png",
+    doc.getElementById("lightbox-open").getAttribute("href"));
+  check("复制链接按钮可见", doc.getElementById("btn-copy-image-link").hidden === false);
+
+  doc.getElementById("lightbox").dispatchEvent(new window.MouseEvent("click", { bubbles: true }));
+  await new Promise((r) => setTimeout(r, 50));
+  check("点遮罩关闭预览", doc.getElementById("lightbox").hidden === true);
+}
+
+// ── 发送失败：保留气泡并可重试 ──────────────────────────────
+{
+  const input = doc.getElementById("input");
+  input.value = "这条会失败";
+  input.dispatchEvent(new window.Event("input", { bubbles: true }));
+  doc.getElementById("composer")
+    .dispatchEvent(new window.Event("submit", { bubbles: true, cancelable: true }));
+  await new Promise((r) => setTimeout(r, 200));
+
+  check("发送失败留下可重试气泡", doc.querySelectorAll(".message-row.failed").length === 1,
+    doc.querySelectorAll(".message-row.failed").length);
+  const retryButton = [...doc.querySelectorAll(".message-row.failed .message-action")]
+    .find((el) => el.textContent === "重试");
+  check("失败气泡带重试按钮", Boolean(retryButton));
+  retryButton?.dispatchEvent(new window.MouseEvent("click", { bubbles: true }));
+  await new Promise((r) => setTimeout(r, 200));
+  check("重试成功后失败气泡消失", doc.querySelectorAll(".message-row.failed").length === 0,
+    doc.querySelectorAll(".message-row.failed").length);
+}
+
+// ── 虚拟滚动：长会话只渲染窗口内的节点 ──────────────────────
+{
+  const sessionId = "aiocqhttp:FriendMessage:9";
+  for (let index = 0; index < 120; index += 1) {
+    window.__sseHandlers.onMessage({ eventType: "message", parsed: {
+      id: 1000 + index, session_id: sessionId, type: "received",
+      sender: "灌水", sender_id: "u10", sender_name: "灌水", content: `第 ${index} 条`,
+      segments: [{ type: "text", text: `第 ${index} 条` }], timestamp: 1700010000 + index } });
+  }
+  await new Promise((r) => setTimeout(r, 400));
+
+  const rendered = doc.querySelectorAll("#message-items .message-row").length;
+  check("长会话启用虚拟滚动（只渲染窗口内节点）", rendered > 0 && rendered < 120,
+    `渲染 ${rendered} 条`);
+  check("虚拟滚动上下有 spacer 占位", Boolean(doc.getElementById("virtual-top")) &&
+    Boolean(doc.getElementById("virtual-bottom")));
+  // 贴底时窗口钉在尾部，未渲染的历史由顶部 spacer 撑住
+  const topPad = parseFloat(doc.getElementById("virtual-top").style.height || "0");
+  check("spacer 撑出未渲染消息的滚动高度", topPad > 0, String(topPad));
+
+  // 图片占位点击后，窗口重渲染不能把已加载的图片又变回占位
+  window.__sseHandlers.onMessage({ eventType: "message", parsed: {
+    id: 2100, session_id: sessionId, type: "received", sender: "图图",
+    sender_id: "u11", sender_name: "图图", content: "",
+    segments: [{ type: "image", url: "https://example.com/long.png" }],
+    timestamp: 1700020000 } });
+  await new Promise((r) => setTimeout(r, 150));
+  const imageHolder = doc.querySelector('[data-message-id="2100"] .message-image-placeholder');
+  check("长会话里图片仍显示占位", Boolean(imageHolder));
+  imageHolder?.dispatchEvent(new window.MouseEvent("click", { bubbles: true }));
+  await new Promise((r) => setTimeout(r, 80));
+  check("点击占位后加载这张图",
+    doc.querySelectorAll('[data-message-id="2100"] .message-image').length === 1,
+    doc.querySelectorAll('[data-message-id="2100"] .message-image').length);
+
+  // 再进一条消息 → 虚拟窗口重渲染，已加载的图片不能被打回占位
+  window.__sseHandlers.onMessage({ eventType: "message", parsed: {
+    id: 2101, session_id: sessionId, type: "received", sender: "灌水",
+    sender_id: "u10", sender_name: "灌水", content: "又一条",
+    segments: [{ type: "text", text: "又一条" }], timestamp: 1700020010 } });
+  await new Promise((r) => setTimeout(r, 200));
+  check("窗口重渲染后图片保持加载",
+    doc.querySelectorAll('[data-message-id="2100"] .message-image').length === 1,
+    doc.querySelectorAll('[data-message-id="2100"] .message-image').length);
+
+  // 往上滚动后窗口要跟着移动，不能一直钉在尾部
+  const list = doc.getElementById("messages");
+  list.scrollTop = 3000;
+  list.dispatchEvent(new window.Event("scroll"));
+  await new Promise((r) => setTimeout(r, 120));
+  const topAfter = parseFloat(doc.getElementById("virtual-top").style.height || "0");
+  check("滚动后虚拟窗口上移", topAfter !== topPad, `${topPad} -> ${topAfter}`);
+}
 
 fs.unlinkSync(tmp);
 

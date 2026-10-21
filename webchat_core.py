@@ -182,7 +182,138 @@ def _component_kind(component: Any) -> str:
     return raw
 
 
-def serialize_component(component: Any) -> dict:
+# 合并转发只展开一层：更深的结构留占位，避免异常转发变成递归炸弹。
+MAX_FORWARD_DEPTH = 1
+
+_FORWARD_CQ_RE = re.compile(r"\[CQ:forward,([^\]]*)\]")
+
+
+def _cq_forward_ids(text: str) -> list[str]:
+    """从 CQ 码里取 forward 的 id；参数按逗号切，避免把 resid= 之类误当成 id。"""
+    ids: list[str] = []
+    for match in _FORWARD_CQ_RE.finditer(str(text or "")):
+        for param in match.group(1).split(","):
+            key, _, value = param.partition("=")
+            if key.strip() == "id" and value.strip():
+                ids.append(value.strip())
+    return ids
+
+
+def _serialize_forward(component: Any, depth: int = 0) -> dict:
+    """把 Node / Nodes / Forward 组件转成带嵌套聊天记录的 forward 片段。
+
+    宿主对转发的承载方式不统一：
+      - 单个 ``Node``：自己就是一条聊天记录，``content`` 是消息组件列表
+      - ``Nodes`` / ``Forward``：``nodes`` / ``content`` 是一组 ``Node``
+      - 有些适配器只给一个转发 id，内容要靠 ``get_forward_msg`` 再拉
+
+    取不到内容时仍返回可点击的片段（带 id 或只有标题）。
+    """
+    segment: dict = {"type": "forward", "text": "[聊天记录]", "messages": []}
+    forward_id = _first_attr(component, "id", "message_id", "resid", "forward_id")
+    if forward_id is None and isinstance(getattr(component, "data", None), dict):
+        forward_id = component.data.get("id") or component.data.get("resid")
+    if forward_id is not None:
+        segment["id"] = str(forward_id)
+    if depth >= MAX_FORWARD_DEPTH:
+        # 深层嵌套只留占位，避免递归炸弹；不带 messages 表示「不再展开」
+        segment.pop("messages")
+        return segment
+
+    # 注意：_component_kind 会把 Node/Nodes/Forward 统一归一成 forward，
+    # 这里要看原始类名才能区分「单个 Node」和「Nodes 容器」。
+    if type(component).__name__.lower() == "node":
+        # 单个 Node：内容就是自己的消息链；空 Node 视为「只有 id、内容待拉取」
+        content = _first_attr(component, "content", "message")
+        if isinstance(content, (list, tuple)) and content:
+            segment["messages"] = [_serialize_forward_node(component, depth)]
+        return segment
+
+    nodes = _first_attr(component, "nodes", "content", "message")
+    if isinstance(nodes, dict):
+        # OneBot 风格：{"messages": [...]} 或 {"content": [...]}
+        segment["messages"] = onebot_forward_to_messages(nodes)
+        return segment
+    if not isinstance(nodes, (list, tuple)):
+        return segment
+
+    messages: list[dict] = []
+    for node in nodes:
+        try:
+            messages.append(_serialize_forward_node(node, depth))
+        except Exception:
+            continue
+    segment["messages"] = messages
+    return segment
+
+
+def _serialize_forward_node(node: Any, depth: int) -> dict:
+    """单条聊天记录：昵称 / 账号 / 内部消息链。"""
+    name = _first_attr(node, "name", "nickname", "sender_nickname")
+    uin = _first_attr(node, "uin", "user_id", "sender_id", "qq")
+    content = _first_attr(node, "content", "message")
+
+    segments: list[dict] = []
+    if isinstance(content, dict):
+        parsed = onebot_forward_to_messages(content)
+        if parsed and not name:
+            name, uin = parsed[0]["name"], parsed[0]["uin"]
+        segments = [seg for item in parsed for seg in item["segments"]]
+    elif isinstance(content, (list, tuple)):
+        for item in content:
+            try:
+                segments.append(serialize_component(item, depth + 1))
+            except Exception:
+                continue
+
+    return {
+        "name": str(name or ""),
+        "uin": str(uin or ""),
+        "segments": segments,
+    }
+
+
+def extract_forward_ids(raw: Any) -> list[str]:
+    """从原始事件里扒出合并转发的 id（宿主组件丢字段时的兜底）。
+
+    ``raw`` 可能是 OneBot 事件 dict（``message`` 段列表 + ``raw_message`` CQ 码）、
+    消息段列表，或一段 CQ 码字符串。只取 id，不猜内容。
+    """
+    found: list[str] = []
+
+    def _from_segments(segments: Any) -> None:
+        if not isinstance(segments, (list, tuple)):
+            return
+        for item in segments:
+            if not isinstance(item, dict) or str(item.get("type")) != "forward":
+                continue
+            data = item.get("data") if isinstance(item.get("data"), dict) else {}
+            value = data.get("id") or data.get("resid")
+            if value:
+                found.append(str(value))
+
+    def _from_cq(text: Any) -> None:
+        if isinstance(text, str):
+            found.extend(_cq_forward_ids(text))
+
+    if isinstance(raw, dict):
+        _from_segments(raw.get("message"))
+        _from_segments(raw.get("messages"))
+        _from_cq(raw.get("raw_message"))
+        _from_cq(raw.get("message_str"))
+    elif isinstance(raw, (list, tuple)):
+        _from_segments(raw)
+    else:
+        _from_cq(raw)
+
+    unique: list[str] = []
+    for value in found:
+        if value and value not in unique:
+            unique.append(value)
+    return unique
+
+
+def serialize_component(component: Any, depth: int = 0) -> dict:
     """把单个消息组件转成可 JSON 存储的片段字典。
 
     只做鸭子类型读取，不 import AstrBot 的组件类，避免版本差异导致 ImportError。
@@ -232,7 +363,7 @@ def serialize_component(component: Any) -> dict:
                 "text": "[引用]"}
 
     if kind in ("node", "nodes", "forward"):
-        return {"type": "forward", "text": text or "[合并转发]"}
+        return _serialize_forward(component, depth)
 
     # 未知组件：保留类型名与可见文本，避免信息全丢
     return {"type": "other", "name": kind, "text": str(text or f"[{kind}]")}
@@ -252,6 +383,95 @@ def serialize_chain(chain: Iterable[Any] | None) -> list[dict]:
             continue
         segments.append(segment)
     return segments
+
+
+# ── OneBot 原始转发（get_forward_msg）→ 片段 ─────────────────────
+
+
+def onebot_segment_to_segment(raw: Any) -> dict | None:
+    """把 OneBot 的 ``{type, data}`` 消息段转成本插件的片段字典。
+
+    只在「协议端按需拉取转发内容」时使用，格式与 AstrBot 组件无关。
+    """
+    if not isinstance(raw, dict):
+        return None
+    kind = str(raw.get("type") or "")
+    data = raw.get("data") if isinstance(raw.get("data"), dict) else {}
+
+    if kind == "text":
+        return {"type": "text", "text": str(data.get("text") or "")}
+    if kind == "at":
+        qq = str(data.get("qq") or "")
+        return {"type": "at", "target": qq, "text": f"@{qq}"}
+    if kind == "image":
+        segment = {
+            "type": "image",
+            "url": data.get("url"),
+            "file": data.get("file"),
+        }
+        return {k: v for k, v in segment.items() if v}
+    if kind == "face":
+        face_id = data.get("id")
+        return {"type": "face", "text": f"[表情 {face_id}]" if face_id else "[表情]"}
+    if kind in ("reply", "quote"):
+        return {"type": "reply", "target": str(data.get("id") or ""), "text": "[引用]"}
+    if kind == "record":
+        return {"type": "record", "url": data.get("url"), "file": data.get("file"),
+                "text": "[语音]"}
+    if kind == "video":
+        return {"type": "video", "url": data.get("url"), "file": data.get("file"),
+                "text": "[视频]"}
+    if kind == "file":
+        name = data.get("name") or data.get("file") or ""
+        return {"type": "file", "url": data.get("url"), "file": data.get("file"),
+                "text": f"[文件] {name}".strip()}
+    if kind in ("node", "forward"):
+        content = data.get("content")
+        messages = onebot_forward_to_messages({"messages": content})
+        segment = {"type": "forward", "text": "[聊天记录]", "messages": messages}
+        if data.get("id"):
+            segment["id"] = str(data["id"])
+        return segment
+    return {"type": "other", "name": kind, "text": f"[{kind}]"}
+
+
+def onebot_forward_to_messages(payload: Any) -> list[dict]:
+    """解析 ``get_forward_msg`` 返回的聊天记录列表。
+
+    结构：``{"messages": [{"sender": {...}, "message": [{type, data}, ...]}]}``。
+    任何一层不符合预期都跳过，绝不让一条脏数据把整条转发打挂。
+    """
+    if not isinstance(payload, dict):
+        return []
+    raw_messages = payload.get("messages")
+    if not isinstance(raw_messages, list):
+        return []
+
+    messages: list[dict] = []
+    for entry in raw_messages:
+        if not isinstance(entry, dict):
+            messages.append({"name": "", "uin": "", "segments": []})
+            continue
+        sender = entry.get("sender") if isinstance(entry.get("sender"), dict) else {}
+        name = sender.get("nickname") or sender.get("card") or entry.get("name") or ""
+        uin = sender.get("user_id") or sender.get("uin") or entry.get("uin") or ""
+        raw_segments = entry.get("message")
+
+        segments: list[dict] = []
+        if isinstance(raw_segments, list):
+            for raw_segment in raw_segments:
+                parsed = onebot_segment_to_segment(raw_segment)
+                if parsed:
+                    segments.append(parsed)
+        elif isinstance(raw_segments, dict):
+            parsed = onebot_segment_to_segment(raw_segments)
+            if parsed:
+                segments.append(parsed)
+
+        messages.append(
+            {"name": str(name or ""), "uin": str(uin or ""), "segments": segments}
+        )
+    return messages
 
 
 # ── 出站文本 → 片段（把 <mention> 标签 / 手打 @ 还原成真实 At） ──────────
@@ -1143,6 +1363,34 @@ class MessageStore:
         finally:
             conn.close()
         return row is not None
+
+    QUOTE_PREVIEW_CHARS = 120
+
+    def quote_of(self, session_id: str, platform_message_id: str) -> dict | None:
+        """按平台消息 id 找回被引用消息的发送者与内容（引用展示用）。
+
+        ``astrbot:<id>`` 是历史导入时本地合成的 id，平台侧不存在，直接跳过。
+        """
+        target = str(platform_message_id or "").strip()
+        if not session_id or not target or target.startswith("astrbot:"):
+            return None
+        conn = self.connect()
+        try:
+            row = conn.execute(
+                "SELECT sender, content FROM messages "
+                "WHERE session_id = ? AND platform_message_id = ? ORDER BY id DESC LIMIT 1",
+                (session_id, target),
+            ).fetchone()
+        except sqlite3.OperationalError:
+            return None
+        finally:
+            conn.close()
+        if row is None:
+            return None
+        return {
+            "sender": str(row["sender"] or ""),
+            "text": str(row["content"] or "").strip()[: self.QUOTE_PREVIEW_CHARS],
+        }
 
     def has_astrbot_message(self, session_id: str, row_id: int) -> bool:
         """这条 AstrBot 历史是否已经导进来过（按 platform_message_id 留痕）。"""

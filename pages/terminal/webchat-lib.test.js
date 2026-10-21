@@ -11,6 +11,7 @@ import { test } from "node:test";
 import {
   compactId,
   compareSessions,
+  computeWindow,
   dayKey,
   dedupeMessages,
   formatDateLabel,
@@ -25,6 +26,7 @@ import {
   messageText,
   normalizeHistory,
   normalizeMessage,
+  normalizeSegment,
   normalizeSession,
   planMessages,
   diffPlan,
@@ -425,4 +427,90 @@ test("diffPlan 首次渲染走 append（旧计划为空）", () => {
     "s",
   );
   assert.deepEqual(diffPlan([], plan), { mode: "append", start: 0, end: plan.length });
+});
+
+// ── 虚拟滚动窗口 ────────────────────────────────────────────
+
+test("computeWindow 空列表返回空窗口", () => {
+  assert.deepEqual(computeWindow({ count: 0 }), {
+    start: 0, end: 0, topPad: 0, bottomPad: 0,
+  });
+});
+
+test("computeWindow 贴顶时从 0 开始且至少渲染 minRender 条", () => {
+  const win = computeWindow({
+    count: 100, heights: [], scrollTop: 0, viewport: 300,
+    forecast: 100, overscan: 0, minRender: 5,
+  });
+  assert.equal(win.start, 0);
+  assert.equal(win.end, 5);
+  assert.equal(win.topPad, 0);
+  assert.equal(win.bottomPad, 9500);
+});
+
+test("computeWindow 滚到中间时按估算高度切片", () => {
+  const win = computeWindow({
+    count: 100, heights: [], scrollTop: 1000, viewport: 300,
+    forecast: 100, overscan: 0, minRender: 1,
+  });
+  assert.equal(win.start, 10);
+  assert.equal(win.end, 13);
+  assert.equal(win.topPad, 1000);
+  assert.equal(win.bottomPad, 8700);
+});
+
+test("computeWindow 用实测高度覆盖估算值", () => {
+  const heights = new Array(100).fill(100);
+  heights[10] = 400; // 一张大图：占满视口，后面的消息被推到窗口外
+  const win = computeWindow({
+    count: 100, heights, scrollTop: 1000, viewport: 300,
+    forecast: 100, overscan: 0, minRender: 2,
+  });
+  assert.equal(win.start, 10);
+  assert.equal(win.end, 12, "高图占满视口时只需渲染它自己 + minRender 兜底");
+  assert.equal(win.topPad, 1000);
+});
+
+test("computeWindow pinToEnd 时窗口贴底", () => {
+  const win = computeWindow({
+    count: 100, heights: [], scrollTop: 0, viewport: 300,
+    forecast: 100, minRender: 5, pinToEnd: true,
+  });
+  assert.equal(win.end, 100);
+  assert.equal(win.start, 95);
+  assert.equal(win.bottomPad, 0);
+});
+
+test("computeWindow 条数少于 minRender 时全部渲染", () => {
+  const win = computeWindow({
+    count: 3, heights: [], scrollTop: 0, viewport: 300,
+    forecast: 100, minRender: 5,
+  });
+  assert.deepEqual(win, { start: 0, end: 3, topPad: 0, bottomPad: 0 });
+});
+
+// ── 消息归一化：平台消息 id / 失败态 / 转发嵌套 ──────────────
+
+test("normalizeMessage 保留 platform_message_id 供引用使用", () => {
+  const message = normalizeMessage(
+    { id: 7, session_id: "s", platform_message_id: "m-42", content: "hi" },
+    "s",
+  );
+  assert.equal(message.platformMessageId, "m-42");
+});
+
+test("normalizeMessage 保留发送失败标记，便于渲染重试按钮", () => {
+  const message = normalizeMessage({ id: null, session_id: "s", failed: true, content: "x" }, "s");
+  assert.equal(message.failed, true);
+});
+
+test("normalizeSegment 保留合并转发的嵌套消息", () => {
+  const [segment] = [{
+    type: "forward", text: "[聊天记录]", messages: [
+      { name: "小明", uin: "42", segments: [{ type: "text", text: "早" }] },
+    ],
+  }].map(normalizeSegment);
+  assert.equal(segment.messages.length, 1);
+  assert.equal(segment.messages[0].name, "小明");
+  assert.deepEqual(segment.messages[0].segments, [{ type: "text", text: "早" }]);
 });

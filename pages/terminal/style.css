@@ -2195,3 +2195,232 @@ html[data-compact="true"] .dialog-panel {
   gap: 8px;
   padding: 12px;
 }
+
+/* ── 虚拟滚动：上下 spacer 撑住滚动高度，中间只放窗口内的消息 ── */
+#message-content {
+  display: flex;
+  flex-direction: column;
+}
+
+#message-items {
+  display: flex;
+  flex-direction: column;
+}
+
+.virtual-spacer {
+  width: 100%;
+  flex: 0 0 auto;
+}
+
+/* ── 合并转发 chip：可点击查看聊天记录 ── */
+.segment-chip.forward-chip {
+  cursor: pointer;
+  border: 1px solid var(--border);
+  background: var(--surface);
+  color: var(--foreground);
+  font: inherit;
+  font-size: 10px;
+}
+
+.segment-chip.forward-chip:hover {
+  border-color: var(--border-strong);
+}
+
+/* ── 引用预览条 ── */
+.reply-preview {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 8px 12px 0;
+  padding: 6px 10px;
+  border-left: 3px solid var(--accent);
+  border-radius: 8px;
+  background: var(--surface);
+}
+
+.reply-preview-main {
+  display: flex;
+  min-width: 0;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.reply-preview-label {
+  color: var(--foreground-muted);
+  font-size: 10px;
+}
+
+.reply-preview-text {
+  overflow: hidden;
+  color: var(--foreground);
+  font-size: 11px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.reply-preview .icon-button {
+  width: 22px;
+  height: 22px;
+  margin-left: auto;
+}
+
+/* ── 发送失败 ── */
+.message-row.failed .message-bubble {
+  border-color: var(--danger);
+}
+
+.message-failed {
+  display: block;
+  margin-top: 4px;
+  color: var(--danger);
+  font-size: 10px;
+}
+
+/* ── 会话列表：加载更多 ── */
+.session-more {
+  margin: 0 12px 12px;
+  padding: 8px;
+  border: 1px dashed var(--border-strong);
+  border-radius: 8px;
+  background: transparent;
+  color: var(--foreground-muted);
+  font-size: 11px;
+  cursor: pointer;
+}
+
+.session-more:hover {
+  border-color: var(--foreground-subtle);
+  color: var(--foreground);
+}
+
+.session-more:disabled {
+  cursor: wait;
+  opacity: 0.6;
+}
+
+/* ── 合并转发详情 ── */
+.dialog-panel-wide {
+  width: min(520px, 100%);
+}
+
+.dialog-body {
+  min-height: 40px;
+}
+
+.forward-body {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.forward-row {
+  padding: 8px 10px;
+  border-radius: 8px;
+  background: var(--background);
+}
+
+.forward-head {
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+  margin-bottom: 4px;
+}
+
+.forward-name {
+  color: var(--foreground);
+  font-size: 11px;
+  font-weight: 600;
+}
+
+.forward-uin {
+  color: var(--foreground-subtle);
+  font-size: 9px;
+}
+
+.forward-text {
+  color: var(--foreground-muted);
+  font-size: 12px;
+  overflow-wrap: anywhere;
+  white-space: pre-wrap;
+}
+
+/* ── 引用块 ── */
+.quote-block {
+  display: flex;
+  max-width: 100%;
+  flex-direction: column;
+  gap: 2px;
+  margin-bottom: 6px;
+  padding: 5px 8px;
+  border-left: 2px solid var(--accent);
+  border-radius: 6px;
+  background: var(--surface);
+}
+
+.quote-block-author {
+  color: var(--foreground-muted);
+  font-size: 10px;
+}
+
+.quote-block-text {
+  overflow: hidden;
+  color: var(--foreground-subtle);
+  font-size: 11px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* ── 图片原始链接 ── */
+.lightbox-figure {
+  display: flex;
+  max-width: min(92vw, 1100px);
+  max-height: 88vh;
+  flex-direction: column;
+  gap: 8px;
+  align-items: center;
+}
+
+.lightbox-caption {
+  display: flex;
+  max-width: 100%;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 10px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--surface-strong);
+  font-size: 10px;
+}
+
+.lightbox-link {
+  overflow: hidden;
+  max-width: 46vw;
+  color: var(--foreground-muted);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  direction: rtl;
+  text-align: left;
+}
+
+.lightbox-actions {
+  display: inline-flex;
+  gap: 6px;
+  flex-shrink: 0;
+}
+
+.lightbox-actions a,
+.lightbox-actions button {
+  padding: 2px 6px;
+  border: 1px solid var(--border-strong);
+  border-radius: 6px;
+  background: transparent;
+  color: var(--foreground);
+  font: inherit;
+  cursor: pointer;
+  text-decoration: none;
+}
+
+.lightbox-actions a:hover,
+.lightbox-actions button:hover {
+  border-color: var(--accent);
+}

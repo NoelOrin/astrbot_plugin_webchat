@@ -43,6 +43,21 @@ export function normalizeSegment(raw) {
   if (raw.file) segment.file = str(raw.file);
   if (raw.target) segment.target = str(raw.target);
   if (raw.name) segment.name = str(raw.name);
+  if (raw.id !== undefined && raw.id !== null && raw.id !== "") segment.id = str(raw.id);
+  // 引用片段带上被引用消息的昵称 / 内容，前端才能显示「回复 小明：…」
+  if (raw.quote && typeof raw.quote === "object") {
+    segment.quote = { sender: str(raw.quote.sender), text: str(raw.quote.text) };
+  }
+  // 合并转发的聊天记录：每条保留昵称 / 账号 / 内部片段
+  if (Array.isArray(raw.messages)) {
+    segment.messages = raw.messages.map((node) => ({
+      name: str(node?.name),
+      uin: str(node?.uin),
+      segments: Array.isArray(node?.segments)
+        ? node.segments.map(normalizeSegment).filter(Boolean)
+        : [],
+    }));
+  }
   return segment;
 }
 
@@ -67,8 +82,10 @@ export function normalizeMessage(raw, sessionId) {
     segments,
     groupId: str(raw?.group_id),
     platform: str(raw?.platform),
+    platformMessageId: str(raw?.platform_message_id || raw?.platformMessageId),
     timestamp,
     pending: Boolean(raw?.pending),
+    failed: Boolean(raw?.failed),
   };
 }
 
@@ -441,4 +458,66 @@ export function diffPlan(previous, next) {
     return { mode: "truncate", start: common, end: oldPlan.length };
   }
   return { mode: "rebuild", start: 0, end: newPlan.length };
+}
+
+/**
+ * 计算虚拟滚动的渲染窗口。
+ *
+ * 只渲染视口附近的一段节点，用上下两个 spacer 撑住滚动高度：
+ * 消息上千条也不会把整棵树塞进 DOM。高度优先用实测值（`heights`），
+ * 没测过的用 `forecast` 估算——聊天列表的行高差异大，估算是唯一的办法。
+ *
+ * @returns {{start:number, end:number, topPad:number, bottomPad:number}}
+ */
+export function computeWindow({
+  count,
+  heights = [],
+  scrollTop = 0,
+  viewport = 0,
+  forecast = 56,
+  overscan = 600,
+  minRender = 24,
+  pinToEnd = false,
+} = {}) {
+  const total = Math.max(0, Math.floor(num(count, 0)));
+  if (!total) return { start: 0, end: 0, topPad: 0, bottomPad: 0 };
+
+  const fallback = num(forecast, 56) > 0 ? num(forecast, 56) : 56;
+  const heightAt = (index) => {
+    const measured = num(heights[index], 0);
+    return measured > 0 ? measured : fallback;
+  };
+
+  const minCount = Math.max(1, Math.floor(num(minRender, 24)));
+  if (total <= minCount) return { start: 0, end: total, topPad: 0, bottomPad: 0 };
+
+  if (pinToEnd) {
+    const start = Math.max(0, total - minCount);
+    let topPad = 0;
+    for (let index = 0; index < start; index += 1) topPad += heightAt(index);
+    return { start, end: total, topPad, bottomPad: 0 };
+  }
+
+  const offsets = new Array(total + 1);
+  offsets[0] = 0;
+  for (let index = 0; index < total; index += 1) {
+    offsets[index + 1] = offsets[index] + heightAt(index);
+  }
+
+  const top = Math.max(0, num(scrollTop, 0) - Math.max(0, num(overscan, 0)));
+  const viewHeight = num(viewport, 0) > 0 ? num(viewport, 0) : 600;
+  const bottom = num(scrollTop, 0) + viewHeight + Math.max(0, num(overscan, 0));
+
+  let start = 0;
+  while (start < total - 1 && offsets[start + 1] <= top) start += 1;
+
+  let end = start + 1;
+  while (end < total && offsets[end] < bottom) end += 1;
+
+  if (end - start < minCount) {
+    end = Math.min(total, start + minCount);
+    start = Math.max(0, end - minCount);
+  }
+
+  return { start, end, topPad: offsets[start], bottomPad: offsets[total] - offsets[end] };
 }

@@ -33,9 +33,11 @@ try:  # 正常情况：以 data.plugins.<dir>.main 包路径加载
         clamp_int,
         coerce_bool,
         coerce_float,
+        extract_forward_ids,
         has_mention_markup,
         is_http_url,
         now_ts,
+        onebot_forward_to_messages,
         serialize_chain,
         session_key_for_group,
         session_key_for_private,
@@ -53,9 +55,11 @@ except ImportError:  # 兜底：宿主以裸模块名加载时走同目录导入
         clamp_int,
         coerce_bool,
         coerce_float,
+        extract_forward_ids,
         has_mention_markup,
         is_http_url,
         now_ts,
+        onebot_forward_to_messages,
         serialize_chain,
         session_key_for_group,
         session_key_for_private,
@@ -259,6 +263,7 @@ class Plugin(Star):
             ("discover", self.api_discover, ["POST"], "自动发现会话并导入历史"),
             ("open", self.api_open_session, ["POST"], "主动创建会话"),
             ("media", self.api_media, ["GET"], "图片代理"),
+            ("forward", self.api_forward, ["GET"], "拉取合并转发聊天记录"),
             ("export", self.api_export, ["GET"], "导出会话记录"),
             ("health", self.api_health, ["GET"], "运行状态"),
         ]
@@ -508,6 +513,8 @@ class Plugin(Star):
         )
 
         segments = serialize_chain(getattr(message_obj, "message", None))
+        self._attach_forward_ids(message_obj, segments)
+        self._enrich_reply_quotes(session_key, segments)
         saved = self.store.add_message(
             session_key,
             {
@@ -1001,6 +1008,7 @@ class Plugin(Star):
             ):
                 return
 
+            self._enrich_reply_quotes(session_key, segments)
             saved = self.store.add_message(
                 session_key,
                 {
@@ -1020,6 +1028,41 @@ class Plugin(Star):
             logger.debug(f"记录出站消息失败（忽略）: {exc}")
 
     @staticmethod
+    def _attach_forward_ids(message_obj: object, segments: list[dict]) -> None:
+        """宿主组件没带转发 id 时，从原始事件（OneBot 段 / CQ 码）里补回来。
+
+        没有 id 也没有内嵌内容的转发，前端点开只能提示「不可用」。
+        """
+        def _has_content(segment: dict) -> bool:
+            return any(node.get("segments") for node in (segment.get("messages") or []))
+
+        missing = [
+            segment
+            for segment in segments
+            if segment.get("type") == "forward"
+            and not _has_content(segment)
+            and not segment.get("id")
+        ]
+        if not missing:
+            return
+        ids = extract_forward_ids(getattr(message_obj, "raw_message", None))
+        for segment, forward_id in zip(missing, ids, strict=False):
+            segment["id"] = forward_id
+
+    def _enrich_reply_quotes(self, session_key: str, segments: list[dict]) -> None:
+        """给 reply 片段补上被引用消息的昵称与内容，前端才能显示「回复 小明：…」。
+
+        协议端只给一个 message_id，内容得从本地库里按 platform_message_id 反查；
+        查不到就保持原样，前端会退化成占位提示。
+        """
+        for segment in segments:
+            if segment.get("type") != "reply":
+                continue
+            quote = self.store.quote_of(session_key, str(segment.get("target") or ""))
+            if quote:
+                segment["quote"] = quote
+
+    @staticmethod
     def _send_fingerprint(segments: list[dict]) -> str:
         """发送指纹：把 @ 片段折叠成 @名，抹平「文本 vs At 段」的表示差异。
 
@@ -1031,6 +1074,10 @@ class Plugin(Star):
             kind = segment.get("type")
             if kind == "at":
                 parts.append(f"@{segment.get('text') or segment.get('target') or ''}")
+            elif kind == "reply":
+                # 引用**不参与**指纹：不同适配器回推时可能保留、也可能剥掉 Reply，
+                # 参与比较反而会让其中一种回声对不上，被记成 sent + bot 两份。
+                continue
             elif kind == "text":
                 parts.append(str(segment.get("text") or ""))
             elif kind == "image":
@@ -1086,10 +1133,14 @@ class Plugin(Star):
     # ── API：会话 ──────────────────────────────────────────────
 
     async def api_sessions(self):
-        """会话列表。?with_history=1 附带每个会话最新一页消息。"""
+        """会话列表。?with_history=1 附带最新一页消息；?limit=&offset= 做分页。"""
         with_history = coerce_bool(request.args.get("with_history", ""))
         history_limit = clamp_int(request.args.get("history_limit", 40), 1, 200, 40)
         keyword = str(request.args.get("q", "") or "").strip()
+        # 不传 limit 时保持旧行为（全量），传了才分页
+        has_limit = "limit" in request.args
+        limit = clamp_int(request.args.get("limit", 50), 1, 500, 50)
+        offset = clamp_int(request.args.get("offset", 0), 0, 2**31, 0)
 
         summaries = self.store.session_summaries()
         participants_map = self.store.query_participants()
@@ -1136,8 +1187,23 @@ class Plugin(Star):
                                     "limit": history_limit}
             sessions.append(entry)
 
-        sessions.sort(key=lambda item: (not item["pinned"], -(item["last_activity"] or 0)))
-        return jsonify({"sessions": sessions})
+        # 稳定排序：置顶 → 最近活跃 → 会话键，分页时不会因并列项抖动而重复/漏项
+        sessions.sort(
+            key=lambda item: (not item["pinned"], -(item["last_activity"] or 0), item["id"])
+        )
+        total = len(sessions)
+        if has_limit:
+            window = sessions[offset:offset + limit]
+            return jsonify(
+                {
+                    "sessions": window,
+                    "total": total,
+                    "offset": offset,
+                    "limit": limit,
+                    "has_more": offset + len(window) < total,
+                }
+            )
+        return jsonify({"sessions": sessions, "total": total, "has_more": False})
 
     @staticmethod
     def _effective_method() -> str:
@@ -1196,6 +1262,10 @@ class Plugin(Star):
 
         send_target = meta.get("send_target") or session_id
         segments: list[dict] = []
+        # 引用必须排在最前（协议端按链首识别回复关系），先收集再从 extra_segments 剔除
+        for segment in extra_segments if isinstance(extra_segments, list) else []:
+            if isinstance(segment, dict) and segment.get("type") == "reply":
+                segments.append(segment)
         if message:
             # 手打的 @昵称 / @QQ号 还原成真实 At，否则在 QQ 里只是文本
             segments.extend(
@@ -1212,7 +1282,6 @@ class Plugin(Star):
             for segment in extra_segments:
                 if isinstance(segment, dict) and segment.get("type") in ("image", "at"):
                     segments.append(segment)
-
         try:
             chain = self._build_chain(segments)
         except Exception as exc:
@@ -1256,10 +1325,12 @@ class Plugin(Star):
         from astrbot.api.message_components import Image
 
         chain = MessageChain()
+        header_only = True
         for segment in segments:
             kind = segment.get("type")
             if kind == "text" and segment.get("text"):
                 chain.message(str(segment["text"]))
+                header_only = False
             elif kind == "image":
                 source = str(segment.get("url") or segment.get("file") or "")
                 if not source:
@@ -1269,6 +1340,7 @@ class Plugin(Star):
                         chain.chain.append(Image.fromURL(source))
                     else:
                         chain.chain.append(Image.fromFileSystem(source))
+                    header_only = False
                 except Exception as exc:
                     logger.warning(f"图片还原失败: {exc}")
             elif kind == "at":
@@ -1282,11 +1354,41 @@ class Plugin(Star):
                         )
                     except Exception as exc:
                         logger.warning(f"@ 还原失败: {exc}")
+            elif kind == "reply":
+                # 引用回复：只有平台消息 id 才能构造 Reply，缺 id 就退化成普通消息
+                target = str(segment.get("target") or segment.get("id") or "")
+                reply = self._reply_component(target)
+                if reply is not None:
+                    chain.chain.append(reply)
+                else:
+                    logger.warning("宿主不支持 Reply 组件，引用片段已降级为普通消息")
             elif kind == "plain" and segment.get("text"):
                 chain.message(str(segment["text"]))
-            elif kind not in ("reply", "plain", "text"):
+                header_only = False
+            elif kind not in ("plain", "text"):
                 logger.debug(f"发送时跳过不支持的片段类型: {kind}")
+
+        # 只剩 Reply / At 时宿主 respond 阶段会整条丢弃，补一个零宽明文段
+        if chain.chain and header_only:
+            chain.message("\u200b")
         return chain
+
+    @staticmethod
+    def _reply_component(target: str):
+        """构造宿主 Reply 组件；老宿主没有该组件时返回 None（调用方降级）。"""
+        if not target or target.startswith("astrbot:"):
+            # astrbot:<id> 是历史导入时本地合成的 id，平台不认识
+            return None
+        try:
+            from astrbot.api.message_components import Reply
+        except Exception:
+            return None
+        for kwargs in ({"id": target}, {"message_id": target}):
+            try:
+                return Reply(**kwargs)
+            except Exception:
+                continue
+        return None
 
     async def api_history(self):
         """?session_id= 时返回消息；带 limit/before_id 走游标分页。"""
@@ -1547,6 +1649,56 @@ class Plugin(Star):
         except Exception as exc:
             logger.info(f"媒体代理失败: {exc}")
             return jsonify({"error": "图片获取失败"}), 502
+
+    # ── API：合并转发内容 ──────────────────────────────────────
+
+    async def api_forward(self):
+        """?session_id=&id= —— 协议端只给了转发 id 时，按需拉取聊天记录。"""
+        session_id = str(request.args.get("session_id", "") or "")
+        forward_id = str(request.args.get("id", "") or "")
+        meta = self.session_meta.get(session_id)
+        if meta is None:
+            return jsonify({"error": "会话不存在"}), 404
+        if not forward_id:
+            return jsonify({"error": "缺少转发 id"}), 400
+
+        messages = await self._fetch_forward_messages(meta, forward_id)
+        return jsonify({"messages": messages, "available": bool(messages)})
+
+    async def _fetch_forward_messages(self, meta: dict, forward_id: str) -> list[dict]:
+        """尽力从协议端拉一条合并转发，任何一步失败都返回空列表（不报错）。"""
+        platform_id = str(meta.get("platform_id") or meta.get("platform") or "")
+        try:
+            inst = self.context.get_platform_inst(platform_id)
+        except Exception as exc:
+            logger.info(f"拉取转发失败（平台实例不可用）: {exc}")
+            return []
+
+        client = None
+        try:
+            client = inst.get_client()
+        except Exception:
+            client = None
+        if client is None:
+            client = getattr(inst, "bot", None) or getattr(inst, "api", None)
+        call_action = getattr(client, "call_action", None)
+        if call_action is None:
+            api = getattr(client, "api", None)
+            call_action = getattr(api, "call_action", None)
+        if call_action is None:
+            logger.info("拉取转发失败（协议端没有 call_action）")
+            return []
+
+        payload = None
+        for kwargs in ({"message_id": forward_id}, {"id": forward_id}):
+            try:
+                payload = await call_action("get_forward_msg", **kwargs)
+                break
+            except Exception as exc:
+                logger.debug(f"get_forward_msg 失败（{kwargs}）: {exc}")
+        if payload is None:
+            return []
+        return onebot_forward_to_messages(payload)
 
     # ── API：导出与健康检查 ────────────────────────────────────
 

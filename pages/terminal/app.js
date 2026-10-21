@@ -13,6 +13,7 @@ import {
   NEAR_BOTTOM_PX,
   compactId,
   compareSessions,
+  computeWindow,
   dedupeMessages,
   errorText,
   formatFullTime,
@@ -24,9 +25,11 @@ import {
   isNearBottom,
   matchesSession,
   mergeMessages,
+  messageKey,
   messageText,
   normalizeHistory,
   normalizeMessage,
+  normalizeSegment,
   normalizeSession,
   planMessages,
   diffPlan,
@@ -49,10 +52,23 @@ const HISTORY_LIMIT = HISTORY_PAGE_SIZE;
 /** SSE 心跳：后端每 15 秒发一个 ping，超过 45 秒没收到就认为连接已死。 */
 const STREAM_STALE_MS = 45000;
 const STREAM_CHECK_MS = 20000;
+/** 轮询降级期间每隔多久再试一次 SSE：尽量回到实时推送，而不是永久轮询。 */
+const SSE_RETRY_MS = 60000;
 /** bridge 订阅迟迟不返回就当失败：宿主缓冲 SSE 时 fetch 永远等不到响应头。 */
 const STREAM_OPEN_TIMEOUT_MS = 8000;
 /** 小窗自动紧凑阈值：必须与 style.css 顶部的 --compact 保持一致。 */
 const COMPACT_MEDIA = "(max-width: 900px), (max-height: 720px)";
+/** 超过这个条数就启用虚拟滚动；小会话保持全量渲染，行为与旧版一致。 */
+const VIRTUAL_THRESHOLD = 80;
+/** 虚拟窗口最少渲染多少条（也决定贴底时的窗口大小）。 */
+const VIRTUAL_MIN_RENDER = 30;
+/** 视口上下额外多渲染多少像素，滚动时不至于露白。 */
+const VIRTUAL_OVERSCAN = 800;
+/** 没测量过的消息用这个高度估算。 */
+const MESSAGE_HEIGHT_FALLBACK = 56;
+/** 会话列表每页条数。 */
+const SESSION_PAGE_SIZE = 50;
+const DRAFT_KEY = `${PLUGIN_NAME}_draft`;
 
 const bridge = window.AstrBotPluginView || window.AstrBotPluginPage || null;
 
@@ -62,6 +78,14 @@ const elements = {
   btnImages: document.getElementById("btn-images"),
   messages: document.getElementById("messages"),
   messageContent: document.getElementById("message-content"),
+  messageItems: document.getElementById("message-items"),
+  virtualTop: document.getElementById("virtual-top"),
+  virtualBottom: document.getElementById("virtual-bottom"),
+  replyPreview: document.getElementById("reply-preview"),
+  replyPreviewName: document.getElementById("reply-preview-name"),
+  replyPreviewText: document.getElementById("reply-preview-text"),
+  btnReplyCancel: document.getElementById("btn-reply-cancel"),
+  sessionMore: document.getElementById("session-more"),
   emptyState: document.getElementById("empty-state"),
   loadMore: document.getElementById("load-more"),
   input: document.getElementById("input"),
@@ -109,6 +133,10 @@ const elements = {
   attachmentPreview: document.getElementById("attachment-preview"),
   lightbox: document.getElementById("lightbox"),
   lightboxImage: document.getElementById("lightbox-image"),
+  lightboxCaption: document.getElementById("lightbox-caption"),
+  lightboxLink: document.getElementById("lightbox-link"),
+  lightboxOpen: document.getElementById("lightbox-open"),
+  btnCopyImageLink: document.getElementById("btn-copy-image-link"),
 };
 
 const state = {
@@ -123,6 +151,8 @@ const state = {
   connected: false,
   /** 最近一次收到任何 SSE 帧（含 ping）的时间，用于判断连接是否假死。 */
   lastStreamAt: 0,
+  /** 轮询降级时最近一次重试 SSE 的时间，避免每次健康检查都重订阅。 */
+  lastSseRetryAt: 0,
   /** 轮询游标：已确认收到的最大消息 id（全局自增，跨会话）。 */
   updatesCursor: 0,
   loadingHistory: false,
@@ -136,8 +166,22 @@ const state = {
   context: null,
   renderPlan: [],
   renderSessionId: "",
+  /** 虚拟滚动：是否启用、当前窗口范围、按 plan key 缓存的行高。 */
+  virtual: false,
+  virtualWindow: { start: 0, end: 0 },
+  heights: new Map(),
+  /** 引用目标：{ sessionId, target(平台消息 id), senderName, text }。 */
+  replyTo: null,
+  /** 草稿：会话 id → 未发送文本（localStorage 失败时的内存兜底）。 */
+  drafts: new Map(),
+  /** 会话列表分页游标。 */
+  sessionPage: { offset: 0, hasMore: false, loading: false },
   /** 是否自动请求图片；默认关，可由插件配置或工具栏开关覆盖。 */
   loadImages: false,
+  /** 用户手动点开过的图片地址：窗口重渲染后仍保持已加载，不能打回占位。 */
+  loadedImages: new Set(),
+  /** 大图预览当前展示的图片原始地址（复制链接用）。 */
+  lightboxSource: "",
 };
 
 bindEvents();
@@ -208,6 +252,7 @@ function bindEvents() {
   elements.input.addEventListener("input", () => {
     resizeComposer();
     updateSendState();
+    scheduleDraftSave();
   });
 
   elements.btnClear.addEventListener("click", clearMessages);
@@ -225,6 +270,9 @@ function bindEvents() {
     markCurrentSessionRead();
   });
   elements.loadMore.addEventListener("click", loadOlderMessages);
+  elements.btnReplyCancel.addEventListener("click", cancelReply);
+  elements.sessionMore.addEventListener("click", loadMoreSessions);
+  elements.sessionList.addEventListener("scroll", handleSessionListScroll, { passive: true });
   elements.messages.addEventListener("scroll", handleMessageScroll, { passive: true });
 
   elements.messageSearch.addEventListener("input", debounce(onSearchInput, 260));
@@ -235,6 +283,14 @@ function bindEvents() {
   elements.btnAttach.addEventListener("click", () => elements.attachmentInput.click());
   elements.attachmentInput.addEventListener("change", onAttachmentPicked);
   elements.lightbox.addEventListener("click", closeLightbox);
+  // 点在图/说明条上不该关掉预览
+  elements.lightbox.querySelector(".lightbox-figure")?.addEventListener("click", (event) => {
+    event.stopPropagation();
+  });
+  elements.btnCopyImageLink.addEventListener("click", () => {
+    if (!state.lightboxSource) return;
+    copyText(state.lightboxSource);
+  });
 
   // 输入框内粘贴图片直接变成待发送附件
   elements.input.addEventListener("paste", onInputPaste);
@@ -245,6 +301,7 @@ function bindEvents() {
       toggleDetails(false);
       closeLightbox();
       closeTopDialog();
+      cancelReply();
     }
   });
 
@@ -268,20 +325,24 @@ function bindEvents() {
 
 // ── 会话加载 ────────────────────────────────────────────────
 
-async function loadSessions({ selectInitial = false } = {}) {
+async function loadSessions({ selectInitial = false, reset = true } = {}) {
   elements.btnRefresh.disabled = true;
+  const offset = reset ? 0 : state.sessionPage.offset;
   try {
     const data = await bridge.apiGet("sessions", {
       with_history: "1",
       history_limit: String(HISTORY_LIMIT),
+      limit: String(SESSION_PAGE_SIZE),
+      offset: String(offset),
     });
     const sessions = Array.isArray(data?.sessions) ? data.sessions : [];
-    const nextSessions = new Map();
+
+    if (reset) state.sessions = new Map();
 
     for (const rawSession of sessions) {
       const session = normalizeSession(rawSession);
       if (!session.id) continue;
-      nextSessions.set(session.id, session);
+      state.sessions.set(session.id, session);
 
       // 首次加载填充历史；已有缓存时保留用户已经翻出来的更早记录
       if (Array.isArray(rawSession.messages) && !state.messages.has(session.id)) {
@@ -302,26 +363,34 @@ async function loadSessions({ selectInitial = false } = {}) {
       if (!state.unread.has(session.id)) state.unread.set(session.id, 0);
     }
 
-    // 清掉已删除会话的缓存
-    for (const sessionId of [...state.sessions.keys()]) {
-      if (!nextSessions.has(sessionId)) {
-        state.sessions.delete(sessionId);
-        state.messages.delete(sessionId);
-        state.history.delete(sessionId);
-        state.unread.delete(sessionId);
+    state.sessionPage = {
+      offset: offset + sessions.length,
+      hasMore: Boolean(data?.has_more),
+      loading: false,
+    };
+
+    // 首页才清理已删除会话的缓存；翻页只是追加，不能删别人
+    if (reset) {
+      for (const sessionId of [...state.messages.keys()]) {
+        if (!state.sessions.has(sessionId)) {
+          state.messages.delete(sessionId);
+          state.history.delete(sessionId);
+          state.unread.delete(sessionId);
+        }
       }
     }
 
-    state.sessions = nextSessions;
+    renderSessionList();
+
+    if (!reset) return;
+
     const savedSession = readStoredSession();
-    const currentStillExists = state.currentSessionId && nextSessions.has(state.currentSessionId);
+    const currentStillExists = state.currentSessionId && state.sessions.has(state.currentSessionId);
     const target = currentStillExists
       ? state.currentSessionId
-      : savedSession && nextSessions.has(savedSession)
+      : savedSession && state.sessions.has(savedSession)
         ? savedSession
         : (sortedSessions()[0]?.id ?? "");
-
-    renderSessionList();
 
     if (target) {
       const stickToBottom = selectInitial || !currentStillExists || isNearBottomOfMessageList();
@@ -338,6 +407,29 @@ async function loadSessions({ selectInitial = false } = {}) {
   } finally {
     elements.btnRefresh.disabled = false;
   }
+}
+
+async function loadMoreSessions() {
+  if (state.sessionPage.loading || !state.sessionPage.hasMore) return;
+  state.sessionPage.loading = true;
+  elements.sessionMore.disabled = true;
+  elements.sessionMore.textContent = "加载中…";
+  try {
+    await loadSessions({ reset: false });
+  } finally {
+    state.sessionPage.loading = false;
+    elements.sessionMore.disabled = false;
+    elements.sessionMore.textContent = "加载更多会话";
+    renderSessionList();
+  }
+}
+
+/** 会话列表滚到底部时自动补一页。 */
+function handleSessionListScroll() {
+  const list = elements.sessionList;
+  if (!state.sessionPage.hasMore || state.sessionPage.loading) return;
+  if (list.scrollTop + list.clientHeight < list.scrollHeight - 120) return;
+  loadMoreSessions();
 }
 
 function sortedSessions() {
@@ -403,6 +495,11 @@ function renderSessionList() {
   const total = state.sessions.size;
   elements.sessionCount.textContent =
     sessions.length === total ? String(total) : `${sessions.length}/${total}`;
+
+  // 有关键词时只在已加载的会话里筛，不假装能搜到还没拉下来的页
+  elements.sessionMore.hidden = !state.sessionPage.hasMore || Boolean(query.trim()) || !sessions.length;
+  elements.sessionMore.disabled = state.sessionPage.loading;
+  elements.sessionMore.textContent = state.sessionPage.loading ? "加载中…" : "加载更多会话";
 }
 
 // ── 会话切换 ────────────────────────────────────────────────
@@ -412,6 +509,7 @@ function selectSession(sessionId, { scrollToBottom: shouldScroll = true, closeSi
   if (!session) return;
 
   const changed = state.currentSessionId !== sessionId;
+  if (changed) saveDraft(state.currentSessionId);
   state.currentSessionId = sessionId;
   rememberSession(sessionId);
   state.newMessageCount = 0;
@@ -423,6 +521,10 @@ function selectSession(sessionId, { scrollToBottom: shouldScroll = true, closeSi
   elements.input.placeholder = session.isGroup
     ? `发送到 ${session.peerName}`
     : `发送给 ${session.peerName}`;
+  if (changed) {
+    cancelReply();
+    elements.input.value = readDraft(sessionId);
+  }
   resizeComposer();
   updateSendState();
 
@@ -432,7 +534,11 @@ function selectSession(sessionId, { scrollToBottom: shouldScroll = true, closeSi
   renderMessages({ scrollToBottom: shouldScroll || changed });
 
   if (closeSidebar) toggleSidebar(false);
-  if (!state.connected && sessionId) startPolling();
+  // 这里**不要**因为 state.connected 还是 false 就 startPolling()：
+  // boot() 先 loadSessions() 再 connectStream()，选会话时 SSE 还没开始连，
+  // connected 必然是 false。在这里兜底轮询会让终端「一启动就降级轮询」，
+  // 之后即使 SSE 连上也已经白跑了一轮。轮询只由流生命周期触发：
+  // 连接失败/超时/心跳假死时各监听器自己 startPolling()。
 }
 
 function resetConversation() {
@@ -447,8 +553,12 @@ function resetConversation() {
   elements.conversationAvatar.textContent = "#";
   elements.conversationAvatar.className = "avatar avatar-large";
   elements.emptyState.hidden = false;
-  elements.messageContent.replaceChildren();
+  elements.messageItems.replaceChildren();
+  setVirtualSpacers(0, 0);
+  state.virtual = false;
+  state.virtualWindow = { start: 0, end: 0 };
   elements.loadMore.hidden = true;
+  cancelReply();
   elements.detailsTitle.textContent = "暂未选择";
   elements.detailKind.textContent = "-";
   elements.detailId.textContent = "-";
@@ -551,40 +661,119 @@ function renderMessages({ scrollToBottom: shouldScroll = false } = {}) {
   elements.loadMore.disabled = state.loadingHistory;
 
   if (!session) {
-    elements.messageContent.replaceChildren();
+    elements.messageItems.replaceChildren();
+    setVirtualSpacers(0, 0);
     state.renderPlan = [];
     state.renderSessionId = "";
+    state.virtual = false;
+    state.virtualWindow = { start: 0, end: 0 };
     return;
   }
 
-  const nextPlan = planMessages(messages, sessionId);
-
-  if (state.renderSessionId !== sessionId) {
-    // 切换会话：DOM 里是上一个会话的节点，diff 无法推断（空计划会被判成 append），
-    // 必须直接清空后整树重建，否则旧会话的消息会残留在新会话里。
-    const fragment = document.createDocumentFragment();
-    for (const item of nextPlan) fragment.append(buildPlanNode(item, session));
-    elements.messageContent.replaceChildren(fragment);
-  } else {
-    applyPlanDiff(diffPlan(state.renderPlan, nextPlan), state.renderPlan, nextPlan, session);
+  const switching = state.renderSessionId !== sessionId;
+  if (switching) {
+    // 切换会话：diff 无法推断（空计划会被判成 append），必须清空后整树重建
+    elements.messageItems.replaceChildren();
+    state.heights.clear();
+    setVirtualSpacers(0, 0);
+    elements.messages.scrollTop = 0;
+    state.renderPlan = [];
+    state.renderSessionId = sessionId;
+    state.virtualWindow = { start: 0, end: 0 };
   }
 
+  const previousPlan = state.renderPlan;
+  const nextPlan = planMessages(messages, sessionId);
   state.renderPlan = nextPlan;
-  state.renderSessionId = sessionId;
+
+  // 少量消息保持全量渲染：小会话行为与旧版完全一致，虚拟滚动只在大列表生效
+  const virtual = nextPlan.length > VIRTUAL_THRESHOLD;
+  state.virtual = virtual;
+
+  if (virtual) {
+    renderVirtualWindow({ session, plan: nextPlan, pinToEnd: shouldScroll });
+  } else {
+    applyPlanDiff(diffPlan(previousPlan, nextPlan), previousPlan, nextPlan, session);
+    setVirtualSpacers(0, 0);
+    state.virtualWindow = { start: 0, end: nextPlan.length };
+  }
 
   if (shouldScroll) {
     requestAnimationFrame(() => {
       elements.messages.scrollTop = elements.messages.scrollHeight;
       markCurrentSessionRead();
     });
-  } else {
+  } else if (!virtual) {
     elements.messages.scrollTop = previousTop;
   }
 }
 
+// ── 虚拟滚动 ────────────────────────────────────────────────
+
+function setVirtualSpacers(topPad, bottomPad) {
+  elements.virtualTop.style.height = `${Math.max(0, Math.round(topPad))}px`;
+  elements.virtualBottom.style.height = `${Math.max(0, Math.round(bottomPad))}px`;
+  elements.virtualTop.hidden = topPad <= 0;
+  elements.virtualBottom.hidden = bottomPad <= 0;
+}
+
+/** 估算未测量行高：已测量行的平均值，没有测量值时用兜底值。 */
+function averageMessageHeight() {
+  if (!state.heights.size) return MESSAGE_HEIGHT_FALLBACK;
+  let total = 0;
+  for (const value of state.heights.values()) total += value;
+  return Math.max(24, total / state.heights.size) || MESSAGE_HEIGHT_FALLBACK;
+}
+
+/** 只渲染视口附近的一段 plan，上下用 spacer 撑住滚动高度。 */
+function renderVirtualWindow({ session, plan, pinToEnd = false }) {
+  const container = elements.messages;
+  const win = computeWindow({
+    count: plan.length,
+    heights: plan.map((item) => state.heights.get(item.key)),
+    scrollTop: container.scrollTop,
+    viewport: container.clientHeight || 0,
+    forecast: averageMessageHeight(),
+    overscan: VIRTUAL_OVERSCAN,
+    minRender: VIRTUAL_MIN_RENDER,
+    pinToEnd,
+  });
+
+  const fragment = document.createDocumentFragment();
+  for (let index = win.start; index < win.end; index += 1) {
+    fragment.append(buildPlanNode(plan[index], session));
+  }
+  elements.messageItems.replaceChildren(fragment);
+  setVirtualSpacers(win.topPad, win.bottomPad);
+  state.virtualWindow = { start: win.start, end: win.end };
+  requestAnimationFrame(() => measureRenderedHeights(plan));
+}
+
+/** 渲染后回写实测行高，下一轮窗口计算就能用上。 */
+function measureRenderedHeights(plan) {
+  if (!state.virtual) return;
+  const nodes = elements.messageItems.children;
+  const start = state.virtualWindow.start;
+  for (let offset = 0; offset < nodes.length; offset += 1) {
+    const item = plan[start + offset];
+    if (!item) break;
+    const node = nodes[offset];
+    const height = node.getBoundingClientRect?.().height || node.offsetHeight || 0;
+    if (height > 0) state.heights.set(item.key, height);
+  }
+}
+
+function refreshVirtualWindow() {
+  if (!state.virtual) return;
+  const session = state.sessions.get(state.currentSessionId);
+  const plan = state.renderPlan;
+  if (!session || !plan.length) return;
+  renderVirtualWindow({ session, plan, pinToEnd: false });
+}
+
 /** 按 diff 结果做最小 DOM 变更，而不是每次重建整棵树。 */
 function applyPlanDiff(diff, previousPlan, nextPlan, session) {
-  const content = elements.messageContent;
+  const content = elements.messageItems;
 
   if (diff.mode === "append") {
     if (diff.start === diff.end) return;
@@ -626,7 +815,9 @@ function renderMessage(message, session, grouped) {
   const isSent = message.type === "sent";
   const isBot = message.type === "bot";
   row.className =
-    `message-row ${isSent ? "sent" : isBot ? "bot" : "received"}${grouped ? " grouped" : ""}`;
+    `message-row ${isSent ? "sent" : isBot ? "bot" : "received"}${grouped ? " grouped" : ""}${
+      message.failed ? " failed" : ""
+    }`;
   row.dataset.messageId = message.id || "";
 
   const displayName = isSent ? "你" : message.senderName || (isBot ? "Bot" : "未知用户");
@@ -665,16 +856,38 @@ function renderMessage(message, session, grouped) {
   appendBubbleContent(bubble, message);
   stack.append(bubble);
 
-  if (message.id) {
+  if (message.id || message.failed) {
     const actions = document.createElement("div");
     actions.className = "message-actions";
     const copyButton = createElement("button", "message-action", "复制");
     copyButton.type = "button";
     copyButton.addEventListener("click", () => copyText(messageText(message)));
-    const deleteButton = createElement("button", "message-action danger", "删除");
-    deleteButton.type = "button";
-    deleteButton.addEventListener("click", () => deleteMessage(message));
-    actions.append(copyButton, deleteButton);
+    actions.append(copyButton);
+
+    // 引用：只有带平台消息 id 的入站消息才能被引用（Bot/终端自己发的行没有）
+    if (message.type === "received" && isQuotableId(message.platformMessageId)) {
+      const replyButton = createElement("button", "message-action", "引用");
+      replyButton.type = "button";
+      replyButton.addEventListener("click", () => startReply(message));
+      actions.append(replyButton);
+    }
+
+    if (message.failed) {
+      const retryButton = createElement("button", "message-action", "重试");
+      retryButton.type = "button";
+      retryButton.addEventListener("click", () => retryMessage(message));
+      const discardButton = createElement("button", "message-action danger", "丢弃");
+      discardButton.type = "button";
+      discardButton.addEventListener("click", () =>
+        removeMessageByKey(message.sessionId, messageKey(message)),
+      );
+      actions.append(retryButton, discardButton);
+    } else {
+      const deleteButton = createElement("button", "message-action danger", "删除");
+      deleteButton.type = "button";
+      deleteButton.addEventListener("click", () => deleteMessage(message));
+      actions.append(deleteButton);
+    }
     stack.append(actions);
   }
 
@@ -686,16 +899,27 @@ function appendBubbleContent(bubble, message) {
   const segments = message.segments || [];
   const images = imageSources(message);
 
+  // 引用块排在最前面，像聊天软件那样先说明「在回复谁」
+  for (const segment of segments) {
+    if (segment.type === "reply") bubble.append(buildQuoteBlock(segment, message));
+  }
+
   if (images.length) {
     const gallery = createElement("div", "message-images");
     for (const source of images) {
-      gallery.append(state.loadImages ? buildImage(source) : buildImagePlaceholder(source));
+      gallery.append(
+        state.loadImages || state.loadedImages.has(source)
+          ? buildImage(source)
+          : buildImagePlaceholder(source),
+      );
     }
     bubble.append(gallery);
   }
 
-  // 非文本片段（@、表情、语音、文件…）用 chip 展示
-  const chips = segments.filter((segment) => segment.type !== "text" && segment.type !== "image");
+  // 非文本片段（@、表情、语音、文件…）用 chip 展示；引用已经单独渲染
+  const chips = segments.filter(
+    (segment) => segment.type !== "text" && segment.type !== "image" && segment.type !== "reply",
+  );
   if (chips.length) {
     const parts = createElement("div", "message-segments");
     for (const segment of chips) parts.append(renderSegmentChip(segment));
@@ -707,10 +931,42 @@ function appendBubbleContent(bubble, message) {
         .map((segment) => (segment.type === "text" ? stripMentionMarkup(segment.text) : ""))
         .join("")
     : "";
-  const fallbackText = visibleText || (images.length ? "" : messageText(message));
+  // 有结构化片段（图片之外的 @/表情/语音/文件/转发）时，正文不要再把占位文案重复一遍
+  const hasStructured = segments.some(
+    (segment) => segment.type !== "text" && segment.type !== "image",
+  );
+  const fallbackText =
+    visibleText || (images.length || hasStructured ? "" : messageText(message));
   if (fallbackText) bubble.append(createElement("span", "message-text", fallbackText));
 
   if (message.pending) bubble.append(createElement("span", "message-pending", "发送中…"));
+  if (message.failed) bubble.append(createElement("span", "message-failed", "发送失败，可重试"));
+}
+
+/** 引用块：作者 + 被引用内容；本地缓存里找得到就用缓存兜底。 */
+function buildQuoteBlock(segment, message) {
+  const quote = resolveQuote(segment, message);
+  const block = createElement("div", "quote-block");
+  const author = quote?.sender ? `回复 ${quote.sender}` : "引用消息";
+  const text =
+    quote?.text ||
+    (segment.text && segment.text !== "[引用]" ? segment.text : "（原消息不在本地记录里）");
+
+  block.append(createElement("span", "quote-block-author", author));
+  block.append(createElement("span", "quote-block-text", String(text).slice(0, 120)));
+  block.title = String(text);
+  return block;
+}
+
+function resolveQuote(segment, message) {
+  if (segment.quote?.text) return segment.quote;
+  const target = String(segment.target || "");
+  if (!target) return null;
+  const sessionId = message?.sessionId || state.currentSessionId;
+  const list = state.messages.get(sessionId) || [];
+  const found = list.find((item) => String(item.platformMessageId || "") === target);
+  if (!found) return null;
+  return { sender: found.senderName, text: messageText(found) };
 }
 
 function buildImage(source) {
@@ -721,7 +977,11 @@ function buildImage(source) {
   image.src = mediaUrl(source);
   image.addEventListener("click", (event) => {
     event.stopPropagation();
-    openLightbox(image.src);
+    openLightbox(image.src, source);
+  });
+  image.addEventListener("load", () => {
+    // 图片真实尺寸决定了行高，加载完回写一次长度，虚拟窗口才不会跳
+    if (state.virtual) requestAnimationFrame(() => measureRenderedHeights(state.renderPlan));
   });
   image.addEventListener("error", () => {
     image.replaceWith(createElement("span", "message-media-fallback", "[图片加载失败]"));
@@ -744,6 +1004,8 @@ function buildImagePlaceholder(source) {
   );
   placeholder.addEventListener("click", (event) => {
     event.stopPropagation();
+    // 记住「这一张被点开过」：虚拟滚动重渲染时按它还原成 <img>，否则会退回占位
+    state.loadedImages.add(source);
     // 只替换这一张，不改变全局开关
     placeholder.replaceWith(buildImage(source));
   });
@@ -751,7 +1013,6 @@ function buildImagePlaceholder(source) {
 }
 
 function renderSegmentChip(segment) {
-  const chip = createElement("span", `segment-chip ${segment.type}`);
   const label =
     segment.text ||
     (segment.type === "image"
@@ -759,8 +1020,90 @@ function renderSegmentChip(segment) {
       : segment.type === "file"
         ? `[文件] ${segment.name || ""}`
         : `[${segment.type}]`);
+
+  // 合并转发：渲染成按钮，点开看聊天记录
+  if (segment.type === "forward") {
+    const count = Array.isArray(segment.messages) ? segment.messages.length : 0;
+    const chip = createElement("button", "segment-chip forward forward-chip");
+    chip.type = "button";
+    chip.title = "点击查看聊天记录";
+    chip.textContent = count
+      ? `聊天记录 · ${count} 条`
+      : segment.id
+        ? "聊天记录 · 点击加载"
+        : "聊天记录";
+    chip.addEventListener("click", () => openForwardDialog(segment));
+    return chip;
+  }
+
+  const chip = createElement("span", `segment-chip ${segment.type}`);
   chip.textContent = String(label).trim();
   return chip;
+}
+
+// ── 合并转发详情 ────────────────────────────────────────────
+
+async function openForwardDialog(segment) {
+  const body = createElement("div", "forward-body");
+  const nodes = Array.isArray(segment.messages) ? segment.messages : [];
+
+  if (nodes.length) {
+    renderForwardMessages(body, nodes);
+  } else if (segment.id && state.currentSessionId) {
+    body.append(createElement("p", "dialog-description", "正在加载聊天记录…"));
+    try {
+      const fetched = await fetchForwardMessages(state.currentSessionId, segment.id);
+      body.replaceChildren();
+      if (fetched.length) {
+        renderForwardMessages(body, fetched);
+      } else {
+        body.append(
+          createElement("p", "dialog-description", "协议端没有返回内容（可能不支持拉取合并转发）"),
+        );
+      }
+    } catch (error) {
+      body.replaceChildren(
+        createElement("p", "dialog-description", `加载失败：${errorText(error)}`),
+      );
+    }
+  } else {
+    body.append(createElement("p", "dialog-description", "这条合并转发没有可展开的内容"));
+  }
+
+  infoDialog({ title: "聊天记录", content: body });
+}
+
+function renderForwardMessages(container, nodes) {
+  for (const node of nodes) {
+    const row = createElement("div", "forward-row");
+    const head = createElement("div", "forward-head");
+    head.append(createElement("span", "forward-name", node.name || node.uin || "未知"));
+    if (node.uin) head.append(createElement("span", "forward-uin", `#${compactId(node.uin)}`));
+    row.append(head);
+
+    const parts = [];
+    for (const item of node.segments || []) {
+      if (item.type === "text") parts.push(item.text);
+      else if (item.type === "image") parts.push("[图片]");
+      else if (item.type === "at") parts.push(`@${item.text || item.target}`);
+      else if (item.type === "forward") parts.push("[聊天记录]");
+      else parts.push(item.text || `[${item.type}]`);
+    }
+    row.append(createElement("div", "forward-text", parts.join("").trim() || "[空消息]"));
+    container.append(row);
+  }
+}
+
+async function fetchForwardMessages(sessionId, forwardId) {
+  const data = await bridge.apiGet("forward", { session_id: sessionId, id: forwardId });
+  const raw = Array.isArray(data?.messages) ? data.messages : [];
+  return raw.map((node) => ({
+    name: String(node?.name || ""),
+    uin: String(node?.uin || ""),
+    segments: (Array.isArray(node?.segments) ? node.segments : [])
+      .map(normalizeSegment)
+      .filter(Boolean),
+  }));
 }
 
 // ── 滚动与未读 ──────────────────────────────────────────────
@@ -776,10 +1119,17 @@ function isNearBottomOfMessageList() {
   );
 }
 
+let virtualScrollFrame = 0;
+
 function handleMessageScroll() {
   if (isNearBottomOfMessageList() && (state.unread.get(state.currentSessionId) || 0) > 0) {
     markCurrentSessionRead();
   }
+  if (!state.virtual || virtualScrollFrame) return;
+  virtualScrollFrame = requestAnimationFrame(() => {
+    virtualScrollFrame = 0;
+    refreshVirtualWindow();
+  });
 }
 
 function markCurrentSessionRead() {
@@ -792,6 +1142,10 @@ function markCurrentSessionRead() {
 }
 
 function scrollToBottom(smooth = false) {
+  if (state.virtual) {
+    const session = state.sessions.get(state.currentSessionId);
+    if (session) renderVirtualWindow({ session, plan: state.renderPlan, pinToEnd: true });
+  }
   elements.messages.scrollTo({
     top: elements.messages.scrollHeight,
     behavior: smooth ? "smooth" : "auto",
@@ -820,12 +1174,29 @@ async function loadOlderMessages() {
     const older = (Array.isArray(data?.messages) ? data.messages : []).map((message) =>
       normalizeMessage(message, sessionId),
     );
-    state.messages.set(sessionId, mergeMessages(older, state.messages.get(sessionId) || []));
+    const merged = mergeMessages(older, state.messages.get(sessionId) || []);
+    const beforePlan = state.renderPlan;
+    state.messages.set(sessionId, merged);
     state.history.set(sessionId, normalizeHistory(data));
-    renderMessages();
-    requestAnimationFrame(() => {
-      elements.messages.scrollTop = previousTop + (elements.messages.scrollHeight - previousHeight);
-    });
+
+    if (state.virtual) {
+      // 更早的消息插在 plan 头部：先把滚动位置抬高同样的高度，窗口才不会错位
+      const nextPlan = planMessages(merged, sessionId);
+      const added = Math.max(0, nextPlan.length - beforePlan.length);
+      const forecast = averageMessageHeight();
+      let addedHeight = 0;
+      for (let index = 0; index < added; index += 1) {
+        addedHeight += state.heights.get(nextPlan[index].key) || forecast;
+      }
+      elements.messages.scrollTop = previousTop + addedHeight;
+      renderMessages();
+    } else {
+      renderMessages();
+      requestAnimationFrame(() => {
+        elements.messages.scrollTop =
+          previousTop + (elements.messages.scrollHeight - previousHeight);
+      });
+    }
   } catch (error) {
     toast(`历史消息加载失败: ${errorText(error)}`, "error");
   } finally {
@@ -852,19 +1223,28 @@ async function sendMessage() {
   }
   if ((!text && !state.attachments.length) || state.sending) return;
 
+  const reply = state.replyTo?.sessionId === session.id ? state.replyTo : null;
   const attachments = state.attachments;
+  // 引用必须排在最前，协议端按链首识别回复关系
+  const segments = [];
+  if (reply) {
+    segments.push({ type: "reply", target: reply.target, text: reply.text });
+  }
+  segments.push(...attachments);
+
   state.sending = true;
   elements.btnSend.disabled = true;
   elements.input.value = "";
   state.attachments = [];
   renderAttachments();
   resizeComposer();
+  clearDraft(session.id);
 
   try {
     const response = await bridge.apiPost("send", {
       session_id: session.id,
       message: text,
-      segments: attachments,
+      segments,
     });
     const message = response?.data
       ? normalizeMessage(response.data, session.id)
@@ -876,26 +1256,168 @@ async function sendMessage() {
             sender: "Terminal",
             sender_name: "你",
             content: text,
-            segments: [
-              ...(text ? [{ type: "text", text }] : []),
-              ...attachments,
-            ],
+            segments: [...(text ? [{ type: "text", text }] : []), ...attachments],
             timestamp: Date.now() / 1000,
             pending: true,
           },
           session.id,
         );
     applyOutgoingMessage(message);
+    cancelReply();
   } catch (error) {
-    elements.input.value = text;
-    state.attachments = attachments;
-    renderAttachments();
-    resizeComposer();
+    // 失败不回滚：留一条可重试的本地气泡，消息内容不能凭空消失
+    const failed = normalizeMessage(
+      {
+        id: null,
+        session_id: session.id,
+        type: "sent",
+        sender: "Terminal",
+        sender_name: "你",
+        content: text,
+        segments: [...(text ? [{ type: "text", text }] : []), ...attachments],
+        timestamp: Date.now() / 1000,
+        failed: true,
+      },
+      session.id,
+    );
+    failed.retryPayload = { message: text, segments };
+    addLocalMessage(failed, { scrollToBottom: true });
     toast(`发送失败: ${errorText(error)}`, "error");
-    elements.input.focus();
   } finally {
     state.sending = false;
     updateSendState();
+  }
+}
+
+async function retryMessage(message) {
+  if (state.sending || !message.retryPayload) return;
+  const payload = message.retryPayload;
+  state.sending = true;
+  updateSendState();
+  try {
+    const response = await bridge.apiPost("send", {
+      session_id: message.sessionId,
+      message: payload.message,
+      segments: payload.segments,
+    });
+    removeMessageByKey(message.sessionId, messageKey(message));
+    if (response?.data) {
+      applyOutgoingMessage(normalizeMessage(response.data, message.sessionId));
+    }
+    toast("已重新发送");
+  } catch (error) {
+    toast(`重试失败: ${errorText(error)}`, "error");
+  } finally {
+    state.sending = false;
+    updateSendState();
+  }
+}
+
+/** 本地（未落库）消息：发送失败的气泡走这里，不推进会话计数与预览。 */
+function addLocalMessage(message, { scrollToBottom: shouldScroll = false } = {}) {
+  const messages = state.messages.get(message.sessionId) || [];
+  state.messages.set(message.sessionId, mergeMessages(messages, [message]));
+  if (message.sessionId === state.currentSessionId) {
+    renderMessages({ scrollToBottom: shouldScroll });
+  }
+}
+
+function removeMessageByKey(sessionId, key) {
+  const messages = state.messages.get(sessionId);
+  if (!Array.isArray(messages)) return;
+  const next = messages.filter((item) => messageKey(item) !== key);
+  if (next.length === messages.length) return;
+  state.messages.set(sessionId, next);
+  if (sessionId === state.currentSessionId) renderMessages();
+}
+
+// ── 引用回复 ────────────────────────────────────────────────
+
+/** 只有平台真实消息 id 能引用；AstrBot 历史导入的 astrbot:<id> 是本地合成 id。 */
+function isQuotableId(value) {
+  const id = String(value || "");
+  return Boolean(id) && !id.startsWith("astrbot:");
+}
+
+function startReply(message) {
+  const sessionId = state.currentSessionId;
+  if (!sessionId || !isQuotableId(message?.platformMessageId)) return;
+  const preview = messageText(message).replace(/\s+/g, " ").slice(0, 60);
+  state.replyTo = {
+    sessionId,
+    target: message.platformMessageId,
+    senderName: message.senderName || "对方",
+    text: preview || "[消息]",
+  };
+  renderReplyPreview();
+  elements.input.focus();
+}
+
+function renderReplyPreview() {
+  const reply = state.replyTo;
+  elements.replyPreview.hidden = !reply;
+  if (!reply) return;
+  elements.replyPreviewName.textContent = reply.senderName;
+  elements.replyPreviewText.textContent = reply.text;
+}
+
+function cancelReply() {
+  if (!state.replyTo) return;
+  state.replyTo = null;
+  renderReplyPreview();
+}
+
+// ── 草稿 ────────────────────────────────────────────────────
+
+let draftTimer = 0;
+
+function draftStorageKey(sessionId) {
+  return `${DRAFT_KEY}:${sessionId}`;
+}
+
+function scheduleDraftSave() {
+  if (draftTimer) window.clearTimeout(draftTimer);
+  const sessionId = state.currentSessionId;
+  draftTimer = window.setTimeout(() => {
+    draftTimer = 0;
+    // 切换会话时 selectSession 已经同步存过旧草稿，这里只处理没切走的情况
+    if (state.currentSessionId === sessionId) saveDraft(sessionId);
+  }, 400);
+}
+
+function saveDraft(sessionId) {
+  if (!sessionId) return;
+  const text = elements.input.value;
+  if (!text.trim()) {
+    clearDraft(sessionId);
+    return;
+  }
+  state.drafts.set(sessionId, text);
+  try {
+    window.localStorage.setItem(draftStorageKey(sessionId), text);
+  } catch {
+    // iframe 沙箱里 localStorage 可能不可用，内存里的 drafts 仍然生效
+  }
+}
+
+function readDraft(sessionId) {
+  if (!sessionId) return "";
+  if (state.drafts.has(sessionId)) return state.drafts.get(sessionId);
+  try {
+    return window.localStorage.getItem(draftStorageKey(sessionId)) || "";
+  } catch {
+    return "";
+  }
+}
+
+function clearDraft(sessionId) {
+  const id = sessionId || state.currentSessionId;
+  if (!id) return;
+  state.drafts.delete(id);
+  try {
+    window.localStorage.removeItem(draftStorageKey(id));
+  } catch {
+    // 同上
   }
 }
 
@@ -1072,12 +1594,21 @@ async function jumpToMessage(message) {
   const selector = message.id ? `[data-message-id="${CSS.escape(String(message.id))}"]` : "";
   let target = selector ? elements.messageContent.querySelector(selector) : null;
 
+  // 虚拟滚动下目标可能还没渲染：直接按 plan 里的位置滚过去再取节点
+  if (!target && state.virtual && selector) {
+    target = scrollVirtualWindowToMessage(message);
+  }
+
   // 目标不在当前窗口时，继续向前翻页直到命中或到底
   for (let attempt = 0; attempt < 6 && !target; attempt += 1) {
     const history = state.history.get(sessionId);
     if (!history?.hasMore) break;
     await loadOlderMessages();
     target = selector ? elements.messageContent.querySelector(selector) : null;
+  }
+
+  if (!target && state.virtual && selector) {
+    target = scrollVirtualWindowToMessage(message);
   }
 
   if (target) {
@@ -1090,6 +1621,28 @@ async function jumpToMessage(message) {
 }
 
 // ── 消息操作 ────────────────────────────────────────────────
+
+/** 把虚拟窗口滚到指定消息所在的位置，返回渲染出来的节点（找不到返回 null）。 */
+function scrollVirtualWindowToMessage(message) {
+  const session = state.sessions.get(state.currentSessionId);
+  const plan = state.renderPlan;
+  if (!session || !plan.length) return null;
+  const index = plan.findIndex(
+    (item) => item.kind === "message" && String(item.message?.id) === String(message.id),
+  );
+  if (index < 0) return null;
+
+  const forecast = averageMessageHeight();
+  let offset = 0;
+  for (let cursor = 0; cursor < index; cursor += 1) {
+    offset += state.heights.get(plan[cursor].key) || forecast;
+  }
+  elements.messages.scrollTop = offset;
+  renderVirtualWindow({ session, plan, pinToEnd: false });
+  return elements.messageItems.querySelector(
+    `[data-message-id="${CSS.escape(String(message.id))}"]`,
+  );
+}
 
 async function deleteMessage(message) {
   if (!message.id) return;
@@ -1491,12 +2044,28 @@ function disposeStream() {
  * 这里超过 45 秒没收到任何帧就主动重连。
  */
 function checkStreamHealth() {
-  if (!state.stream || !state.connected || !state.lastStreamAt) return;
-  if (Date.now() - state.lastStreamAt < STREAM_STALE_MS) return;
-  console.warn("SSE 心跳超时，主动重连");
-  setStatus("正在重连", "loading");
-  state.connected = false;
-  connectStream();
+  // ① SSE 已连上但心跳假死：主动重连
+  if (state.stream && state.connected && state.lastStreamAt) {
+    if (Date.now() - state.lastStreamAt < STREAM_STALE_MS) return;
+    console.warn("SSE 心跳超时，主动重连");
+    setStatus("正在重连", "loading");
+    state.connected = false;
+    connectStream();
+    return;
+  }
+  // ② 正在轮询降级：每隔 SSE_RETRY_MS 再试一次 SSE。
+  // 不这样做的话，一旦降级就永远停在轮询——SSE 恢复（插件重载、临时断网结束）
+  // 也回不来，违背「尽量走 SSE」。重试期间状态保持「轮询连接」，成功后自然切回。
+  if (state.polling && !state.connected) {
+    const now = Date.now();
+    if (!state.lastSseRetryAt) {
+      state.lastSseRetryAt = now;
+      return;
+    }
+    if (now - state.lastSseRetryAt < SSE_RETRY_MS) return;
+    state.lastSseRetryAt = now;
+    connectStream();
+  }
 }
 
 function safeParse(text) {
@@ -1573,12 +2142,9 @@ function handleIncomingMessage(raw) {
   if (isCurrent) {
     elements.detailCount.textContent = String(session.messageCount);
     renderParticipants(session);
-    renderMessages();
+    renderMessages({ scrollToBottom: shouldFollow });
     if (shouldFollow) {
-      requestAnimationFrame(() => {
-        scrollToBottom(false);
-        markCurrentSessionRead();
-      });
+      markCurrentSessionRead();
     } else {
       elements.messages.scrollTop = previousTop;
       state.unread.set(sessionId, (state.unread.get(sessionId) || 0) + 1);
@@ -1748,15 +2314,29 @@ function toggleDetails(open) {
   elements.btnDetails.setAttribute("aria-expanded", state.detailsOpen ? "true" : "false");
 }
 
-function openLightbox(src) {
+function openLightbox(src, source = "") {
+  const original = String(source || "");
+  const isLink = /^https?:\/\//i.test(original);
+  state.lightboxSource = isLink ? original : "";
+
   elements.lightboxImage.src = src;
   elements.lightbox.hidden = false;
+
+  // 图片走 /media 代理，浏览器地址栏拿不到原图地址，这里显式给出来
+  elements.lightboxCaption.hidden = !original;
+  elements.lightboxLink.textContent = isLink ? original : "本地上传的图片";
+  elements.lightboxLink.title = original;
+  elements.btnCopyImageLink.hidden = !isLink;
+  elements.lightboxOpen.hidden = !isLink;
+  elements.lightboxOpen.href = isLink ? original : "#";
 }
 
 function closeLightbox() {
   if (elements.lightbox.hidden) return;
   elements.lightbox.hidden = true;
   elements.lightboxImage.src = "";
+  state.lightboxSource = "";
+  elements.lightboxCaption.hidden = true;
 }
 
 function setStatus(text, mode = "default") {
@@ -1835,6 +2415,34 @@ function formDialog({
   });
 }
 
+function infoDialog({ title, content = null }) {
+  const overlay = createElement("div", "dialog-overlay");
+  const panel = createElement("div", "dialog-panel dialog-panel-wide");
+  panel.setAttribute("role", "dialog");
+  panel.setAttribute("aria-modal", "true");
+
+  panel.append(createElement("h2", "dialog-title", title));
+  const body = createElement("div", "dialog-body");
+  if (content) body.append(content);
+  panel.append(body);
+
+  const actions = createElement("div", "dialog-actions");
+  const closeButton = createElement("button", "button button-primary", "关闭");
+  closeButton.type = "button";
+  actions.append(closeButton);
+  panel.append(actions);
+  overlay.append(panel);
+
+  const close = () => overlay.remove();
+  closeButton.addEventListener("click", close);
+  overlay.addEventListener("click", (event) => {
+    if (event.target === overlay) close();
+  });
+
+  elements.dialogRegion.append(overlay);
+  closeButton.focus();
+}
+
 function closeTopDialog() {
   const dialogs = elements.dialogRegion.querySelectorAll(".dialog-overlay");
   const last = dialogs[dialogs.length - 1];
@@ -1899,6 +2507,8 @@ function applyLoadImages(enabled, { persist = true } = {}) {
     return;
   }
   state.loadImages = next;
+  // 全局关掉 = 全部折叠：手动点开过的那些也一起收回去
+  if (!next) state.loadedImages.clear();
   if (persist) {
     try {
       window.localStorage.setItem(IMAGES_KEY, String(next));

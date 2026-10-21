@@ -137,6 +137,7 @@
           <div id="search-results" class="search-results" hidden></div>
 
           <div id="session-list" class="session-list" role="listbox" aria-label="可用会话"></div>
+          <button id="session-more" class="session-more" type="button" hidden>加载更多会话</button>
           <div id="sidebar-empty" class="sidebar-empty" hidden>
             <svg viewBox="0 0 24 24" aria-hidden="true">
               <path d="M21 15a4 4 0 0 1-4 4H8l-5 3V7a4 4 0 0 1 4-4h10a4 4 0 0 1 4 4z" />
@@ -198,7 +199,11 @@
                 <h3>选择会话开始聊天</h3>
                 <p>历史消息与实时消息会显示在这里</p>
               </div>
-              <div id="message-content"></div>
+              <div id="message-content">
+                <div id="virtual-top" class="virtual-spacer" aria-hidden="true"></div>
+                <div id="message-items"></div>
+                <div id="virtual-bottom" class="virtual-spacer" aria-hidden="true"></div>
+              </div>
             </section>
 
             <aside id="details-panel" class="details-panel" aria-label="会话详情">
@@ -236,6 +241,16 @@
               <span id="new-message-text">有新消息</span>
             </button>
 
+            <div id="reply-preview" class="reply-preview" hidden>
+              <div class="reply-preview-main">
+                <span class="reply-preview-label">回复 <b id="reply-preview-name"></b></span>
+                <span id="reply-preview-text" class="reply-preview-text"></span>
+              </div>
+              <button id="btn-reply-cancel" class="icon-button" type="button" aria-label="取消引用" title="取消引用">
+                <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M18 6 6 18M6 6l12 12" /></svg>
+              </button>
+            </div>
+
             <div id="attachment-preview" class="attachment-preview" hidden></div>
 
             <form id="composer" class="composer">
@@ -259,7 +274,16 @@
     </div>
 
     <div id="lightbox" class="lightbox" hidden role="dialog" aria-label="图片预览">
-      <img id="lightbox-image" alt="图片预览" />
+      <figure class="lightbox-figure">
+        <img id="lightbox-image" alt="图片预览" />
+        <figcaption id="lightbox-caption" class="lightbox-caption" hidden>
+          <span id="lightbox-link" class="lightbox-link"></span>
+          <span class="lightbox-actions">
+            <button id="btn-copy-image-link" type="button">复制链接</button>
+            <a id="lightbox-open" href="#" target="_blank" rel="noopener noreferrer">打开原图</a>
+          </span>
+        </figcaption>
+      </figure>
     </div>
 
     <div id="dialog-region" class="dialog-region"></div>

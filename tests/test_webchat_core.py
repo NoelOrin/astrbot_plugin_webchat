@@ -967,3 +967,179 @@ def test_recent_duplicate_ignore_sender_for_bot_echoes(store):
     assert store.has_recent_duplicate(
         "group:1", "bot-1", "还真是", 1001.0, ignore_sender=True
     ) is True
+
+
+# ── 合并转发：嵌套聊天记录 ────────────────────────────────
+
+
+class Node:
+    """宿主合并转发的单条聊天记录。"""
+
+    def __init__(self, name="", uin="", content=None):
+        self.name = name
+        self.uin = uin
+        self.content = content or []
+
+
+class Nodes:
+    """宿主合并转发容器（Nodes / Forward 组件）。"""
+
+    def __init__(self, nodes=None):
+        self.nodes = nodes or []
+
+
+class Reply:
+    def __init__(self, message_id=""):
+        self.id = message_id
+
+
+def test_forward_nodes_are_serialized_with_nested_messages():
+    seg = serialize_chain(
+        [Nodes(nodes=[Node("小明", "1001", [Plain("早")]), Node("小红", "1002", [Plain("早呀")])])]
+    )[0]
+
+    assert seg["type"] == "forward"
+    assert [m["name"] for m in seg["messages"]] == ["小明", "小红"]
+    assert seg["messages"][0]["segments"] == [{"type": "text", "text": "早"}]
+    assert seg["messages"][1]["uin"] == "1002"
+
+
+def test_forward_without_content_stays_clickable():
+    seg = serialize_chain([Nodes()])[0]
+    assert seg["type"] == "forward"
+    assert seg["messages"] == []
+
+
+def test_nested_forward_is_not_recursed_infinitely():
+    inner = Nodes(nodes=[Node("a", "1", [Plain("x")])])
+    outer = Nodes(nodes=[Node("b", "2", [inner])])
+    seg = serialize_chain([outer])[0]
+
+    assert seg["messages"][0]["segments"][0]["type"] == "forward"
+    assert "messages" not in seg["messages"][0]["segments"][0], "深层转发只展开一层"
+
+
+def test_reply_component_keeps_platform_message_id():
+    seg = serialize_chain([Reply("m-42")])[0]
+    assert seg == {"type": "reply", "target": "m-42", "text": "[引用]"}
+
+
+def test_onebot_forward_payload_converts_to_messages():
+    payload = {
+        "messages": [
+            {
+                "sender": {"nickname": "小明", "user_id": 42},
+                "message": [
+                    {"type": "text", "data": {"text": "hi"}},
+                    {"type": "image", "data": {"url": "http://x/a.png"}},
+                ],
+            },
+            {"sender": {"nickname": "小红"}, "message": [{"type": "at", "data": {"qq": "42"}}]},
+        ]
+    }
+    messages = webchat_core.onebot_forward_to_messages(payload)
+
+    assert [m["name"] for m in messages] == ["小明", "小红"]
+    assert messages[0]["uin"] == "42"
+    assert messages[0]["segments"][1]["url"] == "http://x/a.png"
+    assert messages[1]["segments"][0]["target"] == "42"
+
+
+def test_onebot_forward_payload_tolerates_garbage():
+    assert webchat_core.onebot_forward_to_messages(None) == []
+    assert webchat_core.onebot_forward_to_messages({"messages": "x"}) == []
+    assert webchat_core.onebot_forward_to_messages({}) == []
+
+    broken = webchat_core.onebot_forward_to_messages(
+        {"messages": [{"sender": None, "message": "bad"}, {"message": []}]}
+    )
+    assert broken[0]["segments"] == []
+
+
+# ── 引用：按平台消息 id 找回被引用的内容 ──────────────────
+
+
+def test_quote_of_returns_sender_and_text(store):
+    store.init_schema()
+    store.add_message(
+        "group:1",
+        {"type": "received", "sender": "小明", "sender_id": "u1", "content": "原消息",
+         "platform_message_id": "m-1", "timestamp": 1000.0},
+    )
+
+    quote = store.quote_of("group:1", "m-1")
+
+    assert quote["sender"] == "小明"
+    assert quote["text"] == "原消息"
+
+
+def test_quote_of_missing_or_fake_id_returns_none(store):
+    store.init_schema()
+    assert store.quote_of("group:1", "nope") is None
+    assert store.quote_of("group:1", "") is None
+    assert store.quote_of("group:1", "astrbot:42") is None
+
+
+def test_quote_of_truncates_long_content(store):
+    store.init_schema()
+    store.add_message(
+        "group:1",
+        {"type": "received", "sender": "小明", "content": "长" * 500,
+         "platform_message_id": "m-2", "timestamp": 1000.0},
+    )
+
+    quote = store.quote_of("group:1", "m-2")
+
+    assert len(quote["text"]) <= 120
+
+
+# ── 合并转发：不同宿主形态 ────────────────────────────────
+
+
+def test_single_node_is_one_chat_record():
+    seg = serialize_chain([Node("小明", "1001", [Plain("单条")])])[0]
+
+    assert seg["type"] == "forward"
+    assert len(seg["messages"]) == 1
+    assert seg["messages"][0]["segments"] == [{"type": "text", "text": "单条"}]
+
+
+def test_node_with_only_forward_id_is_clickable():
+    class Node:
+        def __init__(self, forward_id=""):
+            self.id = forward_id
+
+    seg = serialize_chain([Node("f-9")])[0]
+
+    assert seg["id"] == "f-9"
+    assert seg["messages"] == []
+
+
+def test_forward_id_can_come_from_data_dict():
+    class Node:
+        def __init__(self):
+            self.data = {"id": "f-10"}
+
+    seg = serialize_chain([Node()])[0]
+    assert seg["id"] == "f-10"
+
+
+def test_extract_forward_ids_from_onebot_event():
+    raw = {
+        "message": [{"type": "forward", "data": {"id": "f-1"}}],
+        "raw_message": "[CQ:forward,id=f-2]",
+    }
+    assert webchat_core.extract_forward_ids(raw) == ["f-1", "f-2"]
+
+
+def test_extract_forward_ids_from_list_and_string():
+    assert webchat_core.extract_forward_ids(
+        [{"type": "forward", "data": {"id": "f-3"}}]
+    ) == ["f-3"]
+    assert webchat_core.extract_forward_ids("[CQ:forward,id=f-4]") == ["f-4"]
+
+
+def test_extract_forward_ids_tolerates_garbage():
+    assert webchat_core.extract_forward_ids(None) == []
+    assert webchat_core.extract_forward_ids({"message": "x"}) == []
+    assert webchat_core.extract_forward_ids("[CQ:image,file=a.jpg]") == []

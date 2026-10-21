@@ -28,7 +28,7 @@ AstrBot 插件，提供一个 Web 终端 UI，通过 AstrBot 消息平台**双�
   - `on_message()` → `_record_inbound()`：入站消息入库并广播
   - `on_bot_message_sent()`（`@filter.after_message_sent()`）：出站消息入库
   - `_ensure_session()`：幂等注册会话，新会话广播 `session` 事件
-  - 16 个 REST 端点，见 `_register_web_apis()` 的 routes 列表
+  - 17 个 REST 端点，见 `_register_web_apis()` 的 routes 列表
   - `_sse_broadcast()` / `_broadcast_soon()`：SSE 广播（后者在无事件循环时安全降级）
   - `terminate()`：清理 SSE 与缓存
 - **数据存储**: `data/plugin_data/astrbot_plugin_webchat/astrbot_plugin_webchat.db`
@@ -154,6 +154,74 @@ after_message_sent 钩子 → on_bot_message_sent()
 节点签名包含 type / timestamp / senderName / content / segments 长度 / pending，
 任一变化都会触发 rebuild。`state.renderPlan` 缓存上一轮计划，
 `state.renderSessionId` 用于切换会话时强制重建。
+
+## 虚拟滚动（消息列表）
+
+plan 超过 `VIRTUAL_THRESHOLD`（80）时只渲染视口附近的一段节点：
+
+- `#message-content` 结构固定为 `#virtual-top`（spacer）+ `#message-items` + `#virtual-bottom`
+- `computeWindow()`（webchat-lib，纯函数）按「实测行高 + 估算行高」算出 `{start, end, topPad, bottomPad}`
+- 行高渲染后回写到 `state.heights`（key = plan item key），图片加载/窗口 resize 后下次滚动自然重算
+- 滚动用 rAF 节流；贴底时 `pinToEnd` 让窗口钉在尾部
+- 小会话（≤80 条）仍走 `diffPlan` 全量增量渲染，行为与旧版一致
+
+> ⚠️ 所有 DOM 操作的目标是 `#message-items`，**不是** `#message-content`。
+> spacer 是 `#message-content` 的固定子节点，`diffPlan` 的 append/truncate 若作用在
+> `#message-content` 上会把 spacer 一起删掉，滚动高度立刻归零。
+> `dom-smoke` 的「增量渲染复用已有节点」断言依赖 `#message-items`。
+
+> ⚠️ `loadOlderMessages()` 在虚拟滚动下必须**先把 `scrollTop` 抬高新插入内容的估算高度**
+> 再 render，否则窗口会按旧位置重算，视口内容整体错位。
+
+## 引用回复
+
+- 悬停消息 →「引用」→ 输入框上方出现引用条；发送时 segments 首部插入
+  `{type: "reply", target: <platform_message_id>, text: <预览>}`
+- 入站 / Bot 出站的 reply 片段会由 `_enrich_reply_quotes()` 补上
+  `quote: {sender, text}`（`store.quote_of()` 按 platform_message_id 反查，截 120 字）；
+  前端渲染成「回复 小明：…」引用块，查不到时退回本地缓存或占位提示
+- 后端 `_build_chain()` 用宿主 `Reply(id=…)` 还原；宿主没有该组件、或 target 是
+  `astrbot:<id>`（历史导入的本地合成 id）时静默降级为普通消息
+- `api_send` 把 reply 片段提到链首（协议端按链首识别回复关系）
+- 只剩 Reply 的链会补 `\u200b` 明文段，否则宿主 respond 阶段整条丢弃
+- `_send_fingerprint()` **忽略** reply 片段：不同适配器回推时可能剥掉 Reply，
+  参与比较反而会把同一条记成 `sent` + `bot` 两份
+
+## 失败重发与会话草稿
+
+- 发送失败不再回滚消失：本地留一条 `failed: true` 的气泡，带「重试 / 丢弃」
+- 重试复用原 payload（`message.retryPayload`），成功后移除本地行并插入服务端返回行
+- 草稿：输入防抖 400ms 写 `localStorage`（`astrbot_plugin_webchat_draft:<sessionId>`），
+  切会话时同步保存/恢复，发送成功清除；localStorage 不可用时退化为 `state.drafts` 内存表
+- 附件（dataURL）体积大，不持久化
+
+## 会话列表分页
+
+- `GET /sessions?limit=&offset=` 返回 `{sessions, total, has_more}`；不传 `limit` 仍返回全量
+- 排序为「置顶 → 最近活跃 → 会话键」，分页切片稳定，不会因并列项抖动而重复/漏项
+- 前端首屏 `SESSION_PAGE_SIZE`（50）条，列表底部「加载更多会话」+ 触底自动补页
+- 首页加载才清理已删除会话缓存；翻页只做追加，不能把别的页删掉
+
+## 合并转发（聊天记录）
+
+- `serialize_component()` 兼容宿主的三种形态：
+  - **单个 `Node`**：本身是一条聊天记录，`content` 是消息组件列表
+  - **`Nodes` / `Forward` 容器**：`nodes` / `content` 是一组 `Node`
+  - **只有 id**：内容留给点开时再拉
+  统一序列化成 `{type:"forward", text:"[聊天记录]", id?, messages:[{name, uin, segments}]}`
+- `_component_kind()` 会把 Node/Nodes/Forward 归一成 `forward`，判断「单个 Node」必须看
+  `type(component).__name__.lower() == "node"`，否则会把它当容器、把组件当聊天记录
+- 宿主组件丢 id 时，`_attach_forward_ids()` 从 `message_obj.raw_message` 的 OneBot 段 /
+  CQ 码（`[CQ:forward,id=…]`）里把 id 捞回来（`webchat_core.extract_forward_ids`）
+- 点 chip 时：有内嵌 `messages` 直接展示；只有 id 则调 `GET /forward?session_id=&id=`，
+  后端 `_fetch_forward_messages()` 尽力调 `get_forward_msg`，失败返回空列表
+- 前端 `infoDialog()` 渲染只读详情，Esc / 点遮罩 / 「关闭」都能退出
+- 有结构化片段（@/表情/语音/文件/转发）时，气泡正文**不再**回退显示 `messageText()`
+  的占位文案，避免「[合并转发]」在 chip 和正文里各出现一次
+
+> ⚠️ 加这个功能**之前**入库的转发记录只存了 `[合并转发]` 文案，没有 id、没有嵌套内容，
+> 永远无法展开；只有新入库的转发才能点开。别为了「修旧数据」去拿 `platform_message_id`
+> 当转发 id，两者不是一回事。
 
 ## 群聊会话合并
 
@@ -286,6 +354,18 @@ SSE 不可用时前端每 2.5 秒拉一次 `GET /updates?after_id=<全局消息 
   否则可能跳过并发插入的那几条（`startPolling()` 时用 `maxKnownMessageId()` 起跳）
 - 后端按 `MAX_PAGE_SIZE` 分页，返回 `has_more`；前端最多连续补拉 `POLL_MAX_DRAIN` 次
 
+> ⚠️ **不要在 `selectSession()` 里因为 `state.connected === false` 就 `startPolling()`。**
+> `boot()` 的顺序是「先 `loadSessions()`（内部会选初始会话），再 `connectStream()`」，
+> 选会话时 SSE 还没开始连，`connected` 必然是 `false`。在这里兜底轮询会让终端
+> **一启动就降级轮询**，之后即使 SSE 连上，第一轮轮询也已经白跑。
+> 轮询只由流生命周期触发：连接超时 / `onError` / `onerror` / 心跳假死时各自调用。
+> `dom-smoke` 的「启动阶段不提前降级轮询」守着这条。
+
+> ⚠️ **降级轮询不是终点。** SSE 不可用而进入轮询后，`checkStreamHealth()` 每
+> `SSE_RETRY_MS`（60 秒）会再 `connectStream()` 试一次 SSE——插件重载、临时断网结束、
+> 反向代理恢复后都能自动切回实时推送，而不是永久停在 2.5 秒轮询上。
+> 重试期间状态保持「轮询连接」，SSE 一旦 `onOpen` 就 `stopPolling()` 并显示「实时连接」。
+
 
 ## 前端约束（iframe 沙箱）
 
@@ -321,9 +401,15 @@ SSE 不可用时前端每 2.5 秒拉一次 `GET /updates?after_id=<全局消息 
 - 工具栏 `#btn-images` 是全局开关，`aria-pressed` 反映状态，记忆在 localStorage
 - 插件配置 `load_images`（默认 false）只作为**初始默认值**；用户手动切过就以本地记忆为准
 - 前端从 `/health` 的 `load_images` 读默认值，只读一次（`syncImagePreferenceFromConfig`）
+- 图片走 `/media` 代理，浏览器地址栏只有代理地址；大图预览底部固定显示**原始链接**
+  （`#lightbox-link`），并提供「复制链接 / 打开原图」，原始地址存在 `state.lightboxSource`
 
 > ⚠️ 占位**不能**写成 `<img src=… >` + CSS 隐藏——浏览器照样会下载，等于没省。
 > `dom-smoke.mjs` 里 `默认不自动渲染图片` 这条断言就是防这个的。
+
+> ⚠️ 手动点开的图片必须记在 `state.loadedImages`（按图片地址），**不能只 replaceWith 改 DOM**。
+> 虚拟滚动的窗口每次重渲染都会 `replaceChildren`，DOM-only 的「已加载」状态会立刻丢失，
+> 图片被打回占位。工具栏整体关掉时才清空这个集合（关闭 = 全部折叠）。
 
 ## 平台支持范围
 

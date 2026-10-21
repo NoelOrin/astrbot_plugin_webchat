@@ -90,6 +90,17 @@ class FakeRecord:
         self.file = file
 
 
+class Node:
+    """宿主合并转发的单条聊天记录。"""
+
+    def __init__(self, name="", uin="", content=None, forward_id=None):
+        self.name = name
+        self.uin = uin
+        self.content = content or []
+        if forward_id is not None:
+            self.id = forward_id
+
+
 class At:
     """宿主 At 组件。类名必须是 At——片段类型按类名判定。"""
 
@@ -1408,3 +1419,294 @@ def test_health_exposes_load_images_default_off():
     # 配置里显式打开时如实反映
     plugin.config["load_images"] = True
     assert _run(plugin.api_health())["load_images"] is True
+
+
+# ── 引用回复 ─────────────────────────────────────────────
+
+
+def test_terminal_send_with_reply_builds_reply_component(plugin, monkeypatch):
+    inbound(plugin, umo="aiocqhttp:GroupMessage:1", group_id="1",
+            sender_id="u1", sender_name="小明", text="原消息")
+
+    _send(
+        plugin, monkeypatch, "group:1", "同意",
+        [{"type": "reply", "target": "m-42", "text": "原消息"}],
+    )
+
+    _, chain = plugin.context.sent[-1]
+    assert [type(c).__name__ for c in chain.chain] == ["Reply", "FakePlain"]
+    assert chain.chain[0].id == "m-42"
+    assert chain.chain[1].text == "同意"
+
+
+def test_terminal_send_with_reply_is_not_recorded_twice(plugin, monkeypatch):
+    """引用回复经过出站钩子时，指纹必须把 reply 折成同一个 key。"""
+    inbound(plugin, umo="aiocqhttp:GroupMessage:1", group_id="1",
+            sender_id="u1", sender_name="小明", text="原消息")
+
+    _send(
+        plugin, monkeypatch, "group:1", "同意",
+        [{"type": "reply", "target": "m-42", "text": "原消息"}],
+    )
+    target, chain = plugin.context.sent[-1]
+
+    echo = FakeEvent(umo=target, group_id="1", chain=list(chain.chain))
+    _run(plugin.on_bot_message_sent(echo))
+
+    sent = [m for m in plugin.store.query_messages("group:1") if m["type"] == "sent"]
+    assert len(sent) == 1, "引用回复被平台回声记成了两份"
+
+
+def test_terminal_send_without_reply_component_degrades_to_text(plugin, monkeypatch):
+    """老宿主没有 Reply 组件时，消息必须照常发出去，不能 500。"""
+    import sys
+
+    comp = sys.modules["astrbot.api.message_components"]
+    monkeypatch.delattr(comp, "Reply", raising=False)
+    inbound(plugin, umo="aiocqhttp:GroupMessage:1", group_id="1",
+            sender_id="u1", sender_name="小明", text="原消息")
+
+    payload = _send(plugin, monkeypatch, "group:1", "同意",
+                    [{"type": "reply", "target": "m-42", "text": "原消息"}])
+
+    assert payload.get("status") == "ok", payload
+    _, chain = plugin.context.sent[-1]
+    assert [type(c).__name__ for c in chain.chain] == ["FakePlain"]
+    assert chain.chain[0].text == "同意"
+
+
+def test_reply_only_chain_gets_zero_width_text(plugin, monkeypatch):
+    """只引用不写字时，消息链只剩 Reply，宿主会静默丢弃，必须补明文段。"""
+    inbound(plugin, umo="aiocqhttp:GroupMessage:1", group_id="1",
+            sender_id="u1", sender_name="小明", text="原消息")
+
+    _send(plugin, monkeypatch, "group:1", "",
+          [{"type": "reply", "target": "m-42", "text": "原消息"}])
+
+    _, chain = plugin.context.sent[-1]
+    names = [type(c).__name__ for c in chain.chain]
+    assert names == ["Reply", "FakePlain"], names
+    assert chain.chain[1].text == "\u200b"
+
+
+# ── 会话列表分页 ──────────────────────────────────────────
+
+
+def _call_sessions(plugin, monkeypatch, **args):
+    import main as main_module
+
+    monkeypatch.setattr(
+        main_module,
+        "request",
+        types.SimpleNamespace(args={k: str(v) for k, v in args.items()}, method="GET"),
+        raising=False,
+    )
+    return _run(plugin.api_sessions())
+
+
+def _seed_sessions(plugin, count):
+    for index in range(1, count + 1):
+        inbound(plugin, umo=f"aiocqhttp:GroupMessage:{index}", group_id=str(index),
+                sender_id="u1", sender_name="小明", text=f"m{index}")
+
+
+def test_sessions_supports_limit_and_offset(plugin, monkeypatch):
+    _seed_sessions(plugin, 5)
+
+    first = _call_sessions(plugin, monkeypatch, limit=2, offset=0)
+    second = _call_sessions(plugin, monkeypatch, limit=2, offset=2)
+
+    assert first["total"] == 5
+    assert first["has_more"] is True
+    assert second["has_more"] is True
+    assert len(first["sessions"]) == 2 and len(second["sessions"]) == 2
+    ids_first = {item["id"] for item in first["sessions"]}
+    ids_second = {item["id"] for item in second["sessions"]}
+    assert not ids_first & ids_second, "分页返回了重复会话"
+
+
+def test_sessions_last_page_has_no_more(plugin, monkeypatch):
+    _seed_sessions(plugin, 3)
+
+    page = _call_sessions(plugin, monkeypatch, limit=2, offset=2)
+
+    assert len(page["sessions"]) == 1
+    assert page["has_more"] is False
+
+
+def test_sessions_without_limit_returns_everything(plugin, monkeypatch):
+    """不传 limit 时保持旧行为：一次返回全部，避免破坏已有调用方。"""
+    _seed_sessions(plugin, 3)
+
+    payload = _call_sessions(plugin, monkeypatch)
+
+    assert len(payload["sessions"]) == 3
+    assert payload["has_more"] is False
+
+
+# ── 转发内容按需拉取 ──────────────────────────────────────
+
+
+class _ForwardClient:
+    def __init__(self, payload=None, error=None):
+        self.payload = payload
+        self.error = error
+        self.calls = []
+
+    async def call_action(self, action, **kwargs):
+        self.calls.append((action, kwargs))
+        if self.error:
+            raise self.error
+        return self.payload
+
+
+class _ForwardInst:
+    def __init__(self, client=None, error=None):
+        self.client = client
+        self.error = error
+
+    def meta(self):
+        return types.SimpleNamespace(id="aiocqhttp-inst", name="aiocqhttp")
+
+    def get_client(self):
+        if self.error:
+            raise self.error
+        return self.client
+
+
+def _call_forward(plugin, monkeypatch, **args):
+    import main as main_module
+
+    monkeypatch.setattr(
+        main_module,
+        "request",
+        types.SimpleNamespace(args={k: str(v) for k, v in args.items()}, method="GET"),
+        raising=False,
+    )
+    return _run(plugin.api_forward())
+
+
+def _plugin_with_forward_inst(plugin, inst):
+    plugin.context.platform_manager.get_insts = lambda: [inst]
+    inbound(plugin, umo="aiocqhttp:GroupMessage:1", group_id="1",
+            sender_id="u1", sender_name="小明", text="转发来了")
+    return plugin
+
+
+def test_forward_endpoint_fetches_nested_messages(plugin, monkeypatch):
+    client = _ForwardClient(payload={"messages": [
+        {"sender": {"nickname": "小明", "user_id": 42},
+         "message": [{"type": "text", "data": {"text": "早"}}]},
+    ]})
+    _plugin_with_forward_inst(plugin, _ForwardInst(client=client))
+
+    payload = _call_forward(plugin, monkeypatch, session_id="group:1", id="f-1")
+
+    assert payload["available"] is True
+    assert payload["messages"][0]["segments"] == [{"type": "text", "text": "早"}]
+    action, kwargs = client.calls[0]
+    assert action == "get_forward_msg"
+    assert kwargs.get("message_id") == "f-1"
+
+
+def test_forward_endpoint_degrades_gracefully(plugin, monkeypatch):
+    """协议端不支持拉取时返回空内容，前端显示「内容不可用」而不是报错。"""
+    _plugin_with_forward_inst(plugin, _ForwardInst(error=RuntimeError("协议端不支持")))
+
+    payload = _call_forward(plugin, monkeypatch, session_id="group:1", id="f-1")
+
+    assert payload["available"] is False
+    assert payload["messages"] == []
+
+
+def test_forward_endpoint_rejects_unknown_session(plugin, monkeypatch):
+    response = _call_forward(plugin, monkeypatch, session_id="group:404", id="f-1")
+    assert response[1] == 404
+
+
+def test_terminal_send_ignores_synthetic_reply_id(plugin, monkeypatch):
+    """astrbot:<id> 是历史导入的本地合成 id，拿去引用平台会报错。"""
+    inbound(plugin, umo="aiocqhttp:GroupMessage:1", group_id="1",
+            sender_id="u1", sender_name="小明", text="原消息")
+
+    _send(
+        plugin, monkeypatch, "group:1", "同意",
+        [{"type": "reply", "target": "astrbot:42", "text": "原消息"}],
+    )
+
+    _, chain = plugin.context.sent[-1]
+    assert [type(c).__name__ for c in chain.chain] == ["FakePlain"]
+
+
+def test_reply_echo_without_reply_component_is_not_duplicated(plugin, monkeypatch):
+    """有的适配器回推时会剥掉 Reply，指纹不能依赖它，否则同一条记两份。"""
+    inbound(plugin, umo="aiocqhttp:GroupMessage:1", group_id="1",
+            sender_id="u1", sender_name="小明", text="原消息")
+
+    _send(
+        plugin, monkeypatch, "group:1", "同意",
+        [{"type": "reply", "target": "m-42", "text": "原消息"}],
+    )
+    target, _ = plugin.context.sent[-1]
+
+    echo = FakeEvent(umo=target, group_id="1", chain=[FakePlain("同意")])
+    _run(plugin.on_bot_message_sent(echo))
+
+    sent = [m for m in plugin.store.query_messages("group:1") if m["type"] == "sent"]
+    assert len(sent) == 1
+
+
+def test_inbound_reply_is_enriched_with_quoted_message(plugin):
+    """收到「回复某条」时，片段里要带上被引用消息的昵称与内容，否则前端只能显示 [引用]。"""
+    inbound(plugin, umo="aiocqhttp:GroupMessage:1", group_id="1",
+            sender_id="u1", sender_name="小明", text="原消息", message_id="m-1")
+
+    plugin._record_inbound(FakeEvent(
+        umo="aiocqhttp:GroupMessage:1", group_id="1",
+        sender_id="u2", sender_name="小红", text="同意",
+        chain=[Reply(id="m-1"), FakePlain("同意")], message_id="m-2",
+    ))
+
+    stored = plugin.store.query_messages("group:1")[-1]
+    reply = stored["segments"][0]
+    assert reply["type"] == "reply"
+    assert reply["quote"] == {"sender": "小明", "text": "原消息"}
+
+
+def test_inbound_reply_to_missing_message_has_no_quote(plugin):
+    plugin._record_inbound(FakeEvent(
+        umo="aiocqhttp:GroupMessage:1", group_id="1",
+        sender_id="u2", sender_name="小红", text="同意",
+        chain=[Reply(id="m-404"), FakePlain("同意")], message_id="m-2",
+    ))
+
+    stored = plugin.store.query_messages("group:1")[-1]
+    assert "quote" not in stored["segments"][0]
+
+
+def test_inbound_forward_expands_single_node(plugin):
+    """单个 Node 就是一条聊天记录，内容要展开存下来。"""
+    plugin._record_inbound(FakeEvent(
+        umo="aiocqhttp:GroupMessage:1", group_id="1",
+        sender_id="u1", sender_name="小明", text="",
+        chain=[Node("小红", "1002", [FakePlain("早")])], message_id="m-9",
+    ))
+
+    segment = plugin.store.query_messages("group:1")[-1]["segments"][0]
+    assert segment["type"] == "forward"
+    assert segment["messages"][0]["segments"] == [{"type": "text", "text": "早"}]
+
+
+def test_inbound_forward_id_falls_back_to_raw_message(plugin):
+    """宿主 Node 没带 id 时，从原始 CQ 码里把转发 id 捞回来，否则点开看不到内容。"""
+    event = FakeEvent(
+        umo="aiocqhttp:GroupMessage:1", group_id="1",
+        sender_id="u1", sender_name="小明", text="",
+        chain=[Node()], message_id="m-10",
+    )
+    event.message_obj.raw_message = {"raw_message": "[CQ:forward,id=f-10]"}
+
+    plugin._record_inbound(event)
+
+    segment = plugin.store.query_messages("group:1")[-1]["segments"][0]
+    assert segment["id"] == "f-10"
