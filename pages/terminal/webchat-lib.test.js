@@ -36,6 +36,8 @@ import {
   str,
   stripMentionMarkup,
   unreadLabel,
+  windowAnchor,
+  anchorScrollTop,
 } from "./webchat-lib.js";
 
 const T = 1700000000; // 固定时间戳，避免测试依赖当前时间
@@ -433,7 +435,7 @@ test("diffPlan 首次渲染走 append（旧计划为空）", () => {
 
 test("computeWindow 空列表返回空窗口", () => {
   assert.deepEqual(computeWindow({ count: 0 }), {
-    start: 0, end: 0, topPad: 0, bottomPad: 0,
+    start: 0, end: 0, topPad: 0, bottomPad: 0, offsets: [0],
   });
 });
 
@@ -486,7 +488,104 @@ test("computeWindow 条数少于 minRender 时全部渲染", () => {
     count: 3, heights: [], scrollTop: 0, viewport: 300,
     forecast: 100, minRender: 5,
   });
-  assert.deepEqual(win, { start: 0, end: 3, topPad: 0, bottomPad: 0 });
+  assert.deepEqual(win, { start: 0, end: 3, topPad: 0, bottomPad: 0, offsets: [0, 100, 200, 300] });
+});
+
+test("computeWindow 返回累计偏移，供滚动锚点定位", () => {
+  const win = computeWindow({
+    count: 3, heights: [10, 20, 30], scrollTop: 0, viewport: 100,
+    forecast: 10, overscan: 0, minRender: 1,
+  });
+  assert.deepEqual(win.offsets, [0, 10, 30, 60]);
+});
+
+test("windowAnchor 找出视口顶部落在哪一项、项内偏移多少", () => {
+  const offsets = [0, 100, 250, 400];
+  assert.deepEqual(windowAnchor(offsets, 0), { index: 0, delta: 0 });
+  assert.deepEqual(windowAnchor(offsets, 120), { index: 1, delta: 20 });
+  assert.deepEqual(windowAnchor(offsets, 250), { index: 2, delta: 0 });
+  // 滚过末尾时钉在最后一项，不能算出界索引
+  assert.deepEqual(windowAnchor(offsets, 9999), { index: 2, delta: 9749 });
+  assert.equal(windowAnchor([], 100), null);
+});
+
+test("anchorScrollTop 用实测高度把锚点放回原位，抵消估算误差", () => {
+  // 窗口从第 10 项开始；锚点在第 14 项、项内偏移 50。
+  // 估算（forecast=100）时锚点应在 1000 + 400 + 50；
+  // 但前四项实测是 60/60/380/60，真实位置必须按实测算。
+  const heights = new Array(10).fill(0).concat([60, 60, 380, 60]);
+  assert.equal(
+    anchorScrollTop({ topPad: 1000, start: 10, index: 14, heights, forecast: 100, delta: 50 }),
+    1000 + 560 + 50,
+  );
+  // 没测过的高度退回估算值，不能当 0 算短
+  assert.equal(
+    anchorScrollTop({ topPad: 0, start: 0, index: 2, heights: [0, 40], forecast: 90, delta: 0 }),
+    40 + 90,
+  );
+  // 锚点就在窗口顶部时位置就是 topPad
+  assert.equal(
+    anchorScrollTop({ topPad: 700, start: 12, index: 12, heights: [], forecast: 90, delta: 0 }),
+    700,
+  );
+});
+
+test("窗口平移时按锚点回正，内容不会跳一大截", () => {
+  // 200 条消息，每 9 条一张大图：估算高度和实测差得远，正是以前「跳一大截」的场景
+  const count = 200;
+  const realHeights = Array.from({ length: count }, (_, index) => (index % 9 === 4 ? 380 : 62));
+  const measured = new Array(count).fill(0);
+  const forecast = () => {
+    const known = measured.filter((height) => height > 0);
+    if (!known.length) return 56;
+    return Math.max(24, known.reduce((sum, height) => sum + height, 0) / known.length);
+  };
+  const layoutTop = (win, index) => {
+    let top = win.topPad;
+    for (let cursor = win.start; cursor < index; cursor += 1) top += measured[cursor] || forecast();
+    return top;
+  };
+  // 和 app.js 的 renderVirtualWindow 同序：算窗口 → 取锚点 → 渲染并测量 → 回正
+  const computeStep = (scrollTop) => computeWindow({
+    count,
+    heights: measured,
+    scrollTop,
+    viewport: 620,
+    forecast: forecast(),
+    overscan: 800,
+    minRender: 30,
+  });
+  const measure = (win) => {
+    for (let index = win.start; index < win.end; index += 1) measured[index] = realHeights[index];
+  };
+
+  let win = computeStep(0);
+  measure(win);
+  let scrollTop = Math.max(0, win.topPad + realHeights.reduce((sum, height) => sum + height, 0) - 620);
+
+  for (let step = 0; step < 10; step += 1) {
+    // 用户往上滚 400px
+    scrollTop -= 400;
+    win = computeStep(scrollTop);
+    const anchor = windowAnchor(win.offsets, scrollTop);
+    const screenBefore = layoutTop(win, anchor.index) - scrollTop;
+
+    measure(win);
+    scrollTop = anchorScrollTop({
+      topPad: win.topPad,
+      start: win.start,
+      index: anchor.index,
+      heights: measured,
+      forecast: forecast(),
+      delta: anchor.delta,
+    });
+
+    const screenAfter = layoutTop(win, anchor.index) - scrollTop;
+    assert.ok(
+      Math.abs(screenAfter - screenBefore) < 1,
+      `第 ${step + 1} 次窗口平移后锚点移动了 ${(screenAfter - screenBefore).toFixed(1)}px`,
+    );
+  }
 });
 
 // ── 消息归一化：平台消息 id / 失败态 / 转发嵌套 ──────────────

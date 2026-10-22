@@ -720,6 +720,8 @@ html[data-compact="true"] .compact-icon-expand {
   overflow-y: auto;
   padding: 28px clamp(18px, 5vw, 72px) 20px;
   overscroll-behavior: contain;
+  /* 虚拟滚动自己按锚点回正滚动位置；浏览器再插一脚会叠加成二次跳动 */
+  overflow-anchor: none;
   scrollbar-color: var(--border-strong) transparent;
   scrollbar-width: thin;
 }

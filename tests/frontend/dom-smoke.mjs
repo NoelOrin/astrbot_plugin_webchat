@@ -203,6 +203,29 @@ check("参与者被渲染", doc.querySelectorAll(".participant").length === 1);
 check("置顶按钮存在", Boolean(doc.getElementById("btn-pin")));
 check("自动发现按钮存在", Boolean(doc.getElementById("btn-discover")));
 
+// 滚到顶部自动补一页更早消息，不必去点「加载更早消息」
+{
+  const list = doc.getElementById("messages");
+  const countHistoryCalls = () =>
+    calls.filter(([m, e, p]) => m === "GET" && e === "history" && p?.before_id).length;
+  const before = countHistoryCalls();
+  list.scrollTop = 0;
+  list.dispatchEvent(new window.Event("scroll"));
+  await new Promise((r) => setTimeout(r, 200));
+  const after = countHistoryCalls();
+  check("滚到顶部自动加载更早消息", after === before + 1, `${before} -> ${after}`);
+  check(
+    "自动加载的消息渲染出来",
+    [...doc.querySelectorAll(".message-row")].some((el) => (el.textContent || "").includes("更早")),
+    `${doc.querySelectorAll(".message-row").length} 条`,
+  );
+
+  // 停在原地继续触发滚动事件，不能一页接一页把历史抽干
+  list.dispatchEvent(new window.Event("scroll"));
+  await new Promise((r) => setTimeout(r, 120));
+  check("贴顶不重复自动加载", countHistoryCalls() === after, `${after} -> ${countHistoryCalls()}`);
+}
+
 // 点发现按钮 → 调 /discover 并刷新会话列表
 {
   const before = calls.filter(([m, e]) => m === "POST" && e === "discover").length;

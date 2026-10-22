@@ -11,6 +11,7 @@
 import {
   HISTORY_PAGE_SIZE,
   NEAR_BOTTOM_PX,
+  anchorScrollTop,
   compactId,
   compareSessions,
   computeWindow,
@@ -36,6 +37,7 @@ import {
   splitHighlight,
   stripMentionMarkup,
   unreadLabel,
+  windowAnchor,
 } from "./webchat-lib.js";
 
 const PLUGIN_NAME = "astrbot_plugin_webchat";
@@ -66,6 +68,10 @@ const VIRTUAL_MIN_RENDER = 30;
 const VIRTUAL_OVERSCAN = 800;
 /** 没测量过的消息用这个高度估算。 */
 const MESSAGE_HEIGHT_FALLBACK = 56;
+/** 距离顶部多少像素内就自动补一页更早消息。 */
+const AUTO_LOAD_TOP_PX = 120;
+/** 同一段「贴顶」只自动补一页；离开顶部（或切会话）后重新武装。 */
+let autoLoadedAtTop = false;
 /** 会话列表每页条数。 */
 const SESSION_PAGE_SIZE = 50;
 const DRAFT_KEY = `${PLUGIN_NAME}_draft`;
@@ -509,7 +515,10 @@ function selectSession(sessionId, { scrollToBottom: shouldScroll = true, closeSi
   if (!session) return;
 
   const changed = state.currentSessionId !== sessionId;
-  if (changed) saveDraft(state.currentSessionId);
+  if (changed) {
+    saveDraft(state.currentSessionId);
+    autoLoadedAtTop = false;
+  }
   state.currentSessionId = sessionId;
   rememberSession(sessionId);
   state.newMessageCount = 0;
@@ -687,13 +696,22 @@ function renderMessages({ scrollToBottom: shouldScroll = false } = {}) {
   state.renderPlan = nextPlan;
 
   // 少量消息保持全量渲染：小会话行为与旧版完全一致，虚拟滚动只在大列表生效
+  const wasVirtual = state.virtual;
   const virtual = nextPlan.length > VIRTUAL_THRESHOLD;
   state.virtual = virtual;
 
   if (virtual) {
     renderVirtualWindow({ session, plan: nextPlan, pinToEnd: shouldScroll });
   } else {
-    applyPlanDiff(diffPlan(previousPlan, nextPlan), previousPlan, nextPlan, session);
+    if (wasVirtual) {
+      // 从虚拟窗口退回全量渲染：DOM 里只剩一段窗口节点，按 plan diff 增量修补会对不上，
+      // 必须整树重建，否则会残留/错位
+      const fragment = document.createDocumentFragment();
+      for (const item of nextPlan) fragment.append(buildPlanNode(item, session));
+      elements.messageItems.replaceChildren(fragment);
+    } else {
+      applyPlanDiff(diffPlan(previousPlan, nextPlan), previousPlan, nextPlan, session);
+    }
     setVirtualSpacers(0, 0);
     state.virtualWindow = { start: 0, end: nextPlan.length };
   }
@@ -728,9 +746,10 @@ function averageMessageHeight() {
 /** 只渲染视口附近的一段 plan，上下用 spacer 撑住滚动高度。 */
 function renderVirtualWindow({ session, plan, pinToEnd = false }) {
   const container = elements.messages;
+  const heights = plan.map((item) => state.heights.get(item.key));
   const win = computeWindow({
     count: plan.length,
-    heights: plan.map((item) => state.heights.get(item.key)),
+    heights,
     scrollTop: container.scrollTop,
     viewport: container.clientHeight || 0,
     forecast: averageMessageHeight(),
@@ -739,6 +758,10 @@ function renderVirtualWindow({ session, plan, pinToEnd = false }) {
     pinToEnd,
   });
 
+  // 视口顶部压在哪个 plan 项上：窗口平移后靠它把内容钉回原位。
+  // 未渲染消息只有估算高度，估算误差（尤其是图片）会让整屏内容上下跳一大截。
+  const anchor = pinToEnd ? null : windowAnchor(win.offsets, container.scrollTop);
+
   const fragment = document.createDocumentFragment();
   for (let index = win.start; index < win.end; index += 1) {
     fragment.append(buildPlanNode(plan[index], session));
@@ -746,7 +769,45 @@ function renderVirtualWindow({ session, plan, pinToEnd = false }) {
   elements.messageItems.replaceChildren(fragment);
   setVirtualSpacers(win.topPad, win.bottomPad);
   state.virtualWindow = { start: win.start, end: win.end };
-  requestAnimationFrame(() => measureRenderedHeights(plan));
+
+  // 替换节点后浏览器可能已经钳过 scrollTop，这里记下来当作用户位移的基准
+  const scrollTopAfterSwap = container.scrollTop;
+  requestAnimationFrame(() => {
+    // 这一帧里又渲染过别的计划/窗口：DOM 已经不是这一轮的内容，测量和回正都得跳过，
+    // 否则会把新窗口的行高记到旧计划的 key 上，越滚越乱
+    if (state.renderPlan !== plan || state.virtualWindow.start !== win.start) return;
+    measureRenderedHeights(plan);
+    restoreVirtualAnchor({ plan, win, anchor, scrollTopAfterSwap });
+  });
+}
+
+/**
+ * 窗口平移后把锚点放回渲染前的位置。
+ *
+ * 只补偿窗口内部那些刚被渲染出来的项：它们的高度现在是实测值，
+ * 而 spacer 用的是估算值，两者之差就是肉眼看到的「跳一下」。
+ */
+function restoreVirtualAnchor({ plan, win, anchor, scrollTopAfterSwap }) {
+  if (!state.virtual || !anchor) return;
+  if (anchor.index < win.start || anchor.index >= win.end) return;
+
+  // 必须在 measureRenderedHeights 之后重新取：这一轮新渲染的项行高刚刚才测出来
+  const heights = plan.map((item) => state.heights.get(item.key) || 0);
+  const target = anchorScrollTop({
+    topPad: win.topPad,
+    start: win.start,
+    index: anchor.index,
+    heights,
+    forecast: averageMessageHeight(),
+    delta: anchor.delta,
+  });
+  // 渲染到这一帧之间用户还在滚：把这段位移叠加回来，不能把用户拽回去
+  const container = elements.messages;
+  const userMoved = container.scrollTop - scrollTopAfterSwap;
+  const next = target + userMoved;
+  if (Math.abs(next - container.scrollTop) > 0.5) {
+    container.scrollTop = next;
+  }
 }
 
 /** 渲染后回写实测行高，下一轮窗口计算就能用上。 */
@@ -1125,11 +1186,26 @@ function handleMessageScroll() {
   if (isNearBottomOfMessageList() && (state.unread.get(state.currentSessionId) || 0) > 0) {
     markCurrentSessionRead();
   }
+  maybeAutoLoadOlder();
   if (!state.virtual || virtualScrollFrame) return;
   virtualScrollFrame = requestAnimationFrame(() => {
     virtualScrollFrame = 0;
     refreshVirtualWindow();
   });
+}
+
+/** 滚到顶部自动补一页更早消息，不用非得去点「加载更早消息」。 */
+function maybeAutoLoadOlder() {
+  const container = elements.messages;
+  if (container.scrollTop > AUTO_LOAD_TOP_PX) {
+    autoLoadedAtTop = false;
+    return;
+  }
+  if (autoLoadedAtTop || state.loadingHistory) return;
+  const history = state.history.get(state.currentSessionId);
+  if (!history?.hasMore || history.nextCursor == null) return;
+  autoLoadedAtTop = true;
+  loadOlderMessages();
 }
 
 function markCurrentSessionRead() {

@@ -467,7 +467,8 @@ export function diffPlan(previous, next) {
  * 消息上千条也不会把整棵树塞进 DOM。高度优先用实测值（`heights`），
  * 没测过的用 `forecast` 估算——聊天列表的行高差异大，估算是唯一的办法。
  *
- * @returns {{start:number, end:number, topPad:number, bottomPad:number}}
+ * @returns {{start:number, end:number, topPad:number, bottomPad:number, offsets:number[]}}
+ *   `offsets` 是每一项的累计偏移（长度 total + 1），供滚动锚点定位使用。
  */
 export function computeWindow({
   count,
@@ -480,7 +481,7 @@ export function computeWindow({
   pinToEnd = false,
 } = {}) {
   const total = Math.max(0, Math.floor(num(count, 0)));
-  if (!total) return { start: 0, end: 0, topPad: 0, bottomPad: 0 };
+  if (!total) return { start: 0, end: 0, topPad: 0, bottomPad: 0, offsets: [0] };
 
   const fallback = num(forecast, 56) > 0 ? num(forecast, 56) : 56;
   const heightAt = (index) => {
@@ -488,20 +489,20 @@ export function computeWindow({
     return measured > 0 ? measured : fallback;
   };
 
-  const minCount = Math.max(1, Math.floor(num(minRender, 24)));
-  if (total <= minCount) return { start: 0, end: total, topPad: 0, bottomPad: 0 };
-
-  if (pinToEnd) {
-    const start = Math.max(0, total - minCount);
-    let topPad = 0;
-    for (let index = 0; index < start; index += 1) topPad += heightAt(index);
-    return { start, end: total, topPad, bottomPad: 0 };
-  }
-
   const offsets = new Array(total + 1);
   offsets[0] = 0;
   for (let index = 0; index < total; index += 1) {
     offsets[index + 1] = offsets[index] + heightAt(index);
+  }
+
+  const minCount = Math.max(1, Math.floor(num(minRender, 24)));
+  if (total <= minCount) {
+    return { start: 0, end: total, topPad: 0, bottomPad: 0, offsets };
+  }
+
+  if (pinToEnd) {
+    const start = Math.max(0, total - minCount);
+    return { start, end: total, topPad: offsets[start], bottomPad: 0, offsets };
   }
 
   const top = Math.max(0, num(scrollTop, 0) - Math.max(0, num(overscan, 0)));
@@ -519,5 +520,41 @@ export function computeWindow({
     start = Math.max(0, end - minCount);
   }
 
-  return { start, end, topPad: offsets[start], bottomPad: offsets[total] - offsets[end] };
+  return { start, end, topPad: offsets[start], bottomPad: offsets[total] - offsets[end], offsets };
+}
+
+/**
+ * 视口顶部当前压在哪一项上，以及压在项内的什么位置。
+ *
+ * 窗口平移（往上翻/往下滑）时用它当锚点：渲染完成后把这一项放回原来的
+ * 屏幕位置，未测量消息的估算误差就不会把整屏内容顶走。
+ *
+ * @returns {{index:number, delta:number}|null} `delta` 是项内偏移（像素）
+ */
+export function windowAnchor(offsets, scrollTop = 0) {
+  const list = Array.isArray(offsets) ? offsets : [];
+  if (list.length < 2) return null;
+  const top = Math.max(0, num(scrollTop, 0));
+  let index = 0;
+  while (index < list.length - 2 && list[index + 1] <= top) index += 1;
+  return { index, delta: top - list[index] };
+}
+
+/**
+ * 窗口平移后重新算出的滚动位置：锚点 + 项内偏移。
+ *
+ * `start` 与 `index` 之间的项都在本轮窗口里渲染过，高度是实测值；
+ * `topPad` 是浏览器里顶部 spacer 的真实高度。两者相加就是锚点在文档里的真实位置。
+ * 没测到高度的项退回 `forecast` 估算，不能按 0 计算。
+ */
+export function anchorScrollTop({ topPad = 0, start = 0, index = 0, heights = [], forecast = 0, delta = 0 } = {}) {
+  const from = Math.max(0, Math.floor(num(start, 0)));
+  const to = Math.max(from, Math.floor(num(index, 0)));
+  const fallback = Math.max(0, num(forecast, 0));
+  let offset = Math.max(0, num(topPad, 0));
+  for (let cursor = from; cursor < to; cursor += 1) {
+    const measured = num(heights[cursor], 0);
+    offset += measured > 0 ? measured : fallback;
+  }
+  return offset + num(delta, 0);
 }

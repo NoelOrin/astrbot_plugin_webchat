@@ -160,10 +160,22 @@ after_message_sent 钩子 → on_bot_message_sent()
 plan 超过 `VIRTUAL_THRESHOLD`（80）时只渲染视口附近的一段节点：
 
 - `#message-content` 结构固定为 `#virtual-top`（spacer）+ `#message-items` + `#virtual-bottom`
-- `computeWindow()`（webchat-lib，纯函数）按「实测行高 + 估算行高」算出 `{start, end, topPad, bottomPad}`
+- `computeWindow()`（webchat-lib，纯函数）按「实测行高 + 估算行高」算出
+  `{start, end, topPad, bottomPad, offsets}`；`offsets` 是每项的累计偏移，供锚点定位
 - 行高渲染后回写到 `state.heights`（key = plan item key），图片加载/窗口 resize 后下次滚动自然重算
 - 滚动用 rAF 节流；贴底时 `pinToEnd` 让窗口钉在尾部
+- **每次窗口平移都用锚点回正 `scrollTop`**：`windowAnchor()` 记住视口顶部压在哪一项、
+  项内偏移多少，渲染+测量后再用 `anchorScrollTop()` 把它放回原位置
+- 触顶自动加载更早消息（`AUTO_LOAD_TOP_PX`），同一段「贴顶」只补一页，离开顶部后重新武装
 - 小会话（≤80 条）仍走 `diffPlan` 全量增量渲染，行为与旧版一致
+
+> ⚠️ 虚拟滚动的「跳一大截」几乎都来自**估算行高的误差**：窗口往上滑一条，
+> 顶部 spacer 按 `forecast` 减去一行，但新渲染进来的那条节点是真实行高，
+> 图片消息能差出 300px 以上，整屏内容就会突然位移。锚点回正就是补这个差额；
+> `overflow-anchor: none` 是关掉浏览器自带的滚动锚定，否则它会和上面的补偿叠加成二次跳动。
+> `webchat-lib.test.js` 的「窗口平移时按锚点回正」用混合行高模拟了一整串平移。
+> 补行高必须在 `measureRenderedHeights()` **之后**重新读 `state.heights`——这一轮新渲染的项
+> 行高刚测出来，用渲染前的快照会补偿成错的方向。
 
 > ⚠️ 所有 DOM 操作的目标是 `#message-items`，**不是** `#message-content`。
 > spacer 是 `#message-content` 的固定子节点，`diffPlan` 的 append/truncate 若作用在
@@ -172,6 +184,9 @@ plan 超过 `VIRTUAL_THRESHOLD`（80）时只渲染视口附近的一段节点�
 
 > ⚠️ `loadOlderMessages()` 在虚拟滚动下必须**先把 `scrollTop` 抬高新插入内容的估算高度**
 > 再 render，否则窗口会按旧位置重算，视口内容整体错位。
+
+> ⚠️ 从虚拟窗口退回全量渲染（消息删到 ≤80 条）时不能走 `diffPlan`：DOM 里只有一段窗口节点，
+> 增量修补会对不上，必须整树重建。
 
 ## 引用回复
 
