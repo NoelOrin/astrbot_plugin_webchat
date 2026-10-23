@@ -79,6 +79,7 @@ window.AstrBotPluginView = {
       { id: 1, session_id: "group:111", type: "received", sender_name: "小明",
         content: "第一条", segments: [{type:"text",text:"第一条"}], timestamp: 1700000400 }] };
     if (endpoint === "updates") {
+      if (!window.__pollFixture) return { messages: [], last_id: Number(params?.after_id || 0), has_more: false };
       // 轮询降级：新消息来自**另一个会话**，用来验证不再只轮询当前会话
       return { messages: [
         { id: 200, session_id: "aiocqhttp:FriendMessage:9", type: "received",
@@ -110,9 +111,9 @@ window.AstrBotPluginView = {
     calls.push(["SSE", endpoint]);
     window.__sseHandlers = handlers;
     setTimeout(() => handlers.onOpen(), 0);
-    return "sub-1";
+    return `sub-${calls.filter(([kind]) => kind === "SSE").length}`;
   },
-  unsubscribeSSE: async () => {},
+  unsubscribeSSE: async (id) => { calls.push(["UNSUB", id]); },
 };
 
 window.matchMedia = (q) => ({ matches: false, media: q, addEventListener() {}, removeEventListener() {} });
@@ -149,6 +150,7 @@ await import("file://" + tmp);
 
 await new Promise((r) => setTimeout(r, 400));
 
+const initialPollCount = calls.filter(([method, endpoint]) => method === "GET" && endpoint === "updates").length;
 const doc = window.document;
 const results = [];
 const check = (name, cond, extra = "") => results.push([cond ? "PASS" : "FAIL", name, extra]);
@@ -239,6 +241,8 @@ check("自动发现按钮存在", Boolean(doc.getElementById("btn-discover")));
 const target = [...doc.querySelectorAll(".session-item")]
   .find((el) => el.textContent.includes("小红"));
 check("找到小红会话按钮", Boolean(target));
+const previousHandlers = window.__sseHandlers;
+const beforeSwitchSubscriptions = calls.filter(([kind]) => kind === "SSE").length;
 target.dispatchEvent(new window.MouseEvent("click", { bubbles: true }));
 await new Promise((r) => setTimeout(r, 60));
 check("切换会话后标题更新", doc.getElementById("conversation-title").textContent === "小红",
@@ -252,6 +256,49 @@ check("bot 消息有专属样式类", doc.querySelectorAll(".message-row.bot").l
   const leaked = texts.filter((t) => t.includes("第一条") || t.includes("看图"));
   check("切换会话后不残留上个会话的消息", leaked.length === 0, `残留 ${leaked.length} 条: ${leaked.join(" | ")}`);
   check("切换会话后只显示新会话消息", texts.length === 1, `实际 ${texts.length} 条`);
+}
+
+// 会话切换必须重建主题连接，旧连接的迟到消息/错误不能污染当前状态。
+check("切换会话重建 SSE", calls.filter(([kind]) => kind === "SSE").length === beforeSwitchSubscriptions + 1);
+check("SSE 订阅携带当前主题", calls.filter(([kind]) => kind === "SSE").at(-1)?.[1] === "stream?session_id=aiocqhttp%3AFriendMessage%3A9");
+check("切换时退订旧 SSE", calls.some(([kind]) => kind === "UNSUB"));
+previousHandlers.onError();
+previousHandlers.onMessage({ eventType: "message", parsed: {
+  id: 88001, session_id: "aiocqhttp:FriendMessage:9", content: "旧连接不应显示",
+  segments: [{ type: "text", text: "旧连接不应显示" }], timestamp: 1700000501,
+} });
+await new Promise((r) => setTimeout(r, 20));
+check("旧连接错误不影响实时状态", doc.getElementById("status-text").textContent === "实时连接");
+check("旧连接消息被忽略", !doc.getElementById("message-items").textContent.includes("旧连接不应显示"));
+
+// 后台摘要只更新未读和预览；切回来由 history 补齐完整消息。
+{
+  const friendHandlers = window.__sseHandlers;
+  const summary = { id: 88002, session_id: "group:111", sender: "摘要", content: "后台摘要消息", timestamp: 1700000601 };
+  friendHandlers.onMessage({ eventType: "message_summary", parsed: summary });
+  const groupButton = () => [...doc.querySelectorAll(".session-item")].find((el) => el.textContent.includes("测试群"));
+  const badge = () => groupButton()?.querySelector(".unread-badge")?.textContent;
+  const beforeUnread = badge();
+  friendHandlers.onMessage({ eventType: "message_summary", parsed: summary });
+  check("后台摘要更新列表预览", groupButton()?.textContent.includes("后台摘要消息"));
+  check("重复摘要不重复计未读", badge() === beforeUnread && Number(beforeUnread) > 0);
+  check("后台摘要不进入当前消息区", !doc.getElementById("message-items").textContent.includes("后台摘要消息"));
+  friendHandlers.onMessage({ eventType: "message_summary", parsed: { ...summary, id: 88003, content: "即将撤回的摘要" } });
+  friendHandlers.onMessage({ eventType: "message_removed", parsed: { session_id: "group:111", id: 88003 } });
+  check("摘要消息撤回后不残留预览", !groupButton()?.textContent.includes("即将撤回的摘要"));
+  const apiGet = window.AstrBotPluginView.apiGet;
+  window.AstrBotPluginView.apiGet = async (endpoint, params) => endpoint === "history" && params?.session_id === "group:111" && !params?.before_id
+    ? { messages: [{ id: 0, session_id: "group:111", content: "历史补齐", timestamp: 1699999999 }, { ...summary, segments: [{ type: "text", text: "后台摘要消息完整版" }] }] }
+    : apiGet(endpoint, params);
+  groupButton().click();
+  const countBeforeHydration = doc.getElementById("detail-count").textContent;
+  await new Promise((r) => setTimeout(r, 30));
+  check("切回会话补齐摘要的完整消息", doc.getElementById("message-items").textContent.includes("后台摘要消息完整版"));
+  check("补齐旧历史不重复增加消息总数", doc.getElementById("detail-count").textContent === countBeforeHydration);
+  check("补齐历史不产生当前会话未读", !groupButton()?.querySelector(".unread-badge"));
+  window.AstrBotPluginView.apiGet = apiGet;
+  [...doc.querySelectorAll(".session-item")].find((el) => el.textContent.includes("小红")).click();
+  await new Promise((r) => setTimeout(r, 30));
 }
 
 // 搜索
@@ -360,10 +407,11 @@ check("message_removed 后节点被清掉", afterRemove === 0, afterRemove);
 // connected 还是 false 就提前 startPolling()，否则一启动就降级轮询。
 {
   const bootPolls = calls.filter((c) => c[0] === "GET" && c[1] === "updates");
-  check("启动阶段不提前降级轮询", bootPolls.length === 0, `updates 调用 ${bootPolls.length} 次`);
+  check("启动阶段不提前降级轮询", initialPollCount === 0, `启动 updates 调用 ${initialPollCount} 次`);
 }
 
 // 轮询降级：SSE 断开后，非当前会话的新消息也要及时到达并计入未读
+window.__pollFixture = true;
 window.__sseHandlers.onError();
 await new Promise((r) => setTimeout(r, 200));
 {
@@ -617,6 +665,34 @@ check("最后一页后隐藏加载更多", doc.getElementById("session-more").hi
   await new Promise((r) => setTimeout(r, 120));
   const topAfter = parseFloat(doc.getElementById("virtual-top").style.height || "0");
   check("滚动后虚拟窗口上移", topAfter !== topPad, `${topPad} -> ${topAfter}`);
+}
+
+// 快速切换：尚未返回的旧订阅也必须退订，不能取代新订阅。
+{
+  const bridge = window.AstrBotPluginView;
+  const subscribe = bridge.subscribeSSE;
+  const pending = [];
+  bridge.subscribeSSE = (endpoint, handlers) => new Promise((resolve) => pending.push({ endpoint, handlers, resolve }));
+  const clickSession = (name) => [...doc.querySelectorAll(".session-item")].find((el) => el.textContent.includes(name)).click();
+  clickSession("第三个群");
+  clickSession("小红");
+  check("快速切换分别订阅最新主题", pending.length === 2 && pending[1].endpoint.includes("aiocqhttp%3AFriendMessage%3A9"));
+  const originalGet = bridge.apiGet;
+  bridge.apiGet = async (endpoint, params) => endpoint === "updates"
+    ? { messages: [{ id: 99001, session_id: "group:222", content: "切换窗口补回消息", timestamp: 1700010000 }], last_id: 99001, has_more: false }
+    : originalGet(endpoint, params);
+  pending[1].resolve("latest-sub");
+  pending[1].handlers.onOpen();
+  await new Promise((r) => setTimeout(r, 20));
+  pending[0].resolve("obsolete-sub");
+  pending[0].handlers.onOpen();
+  pending[0].handlers.onError();
+  await new Promise((r) => setTimeout(r, 20));
+  check("迟到订阅立即被退订", calls.some(([kind, id]) => kind === "UNSUB" && id === "obsolete-sub"));
+  check("迟到订阅不覆盖新连接状态", doc.getElementById("status-text").textContent === "实时连接");
+  check("切换窗口补齐后台会话消息", [...doc.querySelectorAll(".session-item")].some((el) => el.textContent.includes("切换窗口补回消息")));
+  bridge.apiGet = originalGet;
+  bridge.subscribeSSE = subscribe;
 }
 
 fs.unlinkSync(tmp);

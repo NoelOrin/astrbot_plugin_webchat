@@ -199,6 +199,8 @@ class Plugin(Star):
 
         # SSE 客户端
         self._sse_clients: dict[str, asyncio.Queue] = {}
+        # None = legacy full broadcast; empty string = summaries for every session.
+        self._sse_topics: dict[str, str | None] = {}
         self._sse_counter = 0
         # 终端发出消息的短时指纹，用于抑制 after_message_sent 的重复入库
         self._recent_sends: dict[str, tuple[str, float]] = {}
@@ -279,16 +281,35 @@ class Plugin(Star):
         if not self._sse_clients:
             return
         payload = json.dumps(data, ensure_ascii=False, default=str)
+        summary_payload = None
         dead: list[str] = []
         for cid, queue in list(self._sse_clients.items()):
+            topic = self._sse_topics.get(cid)
+            client_event, client_payload = event_type, payload
+            if event_type == "message" and topic is not None and (
+                not topic or topic != data.get("session_id")
+            ):
+                if summary_payload is None:
+                    summary = {
+                        key: data.get(key)
+                        for key in (
+                            "id", "session_id", "type", "sender", "sender_id",
+                            "sender_name", "timestamp",
+                        )
+                    }
+                    summary["content"] = str(data.get("content") or "")[:120]
+                    summary["preview"] = str(data.get("preview") or data.get("content") or "")[:120]
+                    summary_payload = json.dumps(summary, ensure_ascii=False, default=str)
+                client_event, client_payload = "message_summary", summary_payload
             try:
-                queue.put_nowait((event_type, payload))
+                queue.put_nowait((client_event, client_payload))
             except asyncio.QueueFull:
                 dead.append(cid)
             except Exception:
                 dead.append(cid)
         for cid in dead:
             self._sse_clients.pop(cid, None)
+            self._sse_topics.pop(cid, None)
 
     def _broadcast_soon(self, event_type: str, data: dict) -> None:
         """在可能没有事件循环的上下文里安全地广播。
@@ -321,6 +342,7 @@ class Plugin(Star):
             raise
         finally:
             self._sse_clients.pop(cid, None)
+            self._sse_topics.pop(cid, None)
             logger.debug(f"SSE 客户端断开: {cid}")
 
     async def api_stream(self):
@@ -328,6 +350,7 @@ class Plugin(Star):
         cid = f"cli-{self._sse_counter}-{id(request)}"
         queue: asyncio.Queue = asyncio.Queue(maxsize=512)
         self._sse_clients[cid] = queue
+        self._sse_topics[cid] = request.args.get("session_id")
         logger.info(f"SSE 客户端连接: {cid}")
         headers = {
             "Cache-Control": "no-cache, no-transform",
@@ -1735,5 +1758,6 @@ class Plugin(Star):
             task.cancel()
         self._bg_tasks.clear()
         self._sse_clients.clear()
+        self._sse_topics.clear()
         self._recent_sends.clear()
         logger.info(f"{PLUGIN_NAME} 已卸载")

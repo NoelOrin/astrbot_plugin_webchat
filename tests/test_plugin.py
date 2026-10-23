@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import asyncio
 import enum
+import json
 import os
 import sys
 import types
@@ -424,6 +425,110 @@ def test_sse_falls_back_to_quart_on_old_host(plugin, monkeypatch):
     quart = sys.modules["quart"]
     assert isinstance(response, quart.Response)
     assert response.mimetype == "text/event-stream"
+
+
+def _open_sse(plugin, monkeypatch, args):
+    """Keep the real stream generator while bypassing only host response wrapping."""
+    import main
+
+    monkeypatch.setattr(main.request, "args", args)
+    monkeypatch.setattr(main, "_streaming_response", lambda content, headers: content)
+    return _run(plugin.api_stream())
+
+
+@pytest.mark.parametrize("topic", ["group:2", ""])
+def test_sse_other_session_gets_bounded_summary(plugin, monkeypatch, topic):
+    gen = _open_sse(plugin, monkeypatch, {"session_id": topic})
+    # The generator runs after the original request context has gone away.
+    monkeypatch.setattr(sys.modules["main"].request, "args", {"session_id": "group:1"})
+    message = {
+        "id": 42, "session_id": "group:1", "type": "received",
+        "sender": "小明", "sender_id": "u1", "sender_name": "明明",
+        "content": "文" * 121, "preview": "图" * 121, "timestamp": 1700000000,
+        "segments": [{"type": "image", "url": "large-image"}],
+        "platform": "aiocqhttp", "platform_message_id": "secret",
+    }
+
+    async def scenario():
+        await gen.__anext__()
+        await gen.__anext__()
+        await plugin._sse_broadcast("message", message)
+        frame = await gen.__anext__()
+        await gen.aclose()
+        return frame
+
+    frame = _run(scenario())
+    event, data = frame.strip().split("\n")
+    assert event == "event: message_summary"
+    assert json.loads(data.removeprefix("data: ")) == {
+        "id": 42, "session_id": "group:1", "type": "received",
+        "sender": "小明", "sender_id": "u1", "sender_name": "明明",
+        "content": "文" * 120, "preview": "图" * 120, "timestamp": 1700000000,
+    }
+    assert message["content"] == "文" * 121
+
+
+@pytest.mark.parametrize("args", [{}, {"session_id": "group:1"}])
+def test_sse_legacy_and_active_session_receive_full_message(plugin, monkeypatch, args):
+    gen = _open_sse(plugin, monkeypatch, args)
+    message = {"id": 7, "session_id": "group:1", "content": "x" * 200,
+               "segments": [{"type": "text", "text": "x" * 200}]}
+
+    async def scenario():
+        await gen.__anext__()
+        await gen.__anext__()
+        await plugin._sse_broadcast("message", message)
+        frame = await gen.__anext__()
+        await gen.aclose()
+        return frame
+
+    frame = _run(scenario())
+    event, data = frame.strip().split("\n")
+    assert event == "event: message"
+    assert json.loads(data.removeprefix("data: ")) == message
+
+
+@pytest.mark.parametrize("event_type", [
+    "session", "session_updated", "session_removed", "message_removed",
+    "cleared", "sessions_discovered",
+])
+def test_sse_scoped_stream_keeps_global_events(plugin, monkeypatch, event_type):
+    gen = _open_sse(plugin, monkeypatch, {"session_id": "group:1"})
+    data = {"session_id": "group:2", "id": 42}
+
+    async def scenario():
+        await gen.__anext__()
+        await gen.__anext__()
+        await plugin._sse_broadcast(event_type, data)
+        frame = await gen.__anext__()
+        await gen.aclose()
+        return frame
+
+    assert _run(scenario()) == f"event: {event_type}\ndata: {json.dumps(data)}\n\n"
+
+
+@pytest.mark.parametrize("cleanup", ["disconnect", "terminate", "dead_queue"])
+def test_sse_topic_metadata_is_cleaned_up(plugin, monkeypatch, cleanup):
+    gen = _open_sse(plugin, monkeypatch, {"session_id": "group:1"})
+    cid, queue = next(iter(plugin._sse_clients.items()))
+    assert isinstance(queue, asyncio.Queue)
+    assert plugin._sse_topics[cid] == "group:1"
+
+    async def scenario():
+        await gen.__anext__()
+        if cleanup == "terminate":
+            await plugin.terminate()
+        elif cleanup == "dead_queue":
+            for _ in range(queue.maxsize):
+                queue.put_nowait(("ping", "{}"))
+            await plugin._sse_broadcast("session", {"id": "group:2"})
+        else:
+            await gen.aclose()
+        assert cid not in plugin._sse_clients
+        assert cid not in plugin._sse_topics
+        await gen.aclose()
+
+    _run(scenario())
 
 
 def test_messages_after_walks_all_sessions_by_id(plugin):

@@ -152,6 +152,12 @@ const state = {
   unread: new Map(),
   currentSessionId: "",
   stream: null,
+  streamGeneration: 0,
+  streamStarted: false,
+  /** 本轮重连要补的全局消息游标；首次连接为 null（历史刚由 loadSessions 载入）。 */
+  streamCatchupAfter: null,
+  /** 后台摘要已计数过的消息键（`session:messageId`），全量到达后转正、撤回时清理。 */
+  summaryIds: new Set(),
   pollTimer: null,
   polling: false,
   connected: false,
@@ -543,6 +549,7 @@ function selectSession(sessionId, { scrollToBottom: shouldScroll = true, closeSi
   renderMessages({ scrollToBottom: shouldScroll || changed });
 
   if (closeSidebar) toggleSidebar(false);
+  if (changed && state.streamStarted) connectStream();
   // 这里**不要**因为 state.connected 还是 false 就 startPolling()：
   // boot() 先 loadSessions() 再 connectStream()，选会话时 SSE 还没开始连，
   // connected 必然是 false。在这里兜底轮询会让终端「一启动就降级轮询」，
@@ -551,7 +558,9 @@ function selectSession(sessionId, { scrollToBottom: shouldScroll = true, closeSi
 }
 
 function resetConversation() {
+  const changed = Boolean(state.currentSessionId);
   state.currentSessionId = "";
+  if (changed && state.streamStarted) connectStream();
   elements.input.disabled = true;
   elements.input.value = "";
   elements.input.placeholder = "选择一个会话后输入消息";
@@ -1742,7 +1751,9 @@ function removeMessageLocally(sessionId, messageId) {
   const messages = state.messages.get(sessionId);
   if (!Array.isArray(messages)) return;
   const next = messages.filter((item) => item.id !== messageId);
-  const removed = messages.length - next.length;
+  const summaryRemoved = state.summaryIds.delete(`${sessionId}:${messageId}`);
+  const removed = messages.length - next.length || Number(summaryRemoved);
+  if (summaryRemoved) state.unread.set(sessionId, Math.max(0, (state.unread.get(sessionId) || 0) - 1));
   if (removed <= 0) return;
 
   state.messages.set(sessionId, next);
@@ -1871,6 +1882,7 @@ async function runDiscovery() {
 function clearMessageCaches() {
   state.messages.clear();
   state.history.clear();
+  state.summaryIds.clear();
 }
 
 // ── 新建会话 ────────────────────────────────────────────────
@@ -1996,50 +2008,107 @@ async function openNewSessionDialog() {
 // ── 流式连接 ────────────────────────────────────────────────
 
 function connectStream() {
+  const catchupAfter = state.streamStarted ? maxKnownMessageId() : null;
+  state.streamStarted = true;
   disposeStream();
+  state.streamCatchupAfter = catchupAfter;
+  const generation = state.streamGeneration;
+  const sessionId = state.currentSessionId;
+  const endpoint = `stream?session_id=${encodeURIComponent(sessionId)}`;
+  setStatus(state.polling ? "轮询连接" : "正在连接", "loading");
   if (typeof bridge?.subscribeSSE === "function") {
-    connectBridgeSSE();
+    connectBridgeSSE(generation, endpoint, sessionId);
   } else {
-    connectNativeSSE();
+    connectNativeSSE(generation, endpoint, sessionId);
   }
 }
 
-async function connectBridgeSSE() {
-  const subscription = bridge.subscribeSSE("stream", {
-    onOpen() {
-      state.connected = true;
-      state.lastStreamAt = Date.now();
-      stopPolling();
-      setStatus("实时连接", "connected");
-    },
-    onMessage(event) {
-      state.lastStreamAt = Date.now();
-      handleStreamEvent(event.eventType, event.parsed ?? safeParse(event.raw));
-    },
-    onError() {
-      if (state.connected) setStatus("正在重连", "loading");
+function streamOpened(generation, sessionId) {
+  if (generation !== state.streamGeneration) return;
+  state.connected = true;
+  state.lastStreamAt = Date.now();
+  stopPolling();
+  setStatus("实时连接", "connected");
+  // 首次连接的历史由 loadSessions 载入，不需要再补；只有重连/切换才有缺口。
+  const catchupAfter = state.streamCatchupAfter;
+  if (catchupAfter == null) return;
+  catchUpStream(generation, catchupAfter);
+  // 先订阅再补齐：/updates 覆盖切换窗口，/history 把后台期间只收到摘要的消息补全。
+  if (sessionId) {
+    const knownLastId = Number(state.sessions.get(sessionId)?.lastMessage?.id || 0);
+    bridge.apiGet("history", { session_id: sessionId }).then((data) => {
+      if (generation !== state.streamGeneration) return;
+      const historical = [];
+      for (const raw of data?.messages || []) {
+        if (Number(raw.id) > knownLastId) handleIncomingMessage(raw);
+        else {
+          historical.push(normalizeMessage(raw, sessionId));
+          state.summaryIds.delete(`${sessionId}:${raw.id}`);
+        }
+      }
+      state.messages.set(sessionId, mergeMessages(state.messages.get(sessionId) || [], historical));
+      renderMessages();
+    }).catch((error) => {
+      if (generation !== state.streamGeneration) return;
+      console.warn("重连消息补齐失败:", error);
       state.connected = false;
       startPolling();
-    },
-  });
-
-  let subscriptionId;
-  try {
-    // 宿主若把 SSE 整段缓冲，fetch 永远等不到响应头，subscribeSSE 就不会 resolve。
-    // 加超时兜底：超时后照常退回原生 EventSource，并且先把轮询跑起来，
-    // 保证这段时间里消息仍然能到，而不是界面一直停在「正在连接」。
-    subscriptionId = await withTimeout(subscription, STREAM_OPEN_TIMEOUT_MS);
-  } catch (error) {
-    console.warn("bridge SSE 未就绪，退回原生 EventSource:", error);
-    startPolling();
-    // 订阅可能稍后才成功：拿到就立刻退订，别留下一条看不见的连接
-    Promise.resolve(subscription)
-      .then((lateId) => bridge.unsubscribeSSE?.(lateId))
-      .catch(() => {});
-    connectNativeSSE();
-    return;
+    });
   }
-  state.stream = { kind: "bridge", id: subscriptionId };
+}
+
+async function catchUpStream(generation, cursor) {
+  try {
+    while (generation === state.streamGeneration) {
+      const data = await bridge.apiGet("updates", { after_id: String(cursor), limit: String(POLL_MESSAGE_LIMIT) });
+      if (generation !== state.streamGeneration) return;
+      for (const raw of data?.messages || []) handleIncomingMessage(raw);
+      const next = Number(data?.last_id);
+      if (!data?.has_more || !Number.isFinite(next) || next <= cursor) return;
+      cursor = next;
+    }
+  } catch (error) {
+    if (generation !== state.streamGeneration) return;
+    console.warn("SSE 切换补齐失败:", error);
+    state.connected = false;
+    startPolling();
+  }
+}
+
+async function connectBridgeSSE(generation, endpoint, sessionId) {
+  let subscription;
+  try {
+    subscription = bridge.subscribeSSE(endpoint, {
+      onOpen() { streamOpened(generation, sessionId); },
+      onMessage(event) {
+        if (generation !== state.streamGeneration) return;
+        state.lastStreamAt = Date.now();
+        handleStreamEvent(event.eventType, event.parsed ?? safeParse(event.raw));
+      },
+      onError() {
+        if (generation !== state.streamGeneration) return;
+        state.connected = false;
+        startPolling();
+      },
+    });
+    const id = await withTimeout(subscription, STREAM_OPEN_TIMEOUT_MS);
+    if (generation !== state.streamGeneration) {
+      Promise.resolve(bridge.unsubscribeSSE?.(id)).catch(() => {});
+      return;
+    }
+    state.stream = { kind: "bridge", id };
+  } catch (error) {
+    Promise.resolve(subscription).then((id) => {
+      if (id != null) return bridge.unsubscribeSSE?.(id);
+    }).catch(() => {});
+    if (generation !== state.streamGeneration) return;
+    console.warn("bridge SSE 未就绪，退回原生 EventSource:", error);
+    // 让超时订阅的所有迟到回调失效。
+    const next = ++state.streamGeneration;
+    state.connected = false;
+    startPolling();
+    connectNativeSSE(next, endpoint, sessionId);
+  }
 }
 
 /** 给可能永不 resolve 的 Promise 加超时，超时后按失败处理。 */
@@ -2059,23 +2128,30 @@ function withTimeout(promise, ms, message = "操作超时") {
   });
 }
 
-function connectNativeSSE() {
+function connectNativeSSE(generation, endpoint, sessionId) {
   try {
-    const source = new EventSource(`/api/plug/${PLUGIN_NAME}/stream`, { withCredentials: true });
+    const source = new EventSource(`/api/plug/${PLUGIN_NAME}/${endpoint}`, { withCredentials: true });
     state.stream = { kind: "native", source };
 
+    const timer = window.setTimeout(() => {
+      if (generation !== state.streamGeneration || state.connected) return;
+      source.close();
+      startPolling();
+    }, STREAM_OPEN_TIMEOUT_MS);
+    state.stream.timer = timer;
     source.addEventListener("connected", () => {
-      state.connected = true;
-      state.lastStreamAt = Date.now();
-      stopPolling();
-      setStatus("实时连接", "connected");
+      if (generation !== state.streamGeneration) return;
+      window.clearTimeout(timer);
+      streamOpened(generation, sessionId);
     });
     // 心跳只用来证明连接还活着，不触发任何渲染
     source.addEventListener("ping", () => {
+      if (generation !== state.streamGeneration) return;
       state.lastStreamAt = Date.now();
     });
     for (const type of [
       "message",
+      "message_summary",
       "session",
       "session_updated",
       "session_removed",
@@ -2084,11 +2160,13 @@ function connectNativeSSE() {
       "sessions_discovered",
     ]) {
       source.addEventListener(type, (event) => {
+        if (generation !== state.streamGeneration) return;
         state.lastStreamAt = Date.now();
         handleStreamEvent(type, safeParse(event.data));
       });
     }
     source.onerror = () => {
+      if (generation !== state.streamGeneration) return;
       if (state.connected) setStatus("正在重连", "loading");
       state.connected = false;
       startPolling();
@@ -2101,7 +2179,11 @@ function connectNativeSSE() {
 }
 
 function disposeStream() {
+  state.streamGeneration += 1;
+  state.connected = false;
+  state.lastStreamAt = 0;
   if (!state.stream) return;
+  window.clearTimeout(state.stream.timer);
   if (state.stream.kind === "bridge" && typeof bridge?.unsubscribeSSE === "function") {
     Promise.resolve(bridge.unsubscribeSSE(state.stream.id)).catch(() => {});
   } else if (state.stream.source) {
@@ -2126,6 +2208,7 @@ function checkStreamHealth() {
     console.warn("SSE 心跳超时，主动重连");
     setStatus("正在重连", "loading");
     state.connected = false;
+    startPolling();
     connectStream();
     return;
   }
@@ -2155,6 +2238,9 @@ function safeParse(text) {
 
 function handleStreamEvent(type, payload) {
   switch (type) {
+    case "message_summary":
+      handleIncomingMessage(payload, { summary: true });
+      break;
     case "message":
       handleIncomingMessage(payload);
       break;
@@ -2186,7 +2272,7 @@ function handleStreamEvent(type, payload) {
   }
 }
 
-function handleIncomingMessage(raw) {
+function handleIncomingMessage(raw, { summary = false } = {}) {
   const sessionId = String(raw?.session_id || "");
   if (!sessionId) return;
 
@@ -2205,11 +2291,20 @@ function handleIncomingMessage(raw) {
   const messages = state.messages.get(sessionId) || [];
   if (message.id && messages.some((item) => item.id === message.id)) return;
 
-  const isCurrent = sessionId === state.currentSessionId;
+  const summaryKey = `${sessionId}:${message.id}`;
+  const counted = state.summaryIds.has(summaryKey);
+  if (summary && counted) return;
+  if (summary) state.summaryIds.add(summaryKey);
+  else state.summaryIds.delete(summaryKey);
+  if (!summary) state.messages.set(sessionId, mergeMessages(messages, [message]));
+  if (counted) {
+    if (!summary && sessionId === state.currentSessionId) renderMessages();
+    return;
+  }
+  const isCurrent = sessionId === state.currentSessionId && !summary;
   const shouldFollow = isCurrent && isNearBottomOfMessageList();
   const previousTop = elements.messages.scrollTop;
 
-  state.messages.set(sessionId, mergeMessages(messages, [message]));
   session.messageCount += 1;
   session.lastMessage = message;
   session.lastActivity = message.timestamp;
@@ -2272,9 +2367,16 @@ function handleSessionUpdated(raw) {
   if (session.id === state.currentSessionId) updateConversationHeader(session);
 }
 
+function clearSummaryIds(sessionId) {
+  for (const key of state.summaryIds) {
+    if (key.startsWith(`${sessionId}:`)) state.summaryIds.delete(key);
+  }
+}
+
 function handleSessionRemoved(payload) {
   const sessionId = String(payload?.id || "");
   if (!sessionId) return;
+  clearSummaryIds(sessionId);
   state.sessions.delete(sessionId);
   state.messages.delete(sessionId);
   state.history.delete(sessionId);
@@ -2285,7 +2387,12 @@ function handleSessionRemoved(payload) {
 
 function handleCleared(payload) {
   const sessionId = String(payload?.session_id || "");
-  if (!sessionId) return;
+  if (!sessionId) {
+    for (const id of state.sessions.keys()) handleCleared({ session_id: id });
+    return;
+  }
+  clearSummaryIds(sessionId);
+  state.unread.set(sessionId, 0);
   state.messages.set(sessionId, []);
   state.history.set(sessionId, { hasMore: false, nextCursor: null });
   const session = state.sessions.get(sessionId);
@@ -2368,13 +2475,13 @@ async function pollNewMessages(drain = 0) {
     if (Number.isFinite(lastId) && lastId > state.updatesCursor) {
       state.updatesCursor = lastId;
     }
-    setStatus("轮询连接", "loading");
+    if (state.polling && !state.connected) setStatus("轮询连接", "loading");
     if (data?.has_more && drain < POLL_MAX_DRAIN) {
       window.setTimeout(() => pollNewMessages(drain + 1), 50);
     }
   } catch (error) {
     console.warn("轮询失败:", error);
-    setStatus("连接异常", "error");
+    if (state.polling && !state.connected) setStatus("连接异常", "error");
   }
 }
 

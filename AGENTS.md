@@ -333,11 +333,47 @@ const previousPlan = state.renderSessionId === sessionId ? state.renderPlan : []
 
 ## SSE 实时推送
 
-- 端点: `GET /api/plug/astrbot_plugin_webchat/stream`
-- 事件: `connected`、`hello`、`ping`、`message`、`session`、`session_updated`、`session_removed`、`message_removed`、`cleared`、`sessions_discovered`
+- 端点: `GET /api/plug/astrbot_plugin_webchat/stream?session_id=<会话>`
+- 事件: `connected`、`hello`、`ping`、`message`、`message_summary`、`session`、`session_updated`、`session_removed`、`message_removed`、`cleared`、`sessions_discovered`
 - keepalive: 每 `SSE_KEEPALIVE`（15 秒）发一个 **`ping` 事件**（不是注释行）
-- 前端优先 `bridge.subscribeSSE("stream", ...)`；bridge 无此方法才退回原生 `EventSource`
+- 前端优先 `bridge.subscribeSSE("stream?session_id=…", ...)`；bridge 无此方法才退回原生 `EventSource`
 - 全部失败时降级轮询（2.5 秒）
+
+### 会话主题订阅
+
+**一条流只推一个会话的完整消息**，切换会话时重建连接：
+
+| 客户端 | 收到的 `message` |
+|---|---|
+| 不带 `session_id`（老客户端） | 全量，行为不变 |
+| `session_id` 与消息一致 | 全量，含 segments |
+| `session_id` 不一致，或显式空串 | `message_summary`（截断 120 字，无 segments） |
+
+- 主题存在 `_sse_topics[cid]`，与 `_sse_clients[cid]`（队列）分开维护，生成器 `finally`、
+  `terminate()`、队列满淘汰三处都要一起清，否则会残留主题
+- 生命周期类事件（`session_removed`、`cleared`、`sessions_discovered`）**始终全局广播**，
+  否则后台会话改名/删除后其它窗口不刷新
+- 前端用 `message_summary` 只更新未读 / 列表预览 / 计数，`summaryIds` 记下
+  `session:messageId`；同一 id 的完整消息后来到达时**不再重复计数**，只补全正文
+
+> ⚠️ **切换会话必须重建连接，不能只改订阅参数。** `connectStream()` 里先
+> `disposeStream()` 再按 `state.currentSessionId` 拼端点；`state.streamGeneration`
+> 每次递增，旧连接的回调（bridge 的迟到 resolve、原生 EventSource 的 error/消息）
+> 一律靠代次比对丢弃。快速连点会话时，迟到订阅会被立刻 `unsubscribeSSE` 掉，
+> 不能让旧连接改掉 `state.connected` 或塞进旧会话的消息。
+> `dom-smoke` 的「切换会话重建 SSE / 旧连接消息被忽略 / 迟到订阅立即被退订」守着这三条。
+
+> ⚠️ **重建会留下一个空窗**：旧流已关、新流未连上时到达的消息不会重放。所以
+> `connectStream()` 先记下 `maxKnownMessageId()` 当 `streamCatchupAfter`，新流
+> `onOpen` 后先按它拉一轮 `/updates`（全局补拉，覆盖后台会话），再按 `/history`
+> 把后台期间只收到摘要的当前会话消息补全。首次连接不补——历史刚由 `loadSessions()` 载入。
+> 补历史必须走「只合并、不计数」的路径：会话的 `message_count` 已经包含那些行，
+> 逐条当新消息处理会把总数从 200 撑成 350，并让未读和最后一条预览一起错位。
+
+> ⚠️ **撤回一条只有摘要的消息时，`removeMessageLocally()` 找不到缓存行会直接 return。**
+> 必须同时认 `summaryIds`：删掉标记、减一次计数、未读数回落、预览回退到上一条。
+> `clearMessageCaches()` / `handleCleared()` / `handleSessionRemoved()` 都要清掉对应
+> 标记，否则长期后台流量会让这个集合无限增长。
 
 > ⚠️ keepalive 必须是真事件。bridge 在宿主侧解析 SSE，注释行（`: ping`）没有 data
 > 会被丢弃，iframe 收不到；于是「插件重载 / 服务重启掐断流」时前端仍以为连接活着
