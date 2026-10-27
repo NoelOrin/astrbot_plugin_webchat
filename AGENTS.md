@@ -233,7 +233,37 @@ plan 超过 `VIRTUAL_THRESHOLD`（80）时只渲染视口附近的一段节点�
 - 重试复用原 payload（`message.retryPayload`），成功后移除本地行并插入服务端返回行
 - 草稿：输入防抖 400ms 写 `localStorage`（`astrbot_plugin_webchat_draft:<sessionId>`），
   切会话时同步保存/恢复，发送成功清除；localStorage 不可用时退化为 `state.drafts` 内存表
-- 附件（dataURL）体积大，不持久化
+- 附件（dataURL）体积大，**不写草稿**；发送时会先落盘再入库（见「图片附件」一节）
+
+## 图片附件（终端发送）
+
+前端 `addAttachmentFromFile()` 用 `FileReader` 产出 `data:image/png;base64,...`，
+放在 `segment.url` 里提交给 `POST /send`。
+
+后端处理顺序（`api_send`）：
+
+1. `_persist_image_data_urls()` 把 data URL 写进 `<data_dir>/media/`，
+   片段里的 `url` / `file` 原地替换成**落盘后的绝对路径**
+2. `_build_chain()` → `_image_component()` 按「http → base64/data → 本地文件」分流
+3. 入库、发送；失败则 `_discard_image_files()` 回滚文件
+
+> ⚠️ **data URL 绝不能直接喂给 `Image.fromFileSystem()`**。
+> 宿主会把它 resolve 成 `file:///AstrBot/data%3Aimage/png%3Bbase64%2C...`，
+> 然后抛 `image file URI does not point to an existing file`——线上 500 就是这么来的。
+> 宿主 `Image` 有 `fromBase64()` / `fromBytes()`，data URL 走这两个。
+> `test_terminal_send_data_url_image_is_persisted_not_base64` 守着。
+
+> ⚠️ **data URL 也不能原样入库**。一张 500KB 的图会变成约 670KB 的 JSON，
+> 按 `max_log` 200 条裁剪，极端情况能到上百 MB，还会整段塞进 SSE 广播。
+> 所以只存落盘路径。落盘用**内容哈希命名**，同一张图重复发不会堆多份；
+> 正因如此，回滚删文件前必须 `_image_file_referenced()` 查一下库里还有没有别的消息引用它。
+
+> ⚠️ `GET /media?file=` 只能读 `<data_dir>/media/` 下的文件：先 `realpath` 再比前缀，
+> 挡掉 `../` 目录穿越。`?url=` 仍然只走 http(s) 代理。
+
+> ⚠️ `unquote` 只对 `data:` 前缀的地址做（兼容被整段 URL 编码过的 data URL）。
+> 本地文件名里的 `%20` 是字面量，跟着 unquote 会把路径改错。
+> `test_local_path_with_percent_is_not_unquoted` 守着。
 
 ## 会话列表分页
 

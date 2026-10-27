@@ -2990,13 +2990,16 @@ function debounce(fn, wait) {
   };
 }
 
-/** 远程图片走插件代理，规避防盗链与混合内容；data/blob 直出。 */
+/** 远程图片走插件代理，规避防盗链与混合内容；data/blob 直出；本地落盘附件走 file 参数。 */
 function mediaUrl(source) {
   const text = String(source || "");
   if (!text) return "";
   if (text.startsWith("data:") || text.startsWith("blob:")) return text;
   if (/^https?:\/\//i.test(text)) {
     return `/api/plug/${PLUGIN_NAME}/media?url=${encodeURIComponent(text)}`;
+  }
+  if (text.startsWith("/")) {
+    return `/api/plug/${PLUGIN_NAME}/media?file=${encodeURIComponent(text)}`;
   }
   return text;
 }

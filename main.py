@@ -14,6 +14,7 @@ import asyncio
 import contextlib
 import json
 import logging
+import mimetypes
 import os
 import re
 import shutil
@@ -1305,9 +1306,12 @@ class Plugin(Star):
             for segment in extra_segments:
                 if isinstance(segment, dict) and segment.get("type") in ("image", "at"):
                     segments.append(segment)
+        # 附件 data URL 落盘：库里只留文件路径，避免几十万字符的 base64 入库
+        written_images = self._persist_image_data_urls(segments)
         try:
             chain = self._build_chain(segments)
         except Exception as exc:
+            self._discard_image_files(written_images)
             logger.error(f"构造消息链失败: {exc}")
             return jsonify({"error": f"发送失败: {exc}"}), 500
 
@@ -1336,6 +1340,7 @@ class Plugin(Star):
             self._recent_sends.pop(session_id, None)
             # 发送失败：删掉预写的记录，别在终端留一条其实没发出去的消息
             self.store.delete_message(saved["id"])
+            self._discard_image_files(written_images)
             logger.error(f"发送消息失败: {exc}")
             return jsonify({"error": f"发送失败: {exc}"}), 500
 
@@ -1345,8 +1350,6 @@ class Plugin(Star):
 
     def _build_chain(self, segments: list[dict]):
         """把片段还原成 AstrBot 消息链，图片按可访问地址尽力还原。"""
-        from astrbot.api.message_components import Image
-
         chain = MessageChain()
         header_only = True
         for segment in segments:
@@ -1359,13 +1362,11 @@ class Plugin(Star):
                 if not source:
                     continue
                 try:
-                    if is_http_url(source):
-                        chain.chain.append(Image.fromURL(source))
-                    else:
-                        chain.chain.append(Image.fromFileSystem(source))
+                    chain.chain.append(self._image_component(source))
                     header_only = False
                 except Exception as exc:
-                    logger.warning(f"图片还原失败: {exc}")
+                    # 图片解析失败不该静默吞掉：日志里留一条，方便定位是哪张图
+                    logger.warning(f"图片还原失败 ({source[:64]}...): {exc}")
             elif kind == "at":
                 target = str(segment.get("target") or "")
                 if target:
@@ -1395,6 +1396,42 @@ class Plugin(Star):
         if chain.chain and header_only:
             chain.message("\u200b")
         return chain
+
+    @staticmethod
+    def _image_component(source: str):
+        """把图片地址还原成宿主 Image 组件。
+
+        前端附件是 ``data:image/png;base64,...``（FileReader 的产物），
+        **不能**当成文件路径——``fromFileSystem`` 会把它 resolve 成
+        ``file:///.../data%3Aimage/png%3Bbase64%2C...`` 然后报「文件不存在」。
+        因此按「http 地址 → data URL / base64 → 本地文件」的顺序分流。
+        """
+        from urllib.parse import unquote
+
+        from astrbot.api.message_components import Image
+
+        raw = str(source or "").strip()
+        if not raw:
+            raise ValueError("图片地址为空")
+
+        # data URL 可能被整段 URL 编码过（%3A / %2C / %2F），先还原再分流。
+        # 只对 data: 前缀解码：本地文件名里的 %20 是字面量，不能一起 unquote。
+        text = unquote(raw) if raw[:7].lower() in ("data:", "data%3a") else raw
+
+        if is_http_url(text):
+            return Image.fromURL(text)
+
+        if text.startswith("base64://"):
+            return Image.fromBase64(text[len("base64://"):])
+
+        if text.lower().startswith("data:"):
+            # data:[<mime>][;base64],<payload>
+            header, separator, payload = text.partition(",")
+            if not separator or "base64" not in header.lower():
+                raise ValueError("不支持的 data URL（仅支持 base64 编码）")
+            return Image.fromBase64(payload)
+
+        return Image.fromFileSystem(raw)
 
     @staticmethod
     def _reply_component(target: str):
@@ -1627,6 +1664,98 @@ class Plugin(Star):
             pass
         return platform_id
 
+    # ── 图片附件落盘 ──────────────────────────────────────────
+
+    def _persist_image_data_urls(self, segments: list[dict]) -> list[str]:
+        """把片段里的 data URL 图片落盘，原地替换成轻量文件路径。
+
+        前端附件是 ``data:image/png;base64,...``。若原样入库，一条 500KB 的图
+        就会变成约 670KB 的 JSON——按 ``max_log`` 200 条裁剪，极端情况能撑到
+        上百 MB，还会整段塞进 SSE 广播。所以只存落盘后的文件路径。
+
+        返回写出的文件路径，供发送失败时回滚清理。
+        """
+        written: list[str] = []
+        media_dir = os.path.join(self.data_dir, "media")
+        for segment in segments:
+            if not isinstance(segment, dict) or segment.get("type") != "image":
+                continue
+            key = "url" if str(segment.get("url") or "").startswith("data:") else "file"
+            value = str(segment.get(key) or "")
+            if not value.lower().startswith("data:"):
+                continue
+            try:
+                path = self._write_data_url(value, media_dir)
+            except Exception as exc:
+                logger.warning(f"图片附件落盘失败，已丢弃该片段: {exc}")
+                segment[key] = ""
+                continue
+            # url 字段留给前端显示，指向本地文件；宿主发送时按 file 走文件系统
+            segment["url"] = path
+            segment["file"] = path
+            written.append(path)
+        return written
+
+    def _discard_image_files(self, paths: list[str]) -> None:
+        """清理本次落盘但最终没发出去的图片文件。
+
+        文件按内容哈希寻址，同一张图可能已被别的消息引用（重发同一张图、
+        另一个会话发同一张图）。所以先确认库里还有没有引用，被引用就保留。
+        """
+        for path in paths or []:
+            try:
+                if self._image_file_referenced(path):
+                    continue
+                os.remove(path)
+            except Exception:
+                pass
+
+    def _image_file_referenced(self, path: str) -> bool:
+        """库里是否还有消息片段指向这个文件。"""
+        try:
+            conn = self.store.connect()
+            try:
+                row = conn.execute(
+                    "SELECT 1 FROM messages WHERE segments LIKE ? LIMIT 1",
+                    (f"%{os.path.basename(path)}%",),
+                ).fetchone()
+                return row is not None
+            finally:
+                conn.close()
+        except Exception:
+            # 查不了就当被引用，宁可留一个孤儿文件，也不误删在用的图
+            return True
+
+    @staticmethod
+    def _write_data_url(data_url: str, media_dir: str) -> str:
+        """把 data URL 写成文件，返回绝对路径。"""
+        import base64
+        import hashlib
+        from urllib.parse import unquote
+
+        text = unquote(data_url) if data_url[:7].lower() == "data%3a" else data_url
+        header, separator, payload = text.partition(",")
+        if not separator or "base64" not in header.lower():
+            raise ValueError("不支持的 data URL（仅支持 base64 编码）")
+        mime = header[len("data:"):].split(";")[0].strip() or "image/png"
+        ext = {
+            "image/png": ".png",
+            "image/jpeg": ".jpg",
+            "image/jpg": ".jpg",
+            "image/gif": ".gif",
+            "image/webp": ".webp",
+            "image/bmp": ".bmp",
+        }.get(mime.lower(), ".png")
+        body = base64.b64decode(payload, validate=False)
+        os.makedirs(media_dir, exist_ok=True)
+        # 内容寻址：同一张图重复发送不会堆出多份
+        digest = hashlib.sha256(body).hexdigest()[:32]
+        path = os.path.join(media_dir, f"{digest}{ext}")
+        if not os.path.exists(path):
+            with open(path, "wb") as handle:
+                handle.write(body)
+        return path
+
     def _infer_umo(self, platform_id: str, is_group: bool, peer_id: str) -> str:
         """从同平台已有会话推断 UMO 模板，把最后一段替换成目标 id。"""
         for meta in self.session_meta.values():
@@ -1646,7 +1775,15 @@ class Plugin(Star):
     # ── API：媒体代理 ──────────────────────────────────────────
 
     async def api_media(self):
-        """代理远程图片，规避防盗链与混合内容问题。?url=。"""
+        """代理远程图片，规避防盗链与混合内容问题。
+
+        ``?url=`` 走远程代理；``?file=`` 读插件自己落盘的附件图片
+        （前端发送的 data URL 会先存到 ``data/media/``，库里只留路径）。
+        """
+        file_path = str(request.args.get("file", "") or "")
+        if file_path:
+            return self._serve_local_media(file_path)
+
         url = str(request.args.get("url", "") or "")
         if not is_http_url(url):
             return jsonify({"error": "仅支持 http(s) 图片地址"}), 400
@@ -1672,6 +1809,33 @@ class Plugin(Star):
         except Exception as exc:
             logger.info(f"媒体代理失败: {exc}")
             return jsonify({"error": "图片获取失败"}), 502
+
+    def _serve_local_media(self, file_path: str):
+        """读取落盘附件图片。
+
+        只允许读 ``data/media/`` 下的文件：路径先 realpath，再比对前缀，
+        防止 ``?file=../../astrbot_plugin_webchat.db`` 这类目录穿越。
+        """
+        media_dir = os.path.realpath(os.path.join(self.data_dir, "media"))
+        target = os.path.realpath(file_path)
+        if not target.startswith(media_dir + os.sep):
+            return jsonify({"error": "非法路径"}), 400
+        if not os.path.isfile(target):
+            return jsonify({"error": "文件不存在"}), 404
+        try:
+            with open(target, "rb") as handle:
+                body = handle.read()
+        except Exception as exc:
+            logger.info(f"读取本地图片失败: {exc}")
+            return jsonify({"error": "读取失败"}), 500
+        content_type = mimetypes.guess_type(target)[0] or "application/octet-stream"
+        if not content_type.startswith("image/"):
+            return jsonify({"error": "目标不是图片"}), 415
+        return Response(
+            body,
+            mimetype=content_type,
+            headers={"Cache-Control": "public, max-age=86400"},
+        )
 
     # ── API：合并转发内容 ──────────────────────────────────────
 

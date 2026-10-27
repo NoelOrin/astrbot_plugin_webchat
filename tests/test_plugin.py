@@ -81,9 +81,10 @@ class FakePlain:
 class FakeImage:
     """类名必须与宿主一致——片段类型是按类名判定的。"""
 
-    def __init__(self, url="", file=""):
+    def __init__(self, url="", file="", path=""):
         self.url = url
         self.file = file
+        self.path = path
 
 
 class FakeRecord:
@@ -191,7 +192,15 @@ def _install_fake_astrbot():
 
         @staticmethod
         def fromFileSystem(path):
-            return FakeImage(file=path)
+            return FakeImage(file=f"file://{path}", path=path)
+
+        @staticmethod
+        def fromBase64(base64):
+            return FakeImage(file=f"base64://{base64}")
+
+        @staticmethod
+        def fromBytes(byte):
+            return FakeImage(file="base64://" + byte.hex())
 
     comp.Plain = FakePlain
     comp.Image = _Image
@@ -1815,3 +1824,149 @@ def test_inbound_forward_id_falls_back_to_raw_message(plugin):
 
     segment = plugin.store.query_messages("group:1")[-1]["segments"][0]
     assert segment["id"] == "f-10"
+
+
+# ── 终端发送图片：data URL 必须走 base64，不能当成文件路径 ──────
+
+PNG_DATA_URL = (
+    "data:image/png;base64,"
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg=="
+)
+
+
+def test_terminal_send_data_url_image_is_persisted_not_base64(plugin, monkeypatch):
+    """前端附件是 data URL：落盘后按文件发送，且库里不留整段 base64。"""
+    inbound(plugin, umo="aiocqhttp:GroupMessage:1", group_id="1",
+            sender_id="u1", sender_name="小明", text="x")
+
+    _send(plugin, monkeypatch, "group:1", "", [
+        {"type": "image", "url": PNG_DATA_URL, "name": "a.png"},
+    ])
+
+    _, chain = plugin.context.sent[-1]
+    image = chain.chain[-1]
+    assert type(image).__name__ == "FakeImage"
+    # 落盘后的真实文件，不再是 data URL，也不是不存在的路径
+    assert image.path and os.path.isfile(image.path)
+    assert image.path.startswith(os.path.join(plugin.data_dir, "media"))
+    with open(image.path, "rb") as handle:
+        assert handle.read(4) == b"\x89PNG"
+
+    # 库里只留文件路径：几万字符的 base64 绝不能进数据库
+    stored = plugin.store.query_messages("group:1")[-1]["segments"][0]
+    assert "base64" not in stored["url"]
+    assert len(stored["url"]) < 512
+
+
+def test_terminal_send_data_url_with_percent_encoding_is_decoded(plugin, monkeypatch):
+    """data URL 可能被 URL 编码过（%3A / %2C），必须先还原再解析。"""
+    inbound(plugin, umo="aiocqhttp:GroupMessage:1", group_id="1",
+            sender_id="u1", sender_name="小明", text="x")
+
+    encoded = PNG_DATA_URL.replace(":", "%3A").replace(",", "%2C").replace("/", "%2F")
+    _send(plugin, monkeypatch, "group:1", "", [{"type": "image", "url": encoded}])
+
+    _, chain = plugin.context.sent[-1]
+    assert chain.chain[-1].file.startswith("base64://")
+
+
+def test_terminal_send_http_image_still_uses_url(plugin, monkeypatch):
+    """回归：http 图片仍走 fromURL，不要被 base64 分支吃掉。"""
+    inbound(plugin, umo="aiocqhttp:GroupMessage:1", group_id="1",
+            sender_id="u1", sender_name="小明", text="x")
+
+    _send(plugin, monkeypatch, "group:1", "", [
+        {"type": "image", "url": "https://example.com/a.png"},
+    ])
+
+    _, chain = plugin.context.sent[-1]
+    assert chain.chain[-1].url == "https://example.com/a.png"
+
+
+def test_terminal_send_local_file_image_uses_filesystem(plugin, monkeypatch, tmp_path):
+    """回归：真实存在的本地路径仍走 fromFileSystem。"""
+    inbound(plugin, umo="aiocqhttp:GroupMessage:1", group_id="1",
+            sender_id="u1", sender_name="小明", text="x")
+
+    image_file = tmp_path / "a.png"
+    image_file.write_bytes(b"png")
+    _send(plugin, monkeypatch, "group:1", "", [
+        {"type": "image", "file": str(image_file)},
+    ])
+
+    _, chain = plugin.context.sent[-1]
+    assert chain.chain[-1].path == str(image_file)
+
+
+def test_local_path_with_percent_is_not_unquoted(plugin, monkeypatch, tmp_path):
+    """本地文件名里的 %20 是字面量；只有 data URL 才需要 unquote。"""
+    inbound(plugin, umo="aiocqhttp:GroupMessage:1", group_id="1",
+            sender_id="u1", sender_name="小明", text="x")
+
+    weird = tmp_path / "a%20b.png"
+    weird.write_bytes(b"png")
+    _send(plugin, monkeypatch, "group:1", "", [
+        {"type": "image", "file": str(weird)},
+    ])
+
+    _, chain = plugin.context.sent[-1]
+    assert chain.chain[-1].path == str(weird)
+
+
+# ── 落盘附件的读取入口：必须防目录穿越 ──────────────────────
+
+def _media(plugin, monkeypatch, **args):
+    import main as main_module
+
+    monkeypatch.setattr(
+        main_module,
+        "request",
+        types.SimpleNamespace(args=args, method="GET", get_json=lambda *a, **k: None),
+        raising=False,
+    )
+    return _run(plugin.api_media())
+
+
+def test_media_file_serves_persisted_image(plugin, monkeypatch):
+    """落盘附件要能读出来，否则前端拿到路径也显示不了。"""
+    inbound(plugin, umo="aiocqhttp:GroupMessage:1", group_id="1",
+            sender_id="u1", sender_name="小明", text="x")
+    _send(plugin, monkeypatch, "group:1", "", [{"type": "image", "url": PNG_DATA_URL}])
+    path = plugin.store.query_messages("group:1")[-1]["segments"][0]["file"]
+
+    response = _media(plugin, monkeypatch, file=path)
+    assert getattr(response, "mimetype", "").startswith("image/")
+
+
+def test_media_file_rejects_path_traversal(plugin, monkeypatch):
+    """?file= 不能读到 media 目录以外的任何文件（比如数据库）。"""
+    response = _media(plugin, monkeypatch, file=plugin.db_path)
+    payload, status = response
+    assert status == 400
+    assert "error" in payload
+
+
+def test_media_file_rejects_relative_escape(plugin, monkeypatch):
+    """../ 也要挡住。"""
+    escaped = os.path.join(plugin.data_dir, "media", "..", "..", "x.png")
+    payload, status = _media(plugin, monkeypatch, file=escaped)
+    assert status == 400
+    assert "error" in payload
+
+
+def test_failed_send_discards_persisted_image(plugin, monkeypatch):
+    """发送失败时，刚落盘的图片要清掉，不能留孤儿文件。"""
+    inbound(plugin, umo="aiocqhttp:GroupMessage:1", group_id="1",
+            sender_id="u1", sender_name="小明", text="x")
+
+    async def boom(*args, **kwargs):
+        raise RuntimeError("platform down")
+
+    monkeypatch.setattr(plugin.context, "send_message", boom)
+    _send(plugin, monkeypatch, "group:1", "", [{"type": "image", "url": PNG_DATA_URL}])
+
+    media_dir = os.path.join(plugin.data_dir, "media")
+    leftovers = os.listdir(media_dir) if os.path.isdir(media_dir) else []
+    assert leftovers == []
+    # 只剩入站那条，失败的 sent 行必须回滚掉
+    assert [m["type"] for m in plugin.store.query_messages("group:1")] == ["received"]
