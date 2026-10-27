@@ -438,20 +438,33 @@ SSE 不可用时前端每 2.5 秒拉一次 `GET /updates?after_id=<全局消息 
 |---|---|
 | 页面在浏览器里直接打开 | 没有 Dashboard 父页面 → 没有注入、也没有人能响应 postMessage |
 | `bridge-sdk.js` 404 | WebUI 挂在反向代理子路径（`/astrbot/`）下，宿主注入的是**绝对路径** |
-| `bridge-sdk.js` 401 | Dashboard 会话失效，脚本拿不到鉴权，`<script>` 不执行 |
+| `bridge-sdk.js` 401 | URL 里没带 `asset_token`，或 token 已过期 |
+
+> ⚠️ **401 是主因，且和 cookie 无关。** 视图 iframe 是
+> `sandbox="allow-scripts allow-forms allow-downloads"`（**没有** `allow-same-origin`），
+> 文档是 opaque origin，Dashboard 那个 `SameSite=Strict` 的登录 cookie
+> **不会**跟着 `<script src>` 发出去。所以 AstrBot 给这条路由单开了 query token 认证
+> （`astrbot/dashboard/plugin_page_auth.py`：视图资源走 `/_t/<token>/` path token，
+> 共享的 bridge SDK 只认 `?asset_token=`）。宿主注入的标签偶尔是裸 URL，
+> 实测（`astrbot.noelorin.top`）就是 401 —— 补加载不带 token 等于白试。
 
 `boot()` 现在的顺序：`ensureBridge()` → 拿到 bridge 后再并行「等上下文 + 探 health」→ 再加载会话：
 
-- `ensureBridge()` 先看宿主是否已注入；没有就按 `bridgeSdkUrl(location.pathname)`
-  自己补加载一次。该纯函数按**第一个 `/api/`** 切出部署前缀
+- `ensureBridge()` 先看宿主是否已注入；没有就按 `bridgeSdkUrls(location)` 依次补加载：
+  **第一个带 `asset_token`**（唯一能在 sandbox iframe 里过认证的形式），
+  第二个才是裸地址（同源非 sandbox 场景下 cookie 仍然生效）
+- token 两个来源都要认：`?asset_token=` 查询参数、`/views/<视图>/_t/<token>/` 路径段
+  （`assetTokenFromViewUrl`）。token 是凭证，**console 诊断里只留 `asset_token=***`**
+- 地址由 `bridgeSdkUrl(pathname)` 按**第一个 `/api/`** 切出部署前缀
   （`/astrbot/api/v1/plugins/...` → `/astrbot/api/plugin/page/bridge-sdk.js`），
   所以子路径部署能自愈；地址是算出来的，**不要**改成写死 `/api/plugin/page/bridge-sdk.js`
-- 补加载只在 `http(s)` 下进行（`file://` 没有同源后端），且每个地址只试一次
+- 补加载只在 `http(s)` 下进行（`file://` 没有同源后端），每个地址只试一次
 - `probeBridgeHandshake()` 用 `health` 探一次握手：bridge 存在但宿主不回话时，
   后面的每个 `apiGet` 都会永久挂起，界面就会无声地卡在「正在连接」。
   **只有超时**才算握手失败；宿主回了错误（端点自己抛异常）说明 bridge 是通的
-- 失败分支必须写清楚怎么查：状态栏文案 + `console.error` 结构化诊断
-  （是否在 iframe、页面地址、宿主注入情况、补加载地址）+ 一条长驻 12 秒的 toast
+- 失败分支要写清楚怎么查：状态栏文案 + `console.error` 结构化诊断
+  （是否在 iframe、页面地址、是否有 token、宿主注入情况、尝试过的地址）
+  + 一条长驻 12 秒的 toast
 - `bindBridgeContext()` 不能在 `bindEvents()` 里订阅 `onContext`：那时 bridge 还可能不存在，
   自愈后拿到的 bridge 会漏掉主题 / 语言变化
 

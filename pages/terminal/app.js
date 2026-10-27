@@ -12,7 +12,8 @@ import {
   HISTORY_PAGE_SIZE,
   NEAR_BOTTOM_PX,
   anchorScrollTop,
-  bridgeSdkUrl,
+  assetTokenFromViewUrl,
+  bridgeSdkUrls,
   compactId,
   compareSessions,
   computeWindow,
@@ -59,8 +60,8 @@ const STREAM_CHECK_MS = 20000;
 const SSE_RETRY_MS = 60000;
 /** bridge 订阅迟迟不返回就当失败：宿主缓冲 SSE 时 fetch 永远等不到响应头。 */
 const STREAM_OPEN_TIMEOUT_MS = 8000;
-/** 宿主没注入 bridge SDK 时，自己补一次的最长等待。 */
-const BRIDGE_SDK_LOAD_TIMEOUT_MS = 5000;
+/** 单个补加载地址的最长等待（候选有两个，401 会立刻 error，不用等满）。 */
+const BRIDGE_SDK_LOAD_TIMEOUT_MS = 3000;
 /** bridge 已存在但宿主迟迟不回上下文 / 不响应请求，多半是握手层坏了。 */
 const BRIDGE_HANDSHAKE_TIMEOUT_MS = 8000;
 /** 握手超时的报错文案，boot() 靠它区分「bridge 死了」和「后端端点本身报错」。 */
@@ -91,8 +92,8 @@ const DRAFT_KEY = `${PLUGIN_NAME}_draft`;
 let bridge = pickBridge();
 /** 已经补加载过的 SDK 地址，失败后不重复插脚本。 */
 const attemptedBridgeSdks = new Set();
-/** 上一次补加载的 SDK 地址，失败时写进报错里，省得用户去猜。 */
-let lastBridgeSdkAttempt = "";
+/** 补加载过的地址（含顺序），失败时原样写进诊断。 */
+const attemptedBridgeAttempts = [];
 const elements = {
   btnCompact: document.getElementById("btn-compact"),
   btnTheme: document.getElementById("btn-theme"),
@@ -254,25 +255,35 @@ function bindBridgeContext() {
 
 /**
  * 拿到可用的 bridge：优先宿主注入的那个，
- * 没有就按当前页面路径自己补加载一次（兼容子路径部署）。
+ * 没有就按当前页面路径（并带上 asset_token）自己补加载。
  */
 async function ensureBridge() {
   const injected = pickBridge();
   if (isUsableBridge(injected)) return injected;
 
-  await loadBridgeSdkScript(bridgeSdkUrl(window.location.pathname));
-  const loaded = pickBridge();
-  return isUsableBridge(loaded) ? loaded : null;
+  for (const url of bridgeSdkUrls(window.location)) {
+    await loadBridgeSdkScript(url);
+    const loaded = pickBridge();
+    if (isUsableBridge(loaded)) return loaded;
+  }
+  return null;
 }
 
-/** 动态插一个 bridge-sdk.js；无论成败都 resolve，是否可用由调用方复查全局。 */
+/**
+ * 动态插一个 bridge-sdk.js；无论成败都 resolve，是否可用由调用方复查全局。
+ *
+ * 注意 `?asset_token=` 不能省：sandbox iframe 是 opaque origin，Dashboard 的
+ * SameSite=Strict cookie 不会被 `<script src>` 带出去，这条路由只认 query token，
+ * 不带就是 401（AstrBot 的 PluginPageAuth 就是这么分的：视图资源走 path token，
+ * 共享的 bridge SDK 走 query token）。
+ */
 async function loadBridgeSdkScript(url) {
-  lastBridgeSdkAttempt = url;
   // file:// 下没有同源后端，补加载只会制造一条无意义的报错
   if (!url || window.location.protocol === "file:" || attemptedBridgeSdks.has(url)) {
     return false;
   }
   attemptedBridgeSdks.add(url);
+  attemptedBridgeAttempts.push(redactAssetToken(url));
 
   return new Promise((resolve) => {
     const script = document.createElement("script");
@@ -329,24 +340,34 @@ async function probeBridgeHandshake(bridgeRef) {
   }
 }
 
+/** token 是凭证，诊断里只留形式（`asset_token=***`），不要整串打进 console。 */
+function redactAssetToken(url) {
+  return String(url).replace(/([?&]asset_token=)[^&]*/i, "$1***");
+}
+
 function failBridgeMissing() {
   const inFrame = window.top !== window;
   // 只认宿主自己插的那个（data-webchat-bridge-sdk 是我们补加载时打的标记）
   const injected = [...document.querySelectorAll('script[src*="bridge-sdk.js"]')].find(
     (node) => !node.dataset.webchatBridgeSdk,
   );
+  const assetToken = assetTokenFromViewUrl(window.location);
   console.error("[WebChat] 未检测到 AstrBot 页面 Bridge", {
     inFrame,
-    href: window.location.href,
-    injected: injected ? injected.src : "宿主没有注入 bridge-sdk.js",
-    attempted: lastBridgeSdkAttempt || "（未尝试补加载）",
+    href: redactAssetToken(window.location.href),
+    hasAssetToken: !!assetToken,
+    injected: injected ? redactAssetToken(injected.src) : "宿主没有注入 bridge-sdk.js",
+    attempted: attemptedBridgeAttempts.length ? attemptedBridgeAttempts : "（未尝试补加载）",
+    hint: assetToken
+      ? "已带 asset_token 重试过：401 说明 token 过期或登录已失效，重新登录 WebUI 再进"
+      : "页面地址里没有 asset_token：确认是从插件详情页打开的视图，而不是手拼的 URL",
   });
 
   setStatus("Bridge 不可用", "error");
   toast("未检测到 AstrBot 页面 Bridge", "error");
   toast(
     inFrame
-      ? "bridge-sdk.js 没能加载：打开开发者工具看 Network 里 bridge-sdk.js 的状态码——401 是 Dashboard 登录失效，404 多半是 WebUI 挂在反向代理子路径下"
+      ? "bridge-sdk.js 加载失败（已用页面里的 asset_token 重试）：Network 里该请求 401 就重新登录一次 WebUI；404 检查反向代理是否透传 /api/"
       : "本页要在 AstrBot WebUI 的插件详情页里打开；直接访问 URL（新标签页）不会注入 bridge",
     "error",
     12000,
@@ -358,7 +379,7 @@ function failBridgeHandshake(error) {
   console.error("[WebChat] bridge 已加载，但宿主没有响应握手", {
     inFrame,
     href: window.location.href,
-    attempted: lastBridgeSdkAttempt || "（未尝试补加载）",
+    attempted: attemptedBridgeAttempts.length ? attemptedBridgeAttempts : "（未尝试补加载）",
     error: errorText(error),
   });
   setStatus("Bridge 无响应", "error");

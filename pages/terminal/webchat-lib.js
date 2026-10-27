@@ -51,6 +51,42 @@ export function bridgeSdkUrl(pathname) {
   return `${prefix}${marker}plugin/page/bridge-sdk.js`;
 }
 
+/**
+ * 从视图页面地址里取 asset_token。
+ *
+ * 这个 token 决定 bridge SDK 能不能下载到：视图 iframe 是
+ * `sandbox="allow-scripts"`（没有 allow-same-origin），文档是 opaque origin，
+ * Dashboard 那个 `SameSite=Strict` 的登录 cookie **不会**跟着 `<script src>` 发出去。
+ * AstrBot 为此给 `/api/plugin/page/bridge-sdk.js` 单独开了 query token 认证
+ * （`PluginPageAuth`：path token 给视图资源，bridge SDK 只认 query token）。
+ *
+ * 所以补加载时必须把 token 带回去，否则一定 401。token 有两个来源：
+ * query（`?asset_token=…`）和 `/views/<视图>/_t/<token>/` 路径段，两边都要认。
+ */
+export function assetTokenFromViewUrl({ pathname = "", search = "" } = {}) {
+  const query = typeof search === "string" ? search.replace(/^\?/, "") : "";
+  if (query) {
+    const fromQuery = new URLSearchParams(query).get("asset_token");
+    if (fromQuery) return fromQuery;
+  }
+  const path = typeof pathname === "string" ? pathname : "";
+  const match = /\/_t\/([^/]+)\/?/.exec(path);
+  return match ? decodeURIComponent(match[1]) : "";
+}
+
+/**
+ * 补加载 bridge SDK 的候选地址，按「最可能成功」排序。
+ *
+ * 带 token 的排前面：它在 sandbox iframe 里是唯一能通过认证的形式；
+ * 裸地址放最后兜底（同源非 sandbox 场景下 cookie 仍然生效）。
+ */
+export function bridgeSdkUrls({ pathname = "", search = "" } = {}) {
+  const base = bridgeSdkUrl(pathname);
+  const token = assetTokenFromViewUrl({ pathname, search });
+  if (!token) return [base];
+  return [`${base}?asset_token=${encodeURIComponent(token)}`, base];
+}
+
 /** 归一化单个消息片段。 */
 export function normalizeSegment(raw) {
   if (!raw || typeof raw !== "object") return null;

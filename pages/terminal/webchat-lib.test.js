@@ -9,7 +9,9 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 
 import {
+  assetTokenFromViewUrl,
   bridgeSdkUrl,
+  bridgeSdkUrls,
   compactId,
   compareSessions,
   computeWindow,
@@ -649,4 +651,71 @@ test("bridgeSdkUrl 对空值与无 /api/ 的路径给出根路径兜底", () => 
   assert.equal(bridgeSdkUrl(""), "/api/plugin/page/bridge-sdk.js");
   assert.equal(bridgeSdkUrl("/index.html"), "/api/plugin/page/bridge-sdk.js");
   assert.equal(bridgeSdkUrl(undefined), "/api/plugin/page/bridge-sdk.js");
+});
+
+// ── bridge SDK 认证 ─────────────────────────────────────
+// 视图 iframe 是 sandbox（opaque origin），Dashboard 的 SameSite=Strict cookie
+// 不会被 <script src> 带出去；/api/plugin/page/bridge-sdk.js 只认 query token，
+// 不带就是 401。所以补加载必须把页面里的 asset_token 带回去。
+
+test("assetTokenFromViewUrl 优先取 query 里的 asset_token", () => {
+  assert.equal(
+    assetTokenFromViewUrl({
+      pathname: "/api/v1/plugins/x/views/terminal/_t/path-token/",
+      search: "?asset_token=query-token&theme=light",
+    }),
+    "query-token",
+  );
+});
+
+test("assetTokenFromViewUrl 回退到 /_t/<token>/ 路径段", () => {
+  assert.equal(
+    assetTokenFromViewUrl({
+      pathname: "/api/v1/plugins/x/views/terminal/_t/path-token/",
+      search: "?theme=light",
+    }),
+    "path-token",
+  );
+  assert.equal(
+    assetTokenFromViewUrl({ pathname: "/api/plugin/page/content/x/_t/abc", search: "" }),
+    "abc",
+  );
+});
+
+test("assetTokenFromViewUrl 没有 token 时返回空串", () => {
+  assert.equal(assetTokenFromViewUrl({}), "");
+  assert.equal(assetTokenFromViewUrl({ pathname: "/index.html", search: "" }), "");
+  assert.equal(assetTokenFromViewUrl(undefined), "");
+});
+
+test("bridgeSdkUrls 把带 token 的地址排在前面（它会 401，裸地址兜底）", () => {
+  assert.deepEqual(
+    bridgeSdkUrls({
+      pathname: "/api/v1/plugins/astrbot_plugin_webchat/views/terminal/_t/tok/",
+      search: "?asset_token=tok&theme=light",
+    }),
+    [
+      "/api/plugin/page/bridge-sdk.js?asset_token=tok",
+      "/api/plugin/page/bridge-sdk.js",
+    ],
+  );
+});
+
+test("bridgeSdkUrls 保留部署前缀并对 token 做 URL 编码", () => {
+  assert.deepEqual(
+    bridgeSdkUrls({
+      pathname: "/astrbot/api/v1/plugins/x/views/terminal/_t/a+b/c/",
+      search: "?asset_token=a%2Bb%2Fc",
+    }),
+    [
+      "/astrbot/api/plugin/page/bridge-sdk.js?asset_token=a%2Bb%2Fc",
+      "/astrbot/api/plugin/page/bridge-sdk.js",
+    ],
+  );
+});
+
+test("bridgeSdkUrls 没有 token 时只给裸地址", () => {
+  assert.deepEqual(bridgeSdkUrls({ pathname: "/index.html", search: "" }), [
+    "/api/plugin/page/bridge-sdk.js",
+  ]);
 });

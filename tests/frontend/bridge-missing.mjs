@@ -106,18 +106,33 @@ try {
   check("提示说明要从插件详情页进入", toastText.includes("插件详情页"), toastText);
   check("没有 bridge 时不谎报已连接", !statusText().includes("实时连接"), statusText());
 
-  // ── 场景 2：WebUI 挂在 /astrbot 子路径下，宿主注入失败 ──
+  // ── 场景 2：/astrbot 子路径 + 宿主注入失败，且 SDK 只认 query token ──
+  // 视图 iframe 是 sandbox（opaque origin），Dashboard 的 SameSite=Strict cookie
+  // 不会被 <script src> 带出去，所以裸地址必然 401，必须带上 asset_token。
   const subpath = await bootPage(
-    "http://localhost/astrbot/api/v1/plugins/astrbot_plugin_webchat/views/terminal/_t/tok/",
+    "http://localhost/astrbot/api/v1/plugins/astrbot_plugin_webchat/views/terminal/_t/tok/" +
+      "?asset_token=tok&theme=light",
   );
-  await new Promise((r) => setTimeout(r, 300));
+  await new Promise((r) => setTimeout(r, 200));
 
-  const injected = subpath.document.querySelector("script[data-webchat-bridge-sdk]");
-  check("宿主没注入时自己补加载 bridge SDK", !!injected, String(!!injected));
+  const scripts = () => [
+    ...subpath.document.querySelectorAll("script[data-webchat-bridge-sdk]"),
+  ];
+  check("宿主没注入时自己补加载 bridge SDK", scripts().length > 0, String(scripts().length));
   check(
-    "补加载的 SDK 地址带上反向代理前缀",
-    injected?.getAttribute("src") === "/astrbot/api/plugin/page/bridge-sdk.js",
-    injected?.getAttribute("src"),
+    "第一个候选带上 asset_token（否则 sandbox 里一定 401）",
+    scripts()[0]?.getAttribute("src") ===
+      "/astrbot/api/plugin/page/bridge-sdk.js?asset_token=tok",
+    scripts()[0]?.getAttribute("src"),
+  );
+
+  // 第一个候选 401 → 必须回落到裸地址兜底，而不是直接放弃
+  scripts()[0]?.dispatchEvent(new subpath.Event("error"));
+  await new Promise((r) => setTimeout(r, 200));
+  check(
+    "带 token 失败后回落裸地址，且前缀不丢",
+    scripts()[1]?.getAttribute("src") === "/astrbot/api/plugin/page/bridge-sdk.js",
+    scripts()[1]?.getAttribute("src"),
   );
 
   // SDK 加载成功后必须继续启动，而不是继续报「Bridge 不可用」
@@ -125,10 +140,37 @@ try {
     ready: () => new Promise(() => {}),
     apiGet: () => new Promise(() => {}),
   };
-  injected?.dispatchEvent(new subpath.Event("load"));
-  await new Promise((r) => setTimeout(r, 100));
+  scripts()[1]?.dispatchEvent(new subpath.Event("load"));
+  await new Promise((r) => setTimeout(r, 120));
   const healedStatus = subpath.document.getElementById("status-text").textContent;
   check("补加载成功后不会再报 Bridge 不可用", healedStatus !== "Bridge 不可用", healedStatus);
+
+  // ── 场景 3：两个候选都失败（401）——诊断要交代 token 与尝试过的地址 ──
+  errors.length = 0;
+  const denied = await bootPage(
+    "http://localhost/api/v1/plugins/astrbot_plugin_webchat/views/terminal/_t/tok/" +
+      "?asset_token=tok&theme=light",
+  );
+  await new Promise((r) => setTimeout(r, 200));
+  const deniedScripts = () => [
+    ...denied.document.querySelectorAll("script[data-webchat-bridge-sdk]"),
+  ];
+  deniedScripts()[0]?.dispatchEvent(new denied.Event("error"));
+  await new Promise((r) => setTimeout(r, 200));
+  deniedScripts()[1]?.dispatchEvent(new denied.Event("error"));
+  await new Promise((r) => setTimeout(r, 200));
+
+  const deniedDiag = errors.find(
+    ([message]) => typeof message === "string" && message.includes("未检测到 AstrBot 页面 Bridge"),
+  );
+  check("401 后落到 Bridge 不可用", denied.document.getElementById("status-text").textContent === "Bridge 不可用");
+  check("诊断标明带了 asset_token", deniedDiag?.[1]?.hasAssetToken === true, JSON.stringify(deniedDiag?.[1] || null));
+  check(
+    "诊断列出两次尝试且 token 已打码",
+    JSON.stringify(deniedDiag?.[1]?.attempted || []).includes("asset_token=***") &&
+      (deniedDiag?.[1]?.attempted || []).length === 2,
+    JSON.stringify(deniedDiag?.[1]?.attempted || null),
+  );
 } finally {
   console.error = originalError;
   for (const file of tempFiles) fs.rmSync(file, { force: true });

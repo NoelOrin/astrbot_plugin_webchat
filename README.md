@@ -64,7 +64,7 @@ http://<你的AstrBot地址>/webui#/plugins/astrbot_plugin_webchat
 
 | 状态码 | 原因 | 处理 |
 |---|---|---|
-| `401` | Dashboard 登录状态失效 | 退出重新登录 WebUI |
+| `401` | 请求 URL 里没有 `asset_token`，或 token 已过期 | 插件 0.4.11 起会用页面地址里的 `asset_token` 重试；仍然 401 就重新登录一次 WebUI（iframe 是 sandbox，cookie 不会跟着 `<script>` 走，这条路由只认 URL 里的 token） |
 | `404` | WebUI 挂在反向代理子路径下（如 `https://域名/astrbot/`） | 插件 0.4.10 起会按页面路径自动补加载，升级后刷新即可；仍然 404 就检查反代是否透传 `/api/` |
 | 请求根本不存在 | 页面不是由 AstrBot 的视图路由返回的 | 从插件详情页重新进入 |
 
