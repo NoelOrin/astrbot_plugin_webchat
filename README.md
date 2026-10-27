@@ -53,6 +53,23 @@ git clone https://github.com/NoelOrin/astrbot_plugin_webchat.git
 http://<你的AstrBot地址>/webui#/plugins/astrbot_plugin_webchat
 ```
 
+> ⚠️ 页面**必须**从 WebUI 里打开。终端页面靠 AstrBot 注入的
+> `bridge-sdk.js` 才能调后端接口，直接在浏览器新标签页访问那个 URL 是打不开的
+> （会提示「未检测到 AstrBot 页面 Bridge」）。
+
+### 打不开终端页面？
+
+先确认你是从插件详情页进的（不是直接访问 URL）。仍然提示「未检测到 AstrBot 页面 Bridge」时，
+打开浏览器开发者工具 → Network，搜 `bridge-sdk.js`：
+
+| 状态码 | 原因 | 处理 |
+|---|---|---|
+| `401` | Dashboard 登录状态失效 | 退出重新登录 WebUI |
+| `404` | WebUI 挂在反向代理子路径下（如 `https://域名/astrbot/`） | 插件 0.4.10 起会按页面路径自动补加载，升级后刷新即可；仍然 404 就检查反代是否透传 `/api/` |
+| 请求根本不存在 | 页面不是由 AstrBot 的视图路由返回的 | 从插件详情页重新进入 |
+
+状态栏也会显示具体原因（`Bridge 不可用` / `Bridge 无响应`），Console 里有结构化诊断。
+
 ## 💬 使用
 
 1. 进入终端页面后，在左侧会话列表中选择群聊或私聊

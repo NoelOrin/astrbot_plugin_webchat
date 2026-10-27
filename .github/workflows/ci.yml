@@ -50,6 +50,9 @@ jobs:
           npm install --no-save jsdom
           node tests/frontend/dom-smoke.mjs
 
+      - name: Bridge fallback smoke test
+        run: node tests/frontend/bridge-missing.mjs
+
   metadata:
     name: Metadata sanity
     runs-on: ubuntu-latest

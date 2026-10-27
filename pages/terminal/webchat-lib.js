@@ -33,6 +33,24 @@ export function bool(value, fallback = false) {
   return fallback;
 }
 
+/**
+ * 从视图页面的 pathname 推出 bridge SDK 的地址。
+ *
+ * 宿主会往 HTML 里注入 `<script src="/api/plugin/page/bridge-sdk.js">`，
+ * 这是**绝对路径**；一旦 WebUI 被反向代理挂在子路径下（如 `/astrbot/`），
+ * 这个绝对路径就落到域名根、404，`window.AstrBotPluginView` 永远是 undefined。
+ *
+ * 视图自己的地址里带着部署前缀（`/astrbot/api/v1/plugins/<插件>/views/<视图>/_t/<令牌>/`），
+ * 所以按第一个 `/api/` 切出前缀就能还原宿主的真实入口。
+ */
+export function bridgeSdkUrl(pathname) {
+  const path = typeof pathname === "string" ? pathname : "";
+  const marker = "/api/";
+  const index = path.indexOf(marker);
+  const prefix = index > 0 ? path.slice(0, index) : "";
+  return `${prefix}${marker}plugin/page/bridge-sdk.js`;
+}
+
 /** 归一化单个消息片段。 */
 export function normalizeSegment(raw) {
   if (!raw || typeof raw !== "object") return null;

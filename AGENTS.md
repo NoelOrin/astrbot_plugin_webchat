@@ -427,6 +427,34 @@ SSE 不可用时前端每 2.5 秒拉一次 `GET /updates?after_id=<全局消息 
 - ⚠️ bridge 只有 `apiGet` / `apiPost`（新版本另有 `apiFetch`）；PATCH/DELETE 走后端 `?method=` 覆盖，后端 `_effective_method()` 解析
 - 图片走 `/media?url=` 代理，规避防盗链与混合内容
 
+## bridge 缺失时的自愈与诊断
+
+视图的所有后端能力都经 `window.AstrBotPluginView`（旧版 `AstrBotPluginPage`）转发，
+这个全局由 AstrBot 返回视图 HTML 时注入的 `/api/plugin/page/bridge-sdk.js` 提供。
+
+**三种典型故障**，以前都只丢一句「未检测到 AstrBot 页面 Bridge」：
+
+| 现象 | 真正原因 |
+|---|---|
+| 页面在浏览器里直接打开 | 没有 Dashboard 父页面 → 没有注入、也没有人能响应 postMessage |
+| `bridge-sdk.js` 404 | WebUI 挂在反向代理子路径（`/astrbot/`）下，宿主注入的是**绝对路径** |
+| `bridge-sdk.js` 401 | Dashboard 会话失效，脚本拿不到鉴权，`<script>` 不执行 |
+
+`boot()` 现在的顺序：`ensureBridge()` → 拿到 bridge 后再并行「等上下文 + 探 health」→ 再加载会话：
+
+- `ensureBridge()` 先看宿主是否已注入；没有就按 `bridgeSdkUrl(location.pathname)`
+  自己补加载一次。该纯函数按**第一个 `/api/`** 切出部署前缀
+  （`/astrbot/api/v1/plugins/...` → `/astrbot/api/plugin/page/bridge-sdk.js`），
+  所以子路径部署能自愈；地址是算出来的，**不要**改成写死 `/api/plugin/page/bridge-sdk.js`
+- 补加载只在 `http(s)` 下进行（`file://` 没有同源后端），且每个地址只试一次
+- `probeBridgeHandshake()` 用 `health` 探一次握手：bridge 存在但宿主不回话时，
+  后面的每个 `apiGet` 都会永久挂起，界面就会无声地卡在「正在连接」。
+  **只有超时**才算握手失败；宿主回了错误（端点自己抛异常）说明 bridge 是通的
+- 失败分支必须写清楚怎么查：状态栏文案 + `console.error` 结构化诊断
+  （是否在 iframe、页面地址、宿主注入情况、补加载地址）+ 一条长驻 12 秒的 toast
+- `bindBridgeContext()` 不能在 `bindEvents()` 里订阅 `onContext`：那时 bridge 还可能不存在，
+  自愈后拿到的 bridge 会漏掉主题 / 语言变化
+
 ## 配置 (`_conf_schema.json`)
 
 ```json
@@ -512,6 +540,7 @@ SSE 不可用时前端每 2.5 秒拉一次 `GET /updates?after_id=<全局消息 
 | `python -m pytest tests -q` | 存储/序列化 + 插件行为（假宿主）|
 | `node --test pages/terminal/webchat-lib.test.js` | 前端纯函数 |
 | `node tests/frontend/dom-smoke.mjs` | jsdom 端到端（需 `npm i jsdom`）|
+| `node tests/frontend/bridge-missing.mjs` | bridge 缺失 / 子路径自愈（需 `npm i jsdom`）|
 
 `tests/test_plugin.py` 用 `sys.modules` 注入假 AstrBot/Quart，因此**不需要装 AstrBot 就能跑**。
 新增宿主 API 依赖时，记得同步在 `_install_fake_astrbot()` 里补桩。

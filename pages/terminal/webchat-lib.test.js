@@ -9,6 +9,7 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 
 import {
+  bridgeSdkUrl,
   compactId,
   compareSessions,
   computeWindow,
@@ -612,4 +613,40 @@ test("normalizeSegment 保留合并转发的嵌套消息", () => {
   assert.equal(segment.messages.length, 1);
   assert.equal(segment.messages[0].name, "小明");
   assert.deepEqual(segment.messages[0].segments, [{ type: "text", text: "早" }]);
+});
+
+// ── bridge SDK 地址 ─────────────────────────────────────
+// AstrBot 注入的是绝对路径 /api/plugin/page/bridge-sdk.js；WebUI 挂在反向代理
+// 子路径下时它会 404，于是 window.AstrBotPluginView 永远是 undefined。
+// 这里锁住「按视图路径还原部署前缀」这套推导。
+
+test("bridgeSdkUrl 直接部署时指向根路径", () => {
+  assert.equal(
+    bridgeSdkUrl("/api/v1/plugins/astrbot_plugin_webchat/views/terminal/_t/tok/"),
+    "/api/plugin/page/bridge-sdk.js",
+  );
+});
+
+test("bridgeSdkUrl 保留反向代理的部署前缀", () => {
+  assert.equal(
+    bridgeSdkUrl("/astrbot/api/v1/plugins/astrbot_plugin_webchat/views/terminal/_t/tok/"),
+    "/astrbot/api/plugin/page/bridge-sdk.js",
+  );
+  assert.equal(
+    bridgeSdkUrl("/a/b/api/v1/plugins/x/views/terminal/_t/tok/"),
+    "/a/b/api/plugin/page/bridge-sdk.js",
+  );
+});
+
+test("bridgeSdkUrl 兼容旧版 /api/plugin/page/content 视图地址", () => {
+  assert.equal(
+    bridgeSdkUrl("/api/plugin/page/content/terminal/index.html"),
+    "/api/plugin/page/bridge-sdk.js",
+  );
+});
+
+test("bridgeSdkUrl 对空值与无 /api/ 的路径给出根路径兜底", () => {
+  assert.equal(bridgeSdkUrl(""), "/api/plugin/page/bridge-sdk.js");
+  assert.equal(bridgeSdkUrl("/index.html"), "/api/plugin/page/bridge-sdk.js");
+  assert.equal(bridgeSdkUrl(undefined), "/api/plugin/page/bridge-sdk.js");
 });

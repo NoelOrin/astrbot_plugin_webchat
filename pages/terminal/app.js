@@ -12,6 +12,7 @@ import {
   HISTORY_PAGE_SIZE,
   NEAR_BOTTOM_PX,
   anchorScrollTop,
+  bridgeSdkUrl,
   compactId,
   compareSessions,
   computeWindow,
@@ -58,6 +59,12 @@ const STREAM_CHECK_MS = 20000;
 const SSE_RETRY_MS = 60000;
 /** bridge 订阅迟迟不返回就当失败：宿主缓冲 SSE 时 fetch 永远等不到响应头。 */
 const STREAM_OPEN_TIMEOUT_MS = 8000;
+/** 宿主没注入 bridge SDK 时，自己补一次的最长等待。 */
+const BRIDGE_SDK_LOAD_TIMEOUT_MS = 5000;
+/** bridge 已存在但宿主迟迟不回上下文 / 不响应请求，多半是握手层坏了。 */
+const BRIDGE_HANDSHAKE_TIMEOUT_MS = 8000;
+/** 握手超时的报错文案，boot() 靠它区分「bridge 死了」和「后端端点本身报错」。 */
+const BRIDGE_HANDSHAKE_ERROR = "bridge 握手超时";
 /** 小窗自动紧凑阈值：必须与 style.css 顶部的 --compact 保持一致。 */
 const COMPACT_MEDIA = "(max-width: 900px), (max-height: 720px)";
 /** 超过这个条数就启用虚拟滚动；小会话保持全量渲染，行为与旧版一致。 */
@@ -76,8 +83,16 @@ let autoLoadedAtTop = false;
 const SESSION_PAGE_SIZE = 50;
 const DRAFT_KEY = `${PLUGIN_NAME}_draft`;
 
-const bridge = window.AstrBotPluginView || window.AstrBotPluginPage || null;
-
+/**
+ * bridge 由 AstrBot 返回视图 HTML 时注入的 bridge-sdk.js 提供：
+ * 新版叫 window.AstrBotPluginView，旧版叫 window.AstrBotPluginPage。
+ * 注入失败时这里是 null，boot() 会尝试自己补加载一次。
+ */
+let bridge = pickBridge();
+/** 已经补加载过的 SDK 地址，失败后不重复插脚本。 */
+const attemptedBridgeSdks = new Set();
+/** 上一次补加载的 SDK 地址，失败时写进报错里，省得用户去猜。 */
+let lastBridgeSdkAttempt = "";
 const elements = {
   btnCompact: document.getElementById("btn-compact"),
   btnTheme: document.getElementById("btn-theme"),
@@ -212,21 +227,178 @@ function readInitialLoadImages() {
   return stored === null ? false : stored;
 }
 
+// ── bridge 获取、自愈与诊断 ─────────────────────────────────
+// 视图跑在受限 iframe 里，所有后端能力都要经 window.AstrBotPluginView 转发。
+// 宿主正常会往 HTML 里注入 bridge-sdk.js；但注入可能没发生（页面被直接打开）
+// 或者请求失败（反向代理子路径下绝对路径 404、Dashboard 登录失效 401）。
+// 这几种情况以前只丢一句「未检测到 Bridge」，用户完全无从下手。
+
+function pickBridge() {
+  return window.AstrBotPluginView || window.AstrBotPluginPage || null;
+}
+
+function isUsableBridge(candidate) {
+  return !!candidate && typeof candidate.apiGet === "function";
+}
+
+/** 上下文变化（语言 / 主题）只在 bridge 就绪后才能订阅，所以不放在 bindEvents 里。 */
+let bridgeContextBound = false;
+function bindBridgeContext() {
+  if (bridgeContextBound || typeof bridge?.onContext !== "function") return;
+  bridgeContextBound = true;
+  bridge.onContext((context) => {
+    state.context = context;
+    syncThemeFromBridge();
+  });
+}
+
+/**
+ * 拿到可用的 bridge：优先宿主注入的那个，
+ * 没有就按当前页面路径自己补加载一次（兼容子路径部署）。
+ */
+async function ensureBridge() {
+  const injected = pickBridge();
+  if (isUsableBridge(injected)) return injected;
+
+  await loadBridgeSdkScript(bridgeSdkUrl(window.location.pathname));
+  const loaded = pickBridge();
+  return isUsableBridge(loaded) ? loaded : null;
+}
+
+/** 动态插一个 bridge-sdk.js；无论成败都 resolve，是否可用由调用方复查全局。 */
+async function loadBridgeSdkScript(url) {
+  lastBridgeSdkAttempt = url;
+  // file:// 下没有同源后端，补加载只会制造一条无意义的报错
+  if (!url || window.location.protocol === "file:" || attemptedBridgeSdks.has(url)) {
+    return false;
+  }
+  attemptedBridgeSdks.add(url);
+
+  return new Promise((resolve) => {
+    const script = document.createElement("script");
+    script.src = url;
+    script.async = true;
+    script.dataset.webchatBridgeSdk = "1";
+
+    let timer = 0;
+    const finish = (ok) => {
+      window.clearTimeout(timer);
+      resolve(ok);
+    };
+    timer = window.setTimeout(() => finish(false), BRIDGE_SDK_LOAD_TIMEOUT_MS);
+    script.addEventListener("load", () => finish(true));
+    script.addEventListener("error", () => finish(false));
+    document.head.append(script);
+  });
+}
+
+/** 等宿主回上下文；超时不算致命错误，后面用 health 探针确认真实可用性。 */
+async function readBridgeContext(bridgeRef) {
+  if (typeof bridgeRef?.ready !== "function") return null;
+  try {
+    return await withTimeout(
+      Promise.resolve(bridgeRef.ready()),
+      BRIDGE_HANDSHAKE_TIMEOUT_MS,
+    );
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * bridge 存在但宿主不回话时，后面的每个 apiGet 都会永久挂起，
+ * 界面就永远停在「正在连接」。这里先探一次 health 把死握手变成可读的报错。
+ *
+ * 注意：只有**超时**才算握手失败。宿主回了错误（比如某个后端端点抛异常）
+ * 反而证明 bridge 是通的，不该把整页判死。
+ */
+async function probeBridgeHandshake(bridgeRef) {
+  let timer = 0;
+  const timeout = new Promise((_resolve, reject) => {
+    timer = window.setTimeout(
+      () => reject(new Error(BRIDGE_HANDSHAKE_ERROR)),
+      BRIDGE_HANDSHAKE_TIMEOUT_MS,
+    );
+  });
+  try {
+    await Promise.race([Promise.resolve(bridgeRef.apiGet("health")), timeout]);
+  } catch (error) {
+    if (error instanceof Error && error.message === BRIDGE_HANDSHAKE_ERROR) throw error;
+  } finally {
+    window.clearTimeout(timer);
+  }
+}
+
+function failBridgeMissing() {
+  const inFrame = window.top !== window;
+  // 只认宿主自己插的那个（data-webchat-bridge-sdk 是我们补加载时打的标记）
+  const injected = [...document.querySelectorAll('script[src*="bridge-sdk.js"]')].find(
+    (node) => !node.dataset.webchatBridgeSdk,
+  );
+  console.error("[WebChat] 未检测到 AstrBot 页面 Bridge", {
+    inFrame,
+    href: window.location.href,
+    injected: injected ? injected.src : "宿主没有注入 bridge-sdk.js",
+    attempted: lastBridgeSdkAttempt || "（未尝试补加载）",
+  });
+
+  setStatus("Bridge 不可用", "error");
+  toast("未检测到 AstrBot 页面 Bridge", "error");
+  toast(
+    inFrame
+      ? "bridge-sdk.js 没能加载：打开开发者工具看 Network 里 bridge-sdk.js 的状态码——401 是 Dashboard 登录失效，404 多半是 WebUI 挂在反向代理子路径下"
+      : "本页要在 AstrBot WebUI 的插件详情页里打开；直接访问 URL（新标签页）不会注入 bridge",
+    "error",
+    12000,
+  );
+}
+
+function failBridgeHandshake(error) {
+  const inFrame = window.top !== window;
+  console.error("[WebChat] bridge 已加载，但宿主没有响应握手", {
+    inFrame,
+    href: window.location.href,
+    attempted: lastBridgeSdkAttempt || "（未尝试补加载）",
+    error: errorText(error),
+  });
+  setStatus("Bridge 无响应", "error");
+  toast(
+    inFrame
+      ? "AstrBot bridge 已注入但没有响应，刷新页面重试；仍然不行请重载插件"
+      : "直接访问视图 URL 时没有 Dashboard 父页面接管 bridge；请从插件详情页进入",
+    "error",
+    8000,
+  );
+}
+
 async function boot() {
   setStatus("正在连接", "loading");
-  if (!bridge || typeof bridge.apiGet !== "function") {
-    setStatus("Bridge 不可用", "error");
-    toast("未检测到 AstrBot 页面 Bridge", "error");
+  const usableBridge = await ensureBridge();
+  if (!usableBridge) {
+    failBridgeMissing();
     return;
   }
+  bridge = usableBridge;
+
   try {
-    state.context = await bridge.ready().catch(() => null);
+    // 两件事并行等：拿上下文 + 探一次握手。直接打开视图 URL 时 bridge 会跟
+    // 自己 postMessage，请求永远不回来——没有这个探针，界面会无声地卡在「正在连接」。
+    const [context] = await Promise.all([
+      readBridgeContext(bridge),
+      probeBridgeHandshake(bridge),
+    ]);
+    state.context = context;
+    bindBridgeContext();
     syncThemeFromBridge();
     await syncImagePreferenceFromConfig();
     await loadSessions({ selectInitial: true });
     connectStream();
     window.setInterval(checkStreamHealth, STREAM_CHECK_MS);
   } catch (error) {
+    if (error instanceof Error && error.message === BRIDGE_HANDSHAKE_ERROR) {
+      failBridgeHandshake(error);
+      return;
+    }
     console.error("初始化失败:", error);
     setStatus("加载失败", "error");
     toast(`初始化失败: ${errorText(error)}`, "error");
@@ -327,12 +499,7 @@ function bindEvents() {
     if (readStoredCompact() === null) applyCompactMode(event.matches, { persist: false });
   });
 
-  if (typeof bridge?.onContext === "function") {
-    bridge.onContext((context) => {
-      state.context = context;
-      syncThemeFromBridge();
-    });
-  }
+  // onContext 的注册要等 bridge 就绪，见 bindBridgeContext()
 }
 
 // ── 会话加载 ────────────────────────────────────────────────
@@ -2528,10 +2695,10 @@ function setStatus(text, mode = "default") {
   elements.status.classList.toggle("error", mode === "error");
 }
 
-function toast(message, type = "default") {
+function toast(message, type = "default", duration = 3600) {
   const node = createElement("div", `toast${type === "error" ? " error" : ""}`, message);
   elements.toastRegion.append(node);
-  window.setTimeout(() => node.remove(), 3600);
+  window.setTimeout(() => node.remove(), duration);
 }
 
 function resizeComposer() {
