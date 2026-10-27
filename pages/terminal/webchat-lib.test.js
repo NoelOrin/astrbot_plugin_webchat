@@ -30,6 +30,9 @@ import {
   normalizeSegment,
   normalizeSession,
   planMessages,
+  planAnchor,
+  scrollIntent,
+  scrollTopForAnchor,
   diffPlan,
   segmentsToText,
   shouldGroupWithPrevious,
@@ -649,4 +652,77 @@ test("bridgeSdkUrl 对空值与无 /api/ 的路径给出根路径兜底", () => 
   assert.equal(bridgeSdkUrl(""), "/api/plugin/page/bridge-sdk.js");
   assert.equal(bridgeSdkUrl("/index.html"), "/api/plugin/page/bridge-sdk.js");
   assert.equal(bridgeSdkUrl(undefined), "/api/plugin/page/bridge-sdk.js");
+});
+
+// ── 阅读位置锚点（会话级滚动意图） ──────────────────────────
+// 虚拟滚动下行高是估算的，存像素切回来必然偏；存「压在哪个 plan key、
+// 项内偏移多少」才能在行高重算后还找回原处。
+
+test("planAnchor 用 plan key 记住阅读位置，而不是像素", () => {
+  const plan = [
+    { kind: "date", key: "day:s:1" },
+    { kind: "message", key: "msg:s:1" },
+    { kind: "message", key: "msg:s:2" },
+    { kind: "message", key: "msg:s:3" },
+  ];
+  const offsets = [0, 40, 100, 250, 400];
+  assert.deepEqual(planAnchor(plan, offsets, 0), { key: "day:s:1", delta: 0 });
+  assert.deepEqual(planAnchor(plan, offsets, 120), { key: "msg:s:2", delta: 20 });
+  assert.deepEqual(planAnchor(plan, offsets, 250), { key: "msg:s:3", delta: 0 });
+  // 滚过末尾时钉在最后一项
+  assert.equal(planAnchor(plan, offsets, 9999).key, "msg:s:3");
+  assert.equal(planAnchor([], [], 100), null);
+  assert.equal(planAnchor(plan, [], 100), null);
+});
+
+test("scrollTopForAnchor 在行高重算后仍把同一项放回原位", () => {
+  const plan = [
+    { kind: "message", key: "msg:s:1" },
+    { kind: "message", key: "msg:s:2" },
+    { kind: "message", key: "msg:s:3" },
+  ];
+  // 一开始全部未测量：按 forecast=56 算，锚点 msg:s:3 在 112
+  assert.equal(
+    scrollTopForAnchor(plan, [], 56, { key: "msg:s:3", delta: 0 }),
+    112,
+  );
+  // 实测后前两条变成 200/300：同一项的真实位置是 500
+  assert.equal(
+    scrollTopForAnchor(plan, [200, 300], 56, { key: "msg:s:3", delta: 0 }),
+    500,
+  );
+  // 项内偏移要叠加
+  assert.equal(
+    scrollTopForAnchor(plan, [200, 300], 56, { key: "msg:s:3", delta: 40 }),
+    540,
+  );
+  // 锚点 key 已经不在 plan 里（消息被删/被裁）：返回 null，由调用方兜底
+  assert.equal(scrollTopForAnchor(plan, [], 56, { key: "msg:s:gone", delta: 0 }), null);
+  assert.equal(scrollTopForAnchor(plan, [], 56, null), null);
+});
+
+test("planAnchor 与 scrollTopForAnchor 互为逆运算（行高不变时）", () => {
+  const plan = Array.from({ length: 12 }, (_, index) => ({ kind: "message", key: `msg:s:${index}` }));
+  const heights = plan.map((_, index) => 40 + (index % 3) * 30);
+  const offsets = [0];
+  for (const height of heights) offsets.push(offsets.at(-1) + height);
+  for (const scrollTop of [0, 55, 130, 300, 9999]) {
+    const anchor = planAnchor(plan, offsets, scrollTop);
+    assert.equal(scrollTopForAnchor(plan, heights, 56, anchor), scrollTop);
+  }
+});
+
+test("scrollIntent：程序性滚动不改意图，用户上翻才转阅读", () => {
+  // 程序性写入（贴底、锚点回正）即使 scrollTop 变小也不能当成用户上翻，
+  // 更不能反过来把阅读态刷成跟随
+  assert.equal(scrollIntent({ prevTop: 900, nextTop: 300, programmatic: true, nearBottom: false }), null);
+  assert.equal(scrollIntent({ prevTop: 900, nextTop: 300, programmatic: true, nearBottom: true }), null);
+  // 用户把滚动条往上拖 → 阅读
+  assert.equal(scrollIntent({ prevTop: 900, nextTop: 300, programmatic: false, nearBottom: false }), "read");
+  // 用户滚回底部 → 恢复跟随
+  assert.equal(scrollIntent({ prevTop: 300, nextTop: 900, programmatic: false, nearBottom: true }), "follow");
+  // 内容变高导致 scrollTop 被动变大：既没上翻也没到底，保持原意图
+  assert.equal(scrollIntent({ prevTop: 300, nextTop: 500, programmatic: false, nearBottom: false }), null);
+  // 没有位移且不在底部：不改
+  assert.equal(scrollIntent({ prevTop: 300, nextTop: 300, programmatic: false, nearBottom: false }), null);
 });

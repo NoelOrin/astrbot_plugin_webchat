@@ -17,7 +17,7 @@ desc: >-
   - 会话管理：置顶、导出、删除会话，主动发起新会话
   - 身份映射：展示群号、私聊 ID、发送者 ID 与最新昵称
   - 数据安全：记录保存在 data/plugin_data 目录，重装插件不丢失
-version: 0.4.15
+version: 0.4.16
 author: NoelOrin
 repo: https://github.com/NoelOrin/astrbot_plugin_webchat
 astrbot_version: ">=4.0.0"

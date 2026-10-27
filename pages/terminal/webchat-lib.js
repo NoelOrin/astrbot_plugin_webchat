@@ -576,3 +576,66 @@ export function anchorScrollTop({ topPad = 0, start = 0, index = 0, heights = []
   }
   return offset + num(delta, 0);
 }
+
+// ── 会话级滚动意图 ──────────────────────────────────────────
+// 「贴底跟随」和「上翻阅读」是两种互斥的意图，必须显式表达。
+// 旧实现只在 wheel / touch 里清布尔值，于是拖动滚动条、PageUp、搜索跳转
+// 都识别不到「用户在看历史」，新消息一到就把视口拽走。
+
+/**
+ * 视口顶部压在哪一项上（按 plan key 记录，不用像素）。
+ *
+ * 虚拟滚动下行高是估算的：切走再切回、图片加载完，同一个像素值对应的
+ * 内容早就变了。只有记住「压在哪个 key、项内偏移多少」才稳定。
+ *
+ * @returns {{key:string, delta:number}|null}
+ */
+export function planAnchor(plan, offsets, scrollTop = 0) {
+  const items = Array.isArray(plan) ? plan : [];
+  const list = Array.isArray(offsets) ? offsets : [];
+  if (!items.length || list.length < 2) return null;
+  const top = Math.max(0, num(scrollTop, 0));
+  let index = 0;
+  while (index < list.length - 2 && list[index + 1] <= top) index += 1;
+  const item = items[Math.min(index, items.length - 1)];
+  if (!item?.key) return null;
+  return { key: String(item.key), delta: top - num(list[index], 0) };
+}
+
+/**
+ * 把 planAnchor 记下的位置换算回滚动位置。
+ *
+ * 行高重算后（图片加载、窗口 resize、重新测量）锚点的真实偏移会变，
+ * 这里按当前 `heights` 重新累加，找不到 key 时返回 null 交给调用方兜底。
+ */
+export function scrollTopForAnchor(plan, heights, forecast = 0, anchor = null) {
+  const items = Array.isArray(plan) ? plan : [];
+  if (!anchor?.key || !items.length) return null;
+  const index = items.findIndex((item) => item?.key === anchor.key);
+  if (index < 0) return null;
+  const fallback = Math.max(0, num(forecast, 0));
+  let offset = 0;
+  for (let cursor = 0; cursor < index; cursor += 1) {
+    const measured = num(heights?.[cursor], 0);
+    offset += measured > 0 ? measured : fallback;
+  }
+  return offset + num(anchor.delta, 0);
+}
+
+/**
+ * 一次 scroll 事件之后意图该怎么变。
+ *
+ * - 程序性滚动（贴底、锚点回正）一律不改意图：我们自己写 scrollTop 触发的
+ *   scroll 事件既不能被当成「用户上翻」，也不能反过来把阅读态刷成跟随
+ * - 非程序性且位置往上走了 → 用户在看历史
+ * - 回到接近底部 → 恢复跟随
+ * - 其余（内容变高把 scrollTop 顶大了、原地不动）保持原样，返回 null
+ *
+ * @returns {"follow"|"read"|null}
+ */
+export function scrollIntent({ prevTop = 0, nextTop = 0, programmatic = false, nearBottom = false } = {}) {
+  if (programmatic) return null;
+  if (nearBottom) return "follow";
+  if (num(nextTop, 0) < num(prevTop, 0) - 1) return "read";
+  return null;
+}

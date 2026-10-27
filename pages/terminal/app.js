@@ -32,7 +32,10 @@ import {
   normalizeMessage,
   normalizeSegment,
   normalizeSession,
+  planAnchor,
   planMessages,
+  scrollIntent,
+  scrollTopForAnchor,
   diffPlan,
   splitHighlight,
   stripMentionMarkup,
@@ -208,11 +211,17 @@ const state = {
   /** 大图预览当前展示的图片原始地址（复制链接用）。 */
   lightboxSource: "",
   /**
-   * 消息列表是否保持贴底。
-   * 会话切换 / 主动发送 / 点「新消息」时置位，用户向上滚动离开底部时清除。
-   * 这样 SSE 补历史、窗口重渲染这些**副作用渲染**不会把视口重新甩回开头。
+   * 消息列表的滚动意图，只有两态：
+   *   follow —— 贴底跟随新消息（进入会话、主动发送、点「新消息」、自己滚回底部）
+   *   read   —— 用户在往上翻看历史，新消息只弹「N 条新消息」气泡，不拽走视口
+   * 副作用渲染（SSE 补历史、窗口重渲染、图片加载）都读这个意图，
+   * 不会被当成一次性的渲染参数而丢掉。
    */
-  pinToEnd: false,
+  scrollMode: "follow",
+  /** 阅读态下视口顶部压在哪个 plan 项上：{ key, delta }。切走再切回靠它还原。 */
+  readAnchor: null,
+  /** 各会话最近一次的阅读锚点：sessionId → { key, delta }。 */
+  readAnchors: new Map(),
 };
 
 bindEvents();
@@ -448,12 +457,13 @@ function bindEvents() {
   elements.sessionMore.addEventListener("click", loadMoreSessions);
   elements.sessionList.addEventListener("scroll", handleSessionListScroll, { passive: true });
   elements.messages.addEventListener("scroll", handleMessageScroll, { passive: true });
-  // 用户主动上翻 = 明确不想被新消息拽回底部。滚轮和触摸是最可靠的信号，
-  // 用它们而不是 scroll 事件，免得把程序性滚动当成用户意图。
+  // 滚轮 / 触摸上翻是「提前」信号：scroll 事件要等下一帧才到，先用它把意图
+  // 切到阅读，避免那一瞬间到达的新消息把视口拽走。真正的判定仍统一在
+  // handleMessageScroll 里，拖动滚动条 / PageUp / Home 也能覆盖到。
   elements.messages.addEventListener(
     "wheel",
     (event) => {
-      if (event.deltaY < 0) state.pinToEnd = false;
+      if (event.deltaY < 0) setReadMode();
     },
     { passive: true },
   );
@@ -469,7 +479,7 @@ function bindEvents() {
     (event) => {
       const currentY = event.touches?.[0]?.clientY ?? touchStartY;
       // 手指往下滑 = 内容往上走 = 用户在看更早的消息
-      if (currentY - touchStartY > 8) state.pinToEnd = false;
+      if (currentY - touchStartY > 8) setReadMode();
     },
     { passive: true },
   );
@@ -712,6 +722,8 @@ function selectSession(sessionId, { scrollToBottom: shouldScroll = false, closeS
   state.newMessageCount = 0;
   state.lastNewMessageSender = "";
   hideNewMessagePill();
+  // 进会话前先把未读数记下来：下面会清掉，而「有未读就贴底」正是靠它判断
+  const unreadBefore = state.unread.get(sessionId) || 0;
   state.unread.set(sessionId, 0);
 
   elements.input.disabled = false;
@@ -728,9 +740,24 @@ function selectSession(sessionId, { scrollToBottom: shouldScroll = false, closeS
   renderSessionList();
   updateConversationHeader(session);
   renderParticipants(session);
-  // 切会话一律贴底；停留会话时只有调用方要求才贴
-  if (changed || shouldScroll) state.pinToEnd = true;
-  renderMessages({ scrollToBottom: shouldScroll || changed });
+
+  if (changed || shouldScroll) {
+    // 进入会话的落点（未读优先）：
+    //   有未读 → 贴底看最新
+    //   无未读且有阅读锚点 → 回到上次看的位置
+    //   其它 → 贴底
+    const saved = state.readAnchors.get(sessionId);
+    const restore = !shouldScroll && !unreadBefore && Boolean(saved);
+    if (restore) {
+      state.scrollMode = "read";
+      state.readAnchor = saved;
+    } else {
+      setFollowMode();
+    }
+  }
+  // 落点由上面的意图决定，不能在这里再问一次 isFollowing()：
+  // 「无未读 → 恢复阅读位置」时意图已经是 read，那样会把贴底又变成不贴
+  renderMessages();
 
   if (closeSidebar) toggleSidebar(false);
   if (changed && state.streamStarted) connectStream();
@@ -854,11 +881,11 @@ function mentionPerson(person) {
 
 function renderMessages({ scrollToBottom: shouldScroll = false } = {}) {
   // 贴底是「会话级意图」而不是「这一次调用的参数」：SSE 补历史、窗口重渲染
-  // 这类副作用渲染不传 scrollToBottom，不能因此把视口甩回会话开头
-  // 显式要求贴底的调用（发送、点「新消息」、切换会话）同时把意图置位，
-  // 让后续的新消息继续跟随，而不是只贴这一次
-  if (shouldScroll) state.pinToEnd = true;
-  const pinToEnd = shouldScroll || state.pinToEnd;
+  // 这类副作用渲染不传 scrollToBottom，不能因此把视口甩回会话开头。
+  // 显式要求贴底的调用（发送、点「新消息」）同时把意图置位，
+  // 让后续的新消息继续跟随，而不是只贴这一次。
+  if (shouldScroll) setFollowMode();
+  const follow = isFollowing();
   const sessionId = state.currentSessionId;
   const session = state.sessions.get(sessionId);
   const messages = state.messages.get(sessionId) || [];
@@ -884,7 +911,8 @@ function renderMessages({ scrollToBottom: shouldScroll = false } = {}) {
     elements.messageItems.replaceChildren();
     state.heights.clear();
     setVirtualSpacers(0, 0);
-    elements.messages.scrollTop = 0;
+    writeScrollTop(0, { force: true });
+    lastScrollTop = 0;
     state.renderPlan = [];
     state.renderSessionId = sessionId;
     state.virtualWindow = { start: 0, end: 0 };
@@ -900,7 +928,7 @@ function renderMessages({ scrollToBottom: shouldScroll = false } = {}) {
   state.virtual = virtual;
 
   if (virtual) {
-    renderVirtualWindow({ session, plan: nextPlan, pinToEnd });
+    renderVirtualWindow({ session, plan: nextPlan, pinToEnd: follow });
   } else {
     if (wasVirtual) {
       // 从虚拟窗口退回全量渲染：DOM 里只剩一段窗口节点，按 plan diff 增量修补会对不上，
@@ -915,14 +943,37 @@ function renderMessages({ scrollToBottom: shouldScroll = false } = {}) {
     state.virtualWindow = { start: 0, end: nextPlan.length };
   }
 
-  if (pinToEnd) {
+  if (follow) {
     requestAnimationFrame(() => {
-      elements.messages.scrollTop = elements.messages.scrollHeight;
+      writeScrollTop(elements.messages.scrollHeight, { force: true });
       markCurrentSessionRead();
     });
-  } else if (!virtual) {
-    elements.messages.scrollTop = previousTop;
+  } else if (virtual) {
+    // 阅读态：按 plan key 把锚点放回原处，行高重算也不会漂
+    restoreReadAnchor();
+  } else {
+    writeScrollTop(previousTop);
   }
+}
+
+/**
+ * 阅读态下把视口放回锚点。
+ *
+ * 必须按 key 重算：切走再切回、图片加载完，同一个像素对应的内容早变了。
+ * 锚点 key 已不存在（消息被删/被裁）时退化成保持当前位置。
+ */
+function restoreReadAnchor() {
+  const plan = state.renderPlan;
+  const anchor = state.readAnchor || state.readAnchors.get(state.currentSessionId);
+  if (!plan.length || !anchor) return;
+  const heights = plan.map((item) => state.heights.get(item.key));
+  const target = scrollTopForAnchor(plan, heights, averageMessageHeight(), anchor);
+  if (target == null) {
+    state.readAnchor = null;
+    return;
+  }
+  writeScrollTop(target, { force: true });
+  lastScrollTop = target;
 }
 
 // ── 虚拟滚动 ────────────────────────────────────────────────
@@ -977,12 +1028,48 @@ function renderVirtualWindow({ session, plan, pinToEnd = false }) {
     if (state.renderPlan !== plan || state.virtualWindow.start !== win.start) return;
     measureRenderedHeights(plan);
     if (pinToEnd) {
-      // 贴底：spacer 刚设好，此刻的 scrollHeight 才是真值
-      container.scrollTop = container.scrollHeight;
+      // 贴底之前必须用刚测出来的真实行高把 spacer 重算一遍。
+      //
+      // 少了这一步，scrollHeight 还是「按估算行高撑出来的」假底部：
+      // 视口落到假底部，紧接着那次 scroll 事件按这个假位置重算窗口，
+      // 于是窗口滑到会话中段，再被锚点回正钉住——表现就是「切会话停在中间/顶部」。
+      repinVirtualWindow(plan);
+      writeScrollTop(container.scrollHeight, { force: true });
+      lastScrollTop = container.scrollTop;
       return;
     }
     restoreVirtualAnchor({ plan, win, anchor, scrollTopAfterSwap });
   });
+}
+
+/**
+ * 贴底前用实测行高重算窗口与 spacer。
+ *
+ * 测过的项用真实高度，没测到的仍按估算；重算后 spacer 才是真值，
+ * 此时 scrollHeight 才代表「真实内容的底部」。
+ */
+function repinVirtualWindow(plan) {
+  const container = elements.messages;
+  const heights = plan.map((item) => state.heights.get(item.key));
+  const win = computeWindow({
+    count: plan.length,
+    heights,
+    scrollTop: container.scrollTop,
+    viewport: container.clientHeight || 0,
+    forecast: averageMessageHeight(),
+    overscan: VIRTUAL_OVERSCAN,
+    minRender: VIRTUAL_MIN_RENDER,
+    pinToEnd: true,
+  });
+  if (state.renderPlan !== plan) return;
+  const fragment = document.createDocumentFragment();
+  for (let index = win.start; index < win.end; index += 1) {
+    fragment.append(buildPlanNode(plan[index], state.sessions.get(state.currentSessionId)));
+  }
+  elements.messageItems.replaceChildren(fragment);
+  setVirtualSpacers(win.topPad, win.bottomPad);
+  state.virtualWindow = { start: win.start, end: win.end };
+  measureRenderedHeights(plan);
 }
 
 /**
@@ -1033,7 +1120,9 @@ function refreshVirtualWindow() {
   const session = state.sessions.get(state.currentSessionId);
   const plan = state.renderPlan;
   if (!session || !plan.length) return;
-  renderVirtualWindow({ session, plan, pinToEnd: false });
+  // 跟随态重渲染必须继续贴底：这里以前硬编码 false，等于每滚动一次就把
+  // 会话级贴底意图丢掉，窗口于是按当前（可能是假的）位置重算。
+  renderVirtualWindow({ session, plan, pinToEnd: isFollowing() });
 }
 
 /** 按 diff 结果做最小 DOM 变更，而不是每次重建整棵树。 */
@@ -1245,8 +1334,18 @@ function buildImage(source) {
     openLightbox(image.src, source);
   });
   image.addEventListener("load", () => {
-    // 图片真实尺寸决定了行高，加载完回写一次长度，虚拟窗口才不会跳
-    if (state.virtual) requestAnimationFrame(() => measureRenderedHeights(state.renderPlan));
+    // 图片真实尺寸决定了行高：先回写长度，再按当前意图重新定位。
+    // 跟随态要重新贴底（行高变大后原来的底部不再是底部），
+    // 阅读态则按锚点把视口放回原处，不能因为图片撑高就把内容顶走。
+    if (!state.virtual) return;
+    requestAnimationFrame(() => {
+      measureRenderedHeights(state.renderPlan);
+      if (isFollowing()) {
+        writeScrollTop(elements.messages.scrollHeight, { force: true });
+      } else {
+        restoreReadAnchor();
+      }
+    });
   });
   image.addEventListener("error", () => {
     image.replaceWith(createElement("span", "message-media-fallback", "[图片加载失败]"));
@@ -1373,6 +1472,73 @@ async function fetchForwardMessages(sessionId, forwardId) {
 
 // ── 滚动与未读 ──────────────────────────────────────────────
 
+/**
+ * 所有程序性滚动都必须走这里。
+ *
+ * `scroll` 事件不区分「用户滚的」和「代码滚的」：贴底、锚点回正都会触发它。
+ * 如果不打标记，这些事件会被当成用户上翻（或者反过来把阅读态刷成跟随）。
+ *
+ * 标记记的是「我们期望落在哪个位置」而不是计数器：计数器在
+ * 「写了但浏览器没发 scroll」时会残留，之后第一次真实用户滚动就会被
+ * 误判成程序性滚动，上翻直接失效。按目标值匹配则天然自愈。
+ */
+let programmaticTarget = null;
+
+function writeScrollTop(value, { force = false } = {}) {
+  const container = elements.messages;
+  // 自己先钳到合法范围：写超了浏览器会悄悄改成 maxTop，
+  // 目标值就对不上，紧接着那次 scroll 会被当成用户滚动
+  const maxTop = Math.max(0, Math.round(container.scrollHeight - container.clientHeight));
+  const next = Math.min(Math.max(0, Math.round(Number(value) || 0)), maxTop);
+  if (!force && Math.abs(next - container.scrollTop) < 1) return;
+  programmaticTarget = next;
+  container.scrollTop = next;
+}
+
+/** 读当前意图是否贴底跟随。 */
+function isFollowing() {
+  return state.scrollMode === "follow";
+}
+
+/** 切到「跟随」：贴底 + 清未读。 */
+function setFollowMode() {
+  state.scrollMode = "follow";
+  state.readAnchor = null;
+  if (state.currentSessionId) state.readAnchors.delete(state.currentSessionId);
+}
+
+/** 切到「阅读」：记下视口锚点，之后新消息不再拽走视口。 */
+function setReadMode() {
+  if (state.scrollMode === "read") return;
+  state.scrollMode = "read";
+  rememberReadAnchor();
+}
+
+/** 把当前视口位置记成阅读锚点（按 plan key，不按像素）。 */
+function rememberReadAnchor() {
+  const sessionId = state.currentSessionId;
+  if (!sessionId) return;
+  const plan = state.renderPlan;
+  const container = elements.messages;
+  if (!plan.length) return;
+  const offsets = virtualOffsets(plan);
+  const anchor = planAnchor(plan, offsets, container.scrollTop);
+  if (!anchor) return;
+  state.readAnchor = anchor;
+  state.readAnchors.set(sessionId, anchor);
+}
+
+/** 按当前 plan 与实测行高算累计偏移。 */
+function virtualOffsets(plan) {
+  const forecast = averageMessageHeight();
+  const offsets = [0];
+  for (const item of plan) {
+    const measured = state.heights.get(item.key) || 0;
+    offsets.push(offsets[offsets.length - 1] + (measured > 0 ? measured : forecast));
+  }
+  return offsets;
+}
+
 function isNearBottomOfMessageList() {
   return isNearBottom(
     {
@@ -1386,12 +1552,35 @@ function isNearBottomOfMessageList() {
 
 let virtualScrollFrame = 0;
 
+let lastScrollTop = 0;
+
 function handleMessageScroll() {
-  // 回到底部就恢复贴底。清除只由用户主动上翻（wheel / 手指下拉）触发：
-  // 渲染时我们自己改 scrollTop 也会发 scroll 事件，在这里清除会把意图误抹掉，
-  // 之后新消息就不再跟随了。
-  if (isNearBottomOfMessageList()) state.pinToEnd = true;
-  if (isNearBottomOfMessageList() && (state.unread.get(state.currentSessionId) || 0) > 0) {
+  const container = elements.messages;
+  const programmatic = programmaticTarget !== null && Math.abs(container.scrollTop - programmaticTarget) <= 2;
+  if (programmatic) programmaticTarget = null;
+  const nearBottom = isNearBottomOfMessageList();
+
+  // 意图由「谁在滚 + 往哪滚」判定，不再只认 wheel/touch：
+  // 拖动滚动条、PageUp/Home、搜索跳转同样是用户在看历史。
+  const next = scrollIntent({
+    prevTop: lastScrollTop,
+    nextTop: container.scrollTop,
+    programmatic,
+    nearBottom,
+  });
+  lastScrollTop = container.scrollTop;
+  if (next === "read") {
+    setReadMode();
+    rememberReadAnchor();
+  } else if (next === "follow") {
+    setFollowMode();
+  } else if (state.scrollMode === "read") {
+    // 阅读态下每一次用户位移都要刷新锚点：否则自动加载更早消息、图片撑高
+    // 这类重渲染会把视口带回「上一次记录的位置」，而不是用户现在看的地方
+    rememberReadAnchor();
+  }
+
+  if (nearBottom && (state.unread.get(state.currentSessionId) || 0) > 0) {
     markCurrentSessionRead();
   }
   maybeAutoLoadOlder();
@@ -1427,7 +1616,7 @@ function markCurrentSessionRead() {
 
 function scrollToBottom(smooth = false) {
   // 点「新消息」气泡 = 重新贴底，后续的副作用渲染也要保持这个意图
-  state.pinToEnd = true;
+  setFollowMode();
   if (state.virtual) {
     const session = state.sessions.get(state.currentSessionId);
     if (session) renderVirtualWindow({ session, plan: state.renderPlan, pinToEnd: true });
@@ -1898,7 +2087,9 @@ async function jumpToMessage(message) {
   }
 
   if (target) {
+    setReadMode();
     target.scrollIntoView({ block: "center", behavior: "smooth" });
+    window.setTimeout(rememberReadAnchor, 350);
     target.classList.add("flash");
     window.setTimeout(() => target.classList.remove("flash"), 1600);
   } else {
@@ -1923,7 +2114,11 @@ function scrollVirtualWindowToMessage(message) {
   for (let cursor = 0; cursor < index; cursor += 1) {
     offset += state.heights.get(plan[cursor].key) || forecast;
   }
-  elements.messages.scrollTop = offset;
+  // 搜索跳转 = 用户要看历史里的某条：明确切到阅读态，
+  // 否则新消息一到又会被拽回底部
+  setReadMode();
+  writeScrollTop(offset, { force: true });
+  lastScrollTop = offset;
   renderVirtualWindow({ session, plan, pinToEnd: false });
   return elements.messageItems.querySelector(
     `[data-message-id="${CSS.escape(String(message.id))}"]`,
@@ -2506,7 +2701,7 @@ function handleIncomingMessage(raw, { summary = false } = {}) {
   }
   const isCurrent = sessionId === state.currentSessionId && !summary;
   // 跟随新消息看「贴底意图」：用户上翻过就不再拽回来，否则一直跟随
-  const shouldFollow = isCurrent && (state.pinToEnd || isNearBottomOfMessageList());
+  const shouldFollow = isCurrent && (isFollowing() || isNearBottomOfMessageList());
   const previousTop = elements.messages.scrollTop;
 
   session.messageCount += 1;
@@ -2904,6 +3099,9 @@ function applyLoadImages(enabled, { persist = true } = {}) {
     }
   }
   syncImagesControl();
+  // 图片与占位的高度差很多（一张图能差 200px 以上），旧的实测行高全部作废，
+  // 否则重渲染会按过期行高算 spacer，视口又被甩到别处
+  state.heights.clear();
   // 已渲染的图片/占位要跟着变，切会话时整树重建，这里同样强制重建
   state.renderSessionId = "";
   if (state.currentSessionId) renderMessages();

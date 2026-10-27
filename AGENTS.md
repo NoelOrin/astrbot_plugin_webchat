@@ -165,7 +165,7 @@ plan 超过 `VIRTUAL_THRESHOLD`（80）时只渲染视口附近的一段节点�
 - `computeWindow()`（webchat-lib，纯函数）按「实测行高 + 估算行高」算出
   `{start, end, topPad, bottomPad, offsets}`；`offsets` 是每项的累计偏移，供锚点定位
 - 行高渲染后回写到 `state.heights`（key = plan item key），图片加载/窗口 resize 后下次滚动自然重算
-- 滚动用 rAF 节流；贴底时 `pinToEnd` 让窗口钉在尾部
+- 滚动用 rAF 节流；贴底时 `pinToEnd: true` 让窗口钉在尾部（由 `state.scrollMode` 决定，见下文）
 - **每次窗口平移都用锚点回正 `scrollTop`**：`windowAnchor()` 记住视口顶部压在哪一项、
   项内偏移多少，渲染+测量后再用 `anchorScrollTop()` 把它放回原位置
 - 触顶自动加载更早消息（`AUTO_LOAD_TOP_PX`），同一段「贴顶」只补一页，离开顶部后重新武装
@@ -190,28 +190,68 @@ plan 超过 `VIRTUAL_THRESHOLD`（80）时只渲染视口附近的一段节点�
 > ⚠️ 从虚拟窗口退回全量渲染（消息删到 ≤80 条）时不能走 `diffPlan`：DOM 里只有一段窗口节点，
 > 增量修补会对不上，必须整树重建。
 
-### 贴底是「会话级意图」，不是单次渲染参数
+### 滚动是「会话级意图」，不是单次渲染参数
 
-`state.pinToEnd` 决定消息列表是否贴底：
+`state.scrollMode` 只有两态，别再引入布尔值（0.4.13 的 `pinToEnd` 已废弃）：
 
-- **置位**：会话切换、主动发送、点「新消息」、`renderMessages({scrollToBottom:true})`、
-  以及用户自己滚回底部（`handleMessageScroll` 里 `isNearBottom` 为真）
-- **清除**：只在**用户主动上翻**时——`wheel` 且 `deltaY < 0`，或触摸下拉超过 8px。
-  **不要**在 `scroll` 事件里按 `isNearBottom` 清除：渲染时我们自己改 `scrollTop`
-  也会发 scroll 事件，那样会把意图误抹掉，下一条新消息就不再跟随（0.4.13 的 bug）
+| 态 | 含义 |
+|---|---|
+| `follow` | 贴底跟随新消息；新消息到达时清未读、不弹气泡 |
+| `read` | 用户在上翻看历史；新消息只弹「N 条新消息」气泡，视口不动 |
 
-`renderMessages()` 用 `pinToEnd = scrollToBottom || state.pinToEnd` 决定窗口，
-所以 SSE 补历史（`streamOpened` 里的 `renderMessages()`）、窗口重渲染这些
-**副作用渲染**不会把视口甩回会话开头。
+**置位 `follow`**：主动发送、点「新消息」气泡、用户自己滚回底部（距底 ≤ `NEAR_BOTTOM_PX`）。
+**置位 `read`**：用户把视口往上移（`scrollTop` 变小），来源不限——滚轮、触摸、
+**拖动滚动条、PageUp/Home、搜索跳转**都算。
 
-> ⚠️ 切换会话时 `scrollTop` 会被归零重建，**必须**同时 `pinToEnd`，
-> 否则新会话停在最顶上。虚拟滚动路径还要在 spacer 设好之后的 rAF 里
-> `container.scrollTop = container.scrollHeight`——那才是 scrollHeight 的真值。
-> 新消息到达时的跟随条件是 `isCurrent && (state.pinToEnd || isNearBottom)`，
-> 不是只看 `isNearBottom`。
-> `dom-smoke` 的「切回长会话默认落在最新消息」「连续新消息始终贴底」
-> 「发送后新消息继续跟随」「用户上翻后新消息不拽回底部」「点当前会话不会把视口拽回底部」
-> 守着这些行为。
+> ⚠️ 上翻判定必须放在 `scroll` 事件里，**不能只靠 wheel/touch**。
+> 0.4.15 只在 `wheel`/`touchmove` 里清意图，于是拖滚动条、PageUp、搜索跳转
+> 都被当成「还在跟随」，新消息一到就把正在读历史的视口拽回底部。
+> `webchat-lib.scrollIntent()` 统一判：程序性滚动 → 不改意图；接近底部 → `follow`；
+> 位置变小 → `read`；其余（内容变高把 scrollTop 顶大了）→ 保持原样。
+
+> ⚠️ **所有程序性滚动必须走 `writeScrollTop()`**。`scroll` 事件不区分「用户滚的」
+> 和「代码滚的」，不打标记就会互相误判。标记记的是**目标值**而不是计数器：
+> 计数器在「写了但浏览器没发 scroll」时会残留，之后第一次真实用户滚动就被误判成
+> 程序性滚动，上翻直接失效。`writeScrollTop()` 还会自己钳到合法范围——
+> 写超了浏览器会静默改成 `maxTop`，目标值对不上就又被当成用户滚动。
+
+### 进入会话的落点（未读优先）
+
+`selectSession()` 按「有未读 → 贴底，无未读 → 恢复上次阅读位置」决定：
+
+| 条件 | 落点 |
+|---|---|
+| 有未读 | 贴底看最新，并清未读 |
+| 无未读且有阅读锚点 | 回到上次阅读位置（`read` 态） |
+| 其余（首次进入、空会话） | 贴底 |
+
+> ⚠️ 未读数必须在 `state.unread.set(sessionId, 0)` **之前**读出来，
+> 否则永远是 0，「有未读就贴底」这条永远不会生效。
+
+### 阅读位置按 plan key 锚定，不按像素
+
+`state.readAnchors`（sessionId → `{key, delta}`）记的是「视口顶部压在哪一个 plan 项上」。
+虚拟滚动下行高是估算的：切走再切回、图片加载完，同一个像素值对应的内容早就变了。
+`planAnchor()` / `scrollTopForAnchor()` 负责换算，行高重算后仍能把同一项放回原位。
+
+### 贴底前必须用实测行高重算 spacer
+
+`renderVirtualWindow()` 的 rAF 里，`measureRenderedHeights()` **之后**要调
+`repinVirtualWindow()` 按实测高度重算 spacer，然后才 `scrollTop = scrollHeight`。
+
+> ⚠️ 少了这一步，`scrollHeight` 还是「按估算行高撑出来的」**假底部**：
+> 视口落到假底部，紧接着那次 `scroll` 事件按这个假位置重算窗口，
+> 窗口就滑到会话中段，再被锚点回正钉住——表现就是**切会话停在顶部/中间**（0.4.15 的 bug）。
+> 顺带把 `refreshVirtualWindow()` 的 `pinToEnd` 改成 `isFollowing()`：
+> 以前硬编码 `false`，等于每滚动一次就把会话级贴底意图丢掉。
+
+> ⚠️ 图片加载完成、图片开关切换都会改变行高：`applyLoadImages()` 必须
+> `state.heights.clear()`，图片 `load` 回调里按当前意图重新定位
+> （`follow` 重新贴底、`read` 按锚点回正）。
+
+> `tests/frontend/scroll-layout.mjs` 用**真实布局桩**（行高由内容算、scrollHeight 由
+> spacer + 行高合成、scrollTop 会被钳制）锁住这些行为。jsdom 默认没有布局，
+> 行高恒为 0，这类 bug 在 `dom-smoke` 里根本不可见——这正是 0.4.15 漏掉它的原因。
 
 ## 引用回复
 
@@ -628,6 +668,7 @@ bridge SDK 本质就是一段 postMessage 转发器，协议很短。我们**自
 | `python -m pytest tests -q` | 存储/序列化 + 插件行为（假宿主）|
 | `node --test pages/terminal/webchat-lib.test.js` | 前端纯函数 |
 | `node tests/frontend/dom-smoke.mjs` | jsdom 端到端（需 `npm i jsdom`）|
+| `node tests/frontend/scroll-layout.mjs` | 滚动意图与贴底（真实布局桩，需 `npm i jsdom`）|
 | `node tests/frontend/bridge-missing.mjs` | bridge 缺失时的诊断与自带客户端（需 `npm i jsdom`）|
 | `node --test tests/frontend/plugin-bridge.test.mjs` | 自带 bridge 客户端的协议（假父窗口）|
 
