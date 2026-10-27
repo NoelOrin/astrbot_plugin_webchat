@@ -704,21 +704,84 @@ check("最后一页后隐藏加载更多", doc.getElementById("session-more").hi
     parseFloat(doc.getElementById("virtual-bottom").style.height || "0") === 0,
     doc.getElementById("virtual-bottom").style.height);
 
-  // 点「当前会话」不该把视口拽回底部：只有真的换了会话才贴底。
+  // 用户上翻（wheel 向上）后，新消息不该把视口拽回底部
   // jsdom 没有布局，给消息列表补上 scrollHeight/clientHeight，让 isNearBottom 真实可算
   const list = doc.getElementById("messages");
   Object.defineProperty(list, "scrollHeight", { get: () => 8000, configurable: true });
   Object.defineProperty(list, "clientHeight", { get: () => 600, configurable: true });
   list.scrollTop = 4000;
+  list.dispatchEvent(new window.WheelEvent("wheel", { deltaY: -120, bubbles: true }));
   list.dispatchEvent(new window.Event("scroll"));
   await new Promise((r) => setTimeout(r, 150));
-  const topBeforeRepeatClick = parseFloat(doc.getElementById("virtual-top").style.height || "0");
+
+  const topBeforeScrolledIncoming = parseFloat(doc.getElementById("virtual-top").style.height || "0");
+  window.__sseHandlers.onMessage({ eventType: "message", parsed: {
+    id: 2300, session_id: "aiocqhttp:FriendMessage:9", type: "received",
+    sender: "灌水", sender_id: "u10", sender_name: "灌水", content: "上翻后到达的消息",
+    segments: [{ type: "text", text: "上翻后到达的消息" }], timestamp: 1700040000 } });
+  await new Promise((r) => setTimeout(r, 200));
+  const topAfterScrolledIncoming = parseFloat(doc.getElementById("virtual-top").style.height || "0");
+  check("用户上翻后新消息不拽回底部",
+    topAfterScrolledIncoming === topBeforeScrolledIncoming,
+    `${topBeforeScrolledIncoming} -> ${topAfterScrolledIncoming}`);
+
+  // 点「当前会话」不该把视口拽回底部：只有真的换了会话才贴底
   [...doc.querySelectorAll(".session-item")].find((el) => el.textContent.includes("小红")).click();
   await new Promise((r) => setTimeout(r, 150));
   const topAfterRepeatClick = parseFloat(doc.getElementById("virtual-top").style.height || "0");
   check("点当前会话不会把视口拽回底部",
-    topAfterRepeatClick === topBeforeRepeatClick,
-    `${topBeforeRepeatClick} -> ${topAfterRepeatClick}`);
+    topAfterRepeatClick === topAfterScrolledIncoming,
+    `${topAfterScrolledIncoming} -> ${topAfterRepeatClick}`);
+}
+
+// ── 连续新消息：一直跟随，不会因为渲染自身触发的 scroll 事件丢意图 ──
+{
+  const clickSession = (name) => [...doc.querySelectorAll(".session-item")]
+    .find((el) => el.textContent.includes(name)).click();
+  clickSession("小红");
+  await new Promise((r) => setTimeout(r, 200));
+
+  // 先把视口滚回底部（等价于用户自己滚到底），意图随之恢复
+  const list = doc.getElementById("messages");
+  list.scrollTop = 7300;
+  list.dispatchEvent(new window.Event("scroll"));
+  await new Promise((r) => setTimeout(r, 120));
+
+  // 连续推三条，必须一直跟随
+  for (const [index, id] of [2400, 2401, 2402].entries()) {
+    window.__sseHandlers.onMessage({ eventType: "message", parsed: {
+      id, session_id: "aiocqhttp:FriendMessage:9", type: "received",
+      sender: "灌水", sender_id: "u10", sender_name: "灌水", content: `连发 ${index}`,
+      segments: [{ type: "text", text: `连发 ${index}` }], timestamp: 1700050000 + index } });
+    await new Promise((r) => setTimeout(r, 120));
+  }
+
+  const rows = [...doc.querySelectorAll("#message-items .message-row")];
+  check("连续新消息始终贴底",
+    rows.at(-1)?.getAttribute("data-message-id") === "2402",
+    `末条=${rows.at(-1)?.getAttribute("data-message-id")}`);
+  check("连续新消息后底部无多余 spacer",
+    parseFloat(doc.getElementById("virtual-bottom").style.height || "0") === 0,
+    doc.getElementById("virtual-bottom").style.height);
+
+  // 发送一条 = 明确回到底部，之后的新消息也要继续跟随
+  const input = doc.getElementById("input");
+  input.value = "发完继续跟随";
+  input.dispatchEvent(new window.Event("input", { bubbles: true }));
+  doc.getElementById("composer")
+    .dispatchEvent(new window.Event("submit", { bubbles: true, cancelable: true }));
+  await new Promise((r) => setTimeout(r, 250));
+
+  window.__sseHandlers.onMessage({ eventType: "message", parsed: {
+    id: 2500, session_id: "aiocqhttp:FriendMessage:9", type: "received",
+    sender: "灌水", sender_id: "u10", sender_name: "灌水", content: "发完后的新消息",
+    segments: [{ type: "text", text: "发完后的新消息" }], timestamp: 1700060000 } });
+  await new Promise((r) => setTimeout(r, 200));
+
+  const rowsAfterSend = [...doc.querySelectorAll("#message-items .message-row")];
+  check("发送后新消息继续跟随",
+    rowsAfterSend.at(-1)?.getAttribute("data-message-id") === "2500",
+    `末条=${rowsAfterSend.at(-1)?.getAttribute("data-message-id")} / toast=${doc.getElementById("toast-region").textContent}`);
 }
 
 // 快速切换：尚未返回的旧订阅也必须退订，不能取代新订阅。

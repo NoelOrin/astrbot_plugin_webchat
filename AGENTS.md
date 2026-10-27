@@ -192,8 +192,13 @@ plan 超过 `VIRTUAL_THRESHOLD`（80）时只渲染视口附近的一段节点�
 
 ### 贴底是「会话级意图」，不是单次渲染参数
 
-`state.pinToEnd` 决定消息列表是否贴底，由**会话切换 / 主动发送 / 点「新消息」**置位，
-用户向上滚动离开底部（`handleMessageScroll` 里 `isNearBottom` 为假）时清除。
+`state.pinToEnd` 决定消息列表是否贴底：
+
+- **置位**：会话切换、主动发送、点「新消息」、`renderMessages({scrollToBottom:true})`、
+  以及用户自己滚回底部（`handleMessageScroll` 里 `isNearBottom` 为真）
+- **清除**：只在**用户主动上翻**时——`wheel` 且 `deltaY < 0`，或触摸下拉超过 8px。
+  **不要**在 `scroll` 事件里按 `isNearBottom` 清除：渲染时我们自己改 `scrollTop`
+  也会发 scroll 事件，那样会把意图误抹掉，下一条新消息就不再跟随（0.4.13 的 bug）
 
 `renderMessages()` 用 `pinToEnd = scrollToBottom || state.pinToEnd` 决定窗口，
 所以 SSE 补历史（`streamOpened` 里的 `renderMessages()`）、窗口重渲染这些
@@ -202,8 +207,11 @@ plan 超过 `VIRTUAL_THRESHOLD`（80）时只渲染视口附近的一段节点�
 > ⚠️ 切换会话时 `scrollTop` 会被归零重建，**必须**同时 `pinToEnd`，
 > 否则新会话停在最顶上。虚拟滚动路径还要在 spacer 设好之后的 rAF 里
 > `container.scrollTop = container.scrollHeight`——那才是 scrollHeight 的真值。
-> `dom-smoke` 的「切回长会话默认落在最新消息」「长会话新消息到达后仍贴底」
-> 「点当前会话不会把视口拽回底部」守着这三条。
+> 新消息到达时的跟随条件是 `isCurrent && (state.pinToEnd || isNearBottom)`，
+> 不是只看 `isNearBottom`。
+> `dom-smoke` 的「切回长会话默认落在最新消息」「连续新消息始终贴底」
+> 「发送后新消息继续跟随」「用户上翻后新消息不拽回底部」「点当前会话不会把视口拽回底部」
+> 守着这些行为。
 
 ## 引用回复
 

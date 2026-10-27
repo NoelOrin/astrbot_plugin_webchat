@@ -77,6 +77,8 @@ const MESSAGE_HEIGHT_FALLBACK = 56;
 const AUTO_LOAD_TOP_PX = 120;
 /** 同一段「贴顶」只自动补一页；离开顶部（或切会话）后重新武装。 */
 let autoLoadedAtTop = false;
+/** 触摸起点，用来判断用户是上翻还是下拉。 */
+let touchStartY = 0;
 /** 会话列表每页条数。 */
 const SESSION_PAGE_SIZE = 50;
 const DRAFT_KEY = `${PLUGIN_NAME}_draft`;
@@ -446,6 +448,31 @@ function bindEvents() {
   elements.sessionMore.addEventListener("click", loadMoreSessions);
   elements.sessionList.addEventListener("scroll", handleSessionListScroll, { passive: true });
   elements.messages.addEventListener("scroll", handleMessageScroll, { passive: true });
+  // 用户主动上翻 = 明确不想被新消息拽回底部。滚轮和触摸是最可靠的信号，
+  // 用它们而不是 scroll 事件，免得把程序性滚动当成用户意图。
+  elements.messages.addEventListener(
+    "wheel",
+    (event) => {
+      if (event.deltaY < 0) state.pinToEnd = false;
+    },
+    { passive: true },
+  );
+  elements.messages.addEventListener(
+    "touchstart",
+    (event) => {
+      touchStartY = event.touches?.[0]?.clientY ?? 0;
+    },
+    { passive: true },
+  );
+  elements.messages.addEventListener(
+    "touchmove",
+    (event) => {
+      const currentY = event.touches?.[0]?.clientY ?? touchStartY;
+      // 手指往下滑 = 内容往上走 = 用户在看更早的消息
+      if (currentY - touchStartY > 8) state.pinToEnd = false;
+    },
+    { passive: true },
+  );
 
   elements.messageSearch.addEventListener("input", debounce(onSearchInput, 260));
   elements.btnDiscover.addEventListener("click", runDiscovery);
@@ -828,6 +855,9 @@ function mentionPerson(person) {
 function renderMessages({ scrollToBottom: shouldScroll = false } = {}) {
   // 贴底是「会话级意图」而不是「这一次调用的参数」：SSE 补历史、窗口重渲染
   // 这类副作用渲染不传 scrollToBottom，不能因此把视口甩回会话开头
+  // 显式要求贴底的调用（发送、点「新消息」、切换会话）同时把意图置位，
+  // 让后续的新消息继续跟随，而不是只贴这一次
+  if (shouldScroll) state.pinToEnd = true;
   const pinToEnd = shouldScroll || state.pinToEnd;
   const sessionId = state.currentSessionId;
   const session = state.sessions.get(sessionId);
@@ -1357,8 +1387,10 @@ function isNearBottomOfMessageList() {
 let virtualScrollFrame = 0;
 
 function handleMessageScroll() {
-  // 用户自己往上翻就取消贴底，否则新消息会把视口拽回底部
-  if (!isNearBottomOfMessageList()) state.pinToEnd = false;
+  // 回到底部就恢复贴底。清除只由用户主动上翻（wheel / 手指下拉）触发：
+  // 渲染时我们自己改 scrollTop 也会发 scroll 事件，在这里清除会把意图误抹掉，
+  // 之后新消息就不再跟随了。
+  if (isNearBottomOfMessageList()) state.pinToEnd = true;
   if (isNearBottomOfMessageList() && (state.unread.get(state.currentSessionId) || 0) > 0) {
     markCurrentSessionRead();
   }
@@ -2473,7 +2505,8 @@ function handleIncomingMessage(raw, { summary = false } = {}) {
     return;
   }
   const isCurrent = sessionId === state.currentSessionId && !summary;
-  const shouldFollow = isCurrent && isNearBottomOfMessageList();
+  // 跟随新消息看「贴底意图」：用户上翻过就不再拽回来，否则一直跟随
+  const shouldFollow = isCurrent && (state.pinToEnd || isNearBottomOfMessageList());
   const previousTop = elements.messages.scrollTop;
 
   session.messageCount += 1;
