@@ -205,6 +205,12 @@ const state = {
   loadedImages: new Set(),
   /** 大图预览当前展示的图片原始地址（复制链接用）。 */
   lightboxSource: "",
+  /**
+   * 消息列表是否保持贴底。
+   * 会话切换 / 主动发送 / 点「新消息」时置位，用户向上滚动离开底部时清除。
+   * 这样 SSE 补历史、窗口重渲染这些**副作用渲染**不会把视口重新甩回开头。
+   */
+  pinToEnd: false,
 };
 
 bindEvents();
@@ -665,7 +671,7 @@ function renderSessionList() {
 
 // ── 会话切换 ────────────────────────────────────────────────
 
-function selectSession(sessionId, { scrollToBottom: shouldScroll = true, closeSidebar = true } = {}) {
+function selectSession(sessionId, { scrollToBottom: shouldScroll = false, closeSidebar = true } = {}) {
   const session = state.sessions.get(sessionId);
   if (!session) return;
 
@@ -695,6 +701,8 @@ function selectSession(sessionId, { scrollToBottom: shouldScroll = true, closeSi
   renderSessionList();
   updateConversationHeader(session);
   renderParticipants(session);
+  // 切会话一律贴底；停留会话时只有调用方要求才贴
+  if (changed || shouldScroll) state.pinToEnd = true;
   renderMessages({ scrollToBottom: shouldScroll || changed });
 
   if (closeSidebar) toggleSidebar(false);
@@ -818,6 +826,9 @@ function mentionPerson(person) {
 // ── 消息渲染 ────────────────────────────────────────────────
 
 function renderMessages({ scrollToBottom: shouldScroll = false } = {}) {
+  // 贴底是「会话级意图」而不是「这一次调用的参数」：SSE 补历史、窗口重渲染
+  // 这类副作用渲染不传 scrollToBottom，不能因此把视口甩回会话开头
+  const pinToEnd = shouldScroll || state.pinToEnd;
   const sessionId = state.currentSessionId;
   const session = state.sessions.get(sessionId);
   const messages = state.messages.get(sessionId) || [];
@@ -859,7 +870,7 @@ function renderMessages({ scrollToBottom: shouldScroll = false } = {}) {
   state.virtual = virtual;
 
   if (virtual) {
-    renderVirtualWindow({ session, plan: nextPlan, pinToEnd: shouldScroll });
+    renderVirtualWindow({ session, plan: nextPlan, pinToEnd });
   } else {
     if (wasVirtual) {
       // 从虚拟窗口退回全量渲染：DOM 里只剩一段窗口节点，按 plan diff 增量修补会对不上，
@@ -874,7 +885,7 @@ function renderMessages({ scrollToBottom: shouldScroll = false } = {}) {
     state.virtualWindow = { start: 0, end: nextPlan.length };
   }
 
-  if (shouldScroll) {
+  if (pinToEnd) {
     requestAnimationFrame(() => {
       elements.messages.scrollTop = elements.messages.scrollHeight;
       markCurrentSessionRead();
@@ -935,6 +946,11 @@ function renderVirtualWindow({ session, plan, pinToEnd = false }) {
     // 否则会把新窗口的行高记到旧计划的 key 上，越滚越乱
     if (state.renderPlan !== plan || state.virtualWindow.start !== win.start) return;
     measureRenderedHeights(plan);
+    if (pinToEnd) {
+      // 贴底：spacer 刚设好，此刻的 scrollHeight 才是真值
+      container.scrollTop = container.scrollHeight;
+      return;
+    }
     restoreVirtualAnchor({ plan, win, anchor, scrollTopAfterSwap });
   });
 }
@@ -1341,6 +1357,8 @@ function isNearBottomOfMessageList() {
 let virtualScrollFrame = 0;
 
 function handleMessageScroll() {
+  // 用户自己往上翻就取消贴底，否则新消息会把视口拽回底部
+  if (!isNearBottomOfMessageList()) state.pinToEnd = false;
   if (isNearBottomOfMessageList() && (state.unread.get(state.currentSessionId) || 0) > 0) {
     markCurrentSessionRead();
   }
@@ -1376,6 +1394,8 @@ function markCurrentSessionRead() {
 }
 
 function scrollToBottom(smooth = false) {
+  // 点「新消息」气泡 = 重新贴底，后续的副作用渲染也要保持这个意图
+  state.pinToEnd = true;
   if (state.virtual) {
     const session = state.sessions.get(state.currentSessionId);
     if (session) renderVirtualWindow({ session, plan: state.renderPlan, pinToEnd: true });

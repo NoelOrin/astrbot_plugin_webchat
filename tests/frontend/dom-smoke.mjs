@@ -670,6 +670,57 @@ check("最后一页后隐藏加载更多", doc.getElementById("session-more").hi
   check("滚动后虚拟窗口上移", topAfter !== topPad, `${topPad} -> ${topAfter}`);
 }
 
+// ── 切换会话：长会话也必须默认落在最新消息 ──────────────────
+// 之前切换时会把 scrollTop 归零，虚拟窗口按 scrollTop=0 算，于是停在会话开头。
+{
+  const clickSession = (name) => [...doc.querySelectorAll(".session-item")]
+    .find((el) => el.textContent.includes(name)).click();
+  clickSession("第三个群");
+  await new Promise((r) => setTimeout(r, 80));
+  clickSession("小红");
+  await new Promise((r) => setTimeout(r, 200));
+
+  const rows = [...doc.querySelectorAll("#message-items .message-row")];
+  const lastRow = rows.at(-1);
+  check("切回长会话默认落在最新消息",
+    lastRow?.getAttribute("data-message-id") === "2101",
+    `最后一条=${lastRow?.getAttribute("data-message-id")} 渲染=${rows.length} 条`);
+  check("切回长会话时底部没有多余 spacer",
+    parseFloat(doc.getElementById("virtual-bottom").style.height || "0") === 0,
+    doc.getElementById("virtual-bottom").style.height);
+
+  // 长会话里来一条新消息（SSE）：必须贴底显示，而不是停在历史里
+  window.__sseHandlers.onMessage({ eventType: "message", parsed: {
+    id: 2200, session_id: "aiocqhttp:FriendMessage:9", type: "received",
+    sender: "灌水", sender_id: "u10", sender_name: "灌水", content: "长会话新到的一条",
+    segments: [{ type: "text", text: "长会话新到的一条" }], timestamp: 1700030000 } });
+  await new Promise((r) => setTimeout(r, 250));
+
+  const rowsAfterArrive = [...doc.querySelectorAll("#message-items .message-row")];
+  check("长会话新消息到达后仍贴底",
+    rowsAfterArrive.at(-1)?.getAttribute("data-message-id") === "2200",
+    `末条=${rowsAfterArrive.at(-1)?.getAttribute("data-message-id")} 共 ${rowsAfterArrive.length} 条`);
+  check("新消息到达后底部没有多余 spacer",
+    parseFloat(doc.getElementById("virtual-bottom").style.height || "0") === 0,
+    doc.getElementById("virtual-bottom").style.height);
+
+  // 点「当前会话」不该把视口拽回底部：只有真的换了会话才贴底。
+  // jsdom 没有布局，给消息列表补上 scrollHeight/clientHeight，让 isNearBottom 真实可算
+  const list = doc.getElementById("messages");
+  Object.defineProperty(list, "scrollHeight", { get: () => 8000, configurable: true });
+  Object.defineProperty(list, "clientHeight", { get: () => 600, configurable: true });
+  list.scrollTop = 4000;
+  list.dispatchEvent(new window.Event("scroll"));
+  await new Promise((r) => setTimeout(r, 150));
+  const topBeforeRepeatClick = parseFloat(doc.getElementById("virtual-top").style.height || "0");
+  [...doc.querySelectorAll(".session-item")].find((el) => el.textContent.includes("小红")).click();
+  await new Promise((r) => setTimeout(r, 150));
+  const topAfterRepeatClick = parseFloat(doc.getElementById("virtual-top").style.height || "0");
+  check("点当前会话不会把视口拽回底部",
+    topAfterRepeatClick === topBeforeRepeatClick,
+    `${topBeforeRepeatClick} -> ${topAfterRepeatClick}`);
+}
+
 // 快速切换：尚未返回的旧订阅也必须退订，不能取代新订阅。
 {
   const bridge = window.AstrBotPluginView;

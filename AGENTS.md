@@ -190,6 +190,21 @@ plan 超过 `VIRTUAL_THRESHOLD`（80）时只渲染视口附近的一段节点�
 > ⚠️ 从虚拟窗口退回全量渲染（消息删到 ≤80 条）时不能走 `diffPlan`：DOM 里只有一段窗口节点，
 > 增量修补会对不上，必须整树重建。
 
+### 贴底是「会话级意图」，不是单次渲染参数
+
+`state.pinToEnd` 决定消息列表是否贴底，由**会话切换 / 主动发送 / 点「新消息」**置位，
+用户向上滚动离开底部（`handleMessageScroll` 里 `isNearBottom` 为假）时清除。
+
+`renderMessages()` 用 `pinToEnd = scrollToBottom || state.pinToEnd` 决定窗口，
+所以 SSE 补历史（`streamOpened` 里的 `renderMessages()`）、窗口重渲染这些
+**副作用渲染**不会把视口甩回会话开头。
+
+> ⚠️ 切换会话时 `scrollTop` 会被归零重建，**必须**同时 `pinToEnd`，
+> 否则新会话停在最顶上。虚拟滚动路径还要在 spacer 设好之后的 rAF 里
+> `container.scrollTop = container.scrollHeight`——那才是 scrollHeight 的真值。
+> `dom-smoke` 的「切回长会话默认落在最新消息」「长会话新消息到达后仍贴底」
+> 「点当前会话不会把视口拽回底部」守着这三条。
+
 ## 引用回复
 
 - 悬停消息 →「引用」→ 输入框上方出现引用条；发送时 segments 首部插入
