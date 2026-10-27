@@ -107,8 +107,8 @@ window.AstrBotPluginView = {
     }
     return { status: "ok" };
   },
-  subscribeSSE: async (endpoint, handlers) => {
-    calls.push(["SSE", endpoint]);
+  subscribeSSE: async (endpoint, handlers, params) => {
+    calls.push(["SSE", endpoint, params]);
     window.__sseHandlers = handlers;
     setTimeout(() => handlers.onOpen(), 0);
     return `sub-${calls.filter(([kind]) => kind === "SSE").length}`;
@@ -260,7 +260,10 @@ check("bot 消息有专属样式类", doc.querySelectorAll(".message-row.bot").l
 
 // 会话切换必须重建主题连接，旧连接的迟到消息/错误不能污染当前状态。
 check("切换会话重建 SSE", calls.filter(([kind]) => kind === "SSE").length === beforeSwitchSubscriptions + 1);
-check("SSE 订阅携带当前主题", calls.filter(([kind]) => kind === "SSE").at(-1)?.[1] === "stream?session_id=aiocqhttp%3AFriendMessage%3A9");
+check("SSE 订阅走 topic 参数而不是拼在 endpoint 里",
+  calls.filter(([kind]) => kind === "SSE").at(-1)?.[1] === "stream" &&
+    calls.filter(([kind]) => kind === "SSE").at(-1)?.[2]?.session_id === "aiocqhttp:FriendMessage:9",
+  JSON.stringify(calls.filter(([kind]) => kind === "SSE").at(-1)));
 check("切换时退订旧 SSE", calls.some(([kind]) => kind === "UNSUB"));
 previousHandlers.onError();
 previousHandlers.onMessage({ eventType: "message", parsed: {
@@ -672,11 +675,14 @@ check("最后一页后隐藏加载更多", doc.getElementById("session-more").hi
   const bridge = window.AstrBotPluginView;
   const subscribe = bridge.subscribeSSE;
   const pending = [];
-  bridge.subscribeSSE = (endpoint, handlers) => new Promise((resolve) => pending.push({ endpoint, handlers, resolve }));
+  bridge.subscribeSSE = (endpoint, handlers, params) => new Promise((resolve) => pending.push({ endpoint, handlers, params, resolve }));
   const clickSession = (name) => [...doc.querySelectorAll(".session-item")].find((el) => el.textContent.includes(name)).click();
   clickSession("第三个群");
   clickSession("小红");
-  check("快速切换分别订阅最新主题", pending.length === 2 && pending[1].endpoint.includes("aiocqhttp%3AFriendMessage%3A9"));
+  check("快速切换分别订阅最新主题",
+    pending.length === 2 && pending[1].endpoint === "stream" &&
+      pending[1].params?.session_id === "aiocqhttp:FriendMessage:9",
+    JSON.stringify(pending.map((item) => [item.endpoint, item.params])));
   const originalGet = bridge.apiGet;
   bridge.apiGet = async (endpoint, params) => endpoint === "updates"
     ? { messages: [{ id: 99001, session_id: "group:222", content: "切换窗口补回消息", timestamp: 1700010000 }], last_id: 99001, has_more: false }

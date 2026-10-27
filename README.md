@@ -59,16 +59,20 @@ http://<你的AstrBot地址>/webui#/plugins/astrbot_plugin_webchat
 
 ### 打不开终端页面？
 
-先确认你是从插件详情页进的（不是直接访问 URL）。仍然提示「未检测到 AstrBot 页面 Bridge」时，
-打开浏览器开发者工具 → Network，搜 `bridge-sdk.js`：
+先确认你是从插件详情页进的（不是直接访问 URL）。
 
-| 状态码 | 原因 | 处理 |
+插件从 **0.4.12** 起不再依赖 AstrBot 注入的 `bridge-sdk.js`：那个文件在受限 iframe
+（`sandbox` 且无 `allow-same-origin`）里拿不到登录态，AstrBot 4.29.x 上会稳定 401。
+现在页面自带一份同协议的 bridge 客户端（`pages/terminal/plugin-bridge.js`），
+作为视图静态资源加载，直接和 Dashboard 父页面握手。
+
+所以仍然打不开时，看 Console 里第一条 `[WebChat]`：
+
+| 诊断字段 | 含义 | 处理 |
 |---|---|---|
-| `401` | 请求 URL 里没有 `asset_token`，或 token 已过期 | 插件 0.4.11 起会用页面地址里的 `asset_token` 重试；仍然 401 就重新登录一次 WebUI（iframe 是 sandbox，cookie 不会跟着 `<script>` 走，这条路由只认 URL 里的 token） |
-| `404` | WebUI 挂在反向代理子路径下（如 `https://域名/astrbot/`） | 插件 0.4.10 起会按页面路径自动补加载，升级后刷新即可；仍然 404 就检查反代是否透传 `/api/` |
-| 请求根本不存在 | 页面不是由 AstrBot 的视图路由返回的 | 从插件详情页重新进入 |
-
-状态栏也会显示具体原因（`Bridge 不可用` / `Bridge 无响应`），Console 里有结构化诊断。
+| `bridgeSource: "none"` + `inFrame: false` | 页面被顶层打开，没有父页面 | 从插件详情页进入 |
+| `bridgeSource: "local"` + 「Bridge 无响应」 | 自带客户端建好了，但父页面没回话 | 强刷一次；仍不行就重载插件 |
+| 状态栏 `Bridge 不可用` 且 `inFrame: true` | 极端情况：连客户端都没起来 | 把这条诊断发出来 |
 
 ## 💬 使用
 

@@ -19,6 +19,7 @@ AstrBot 插件，提供一个 Web 终端 UI，通过 AstrBot 消息平台**双�
 | `webchat_core.py` | 纯逻辑：片段序列化、SQLite 存储、会话键 | 仅标准库，**不 import AstrBot** |
 | `main.py` | 插件入口：事件监听、Web API、SSE、生命周期 | AstrBot SDK + Quart + webchat_core |
 | `pages/terminal/webchat-lib.js` | 前端纯函数：去重、排序、格式化、高亮 | 无（不碰 DOM/bridge） |
+| `pages/terminal/plugin-bridge.js` | 自带 bridge 客户端：与 Dashboard 父页面 postMessage 握手 | 无（只碰 window）|
 | `pages/terminal/app.js` | 状态、渲染、SSE、弹窗 | DOM + bridge + webchat-lib |
 
 **这条边界是刻意的**：`webchat_core.py` 和 `webchat-lib.js` 能脱离宿主单测，改动逻辑时优先放这里。
@@ -38,7 +39,8 @@ AstrBot 插件，提供一个 Web 终端 UI，通过 AstrBot 消息平台**双�
 ### 前端 (`pages/terminal/`)
 - `index.html` — 结构 + 首屏主题/紧凑模式内联脚本（避免闪烁）
 - `webchat-lib.js` — 纯函数（有测试）
-- `app.js` — 控制器，`window.AstrBotPluginView`（回退 `AstrBotPluginPage`）
+- `plugin-bridge.js` — 自带 bridge 客户端（宿主注入失败时顶上，见「bridge」一节）
+- `app.js` — 控制器，优先 `window.AstrBotPluginView`（回退 `AstrBotPluginPage`）
 
 ### 路由前缀
 AstrBot 在 `/api/plug/` 下注册插件 API。bridge 自动加前缀；原生 `EventSource` 需完整路径：
@@ -336,7 +338,7 @@ const previousPlan = state.renderSessionId === sessionId ? state.renderPlan : []
 - 端点: `GET /api/plug/astrbot_plugin_webchat/stream?session_id=<会话>`
 - 事件: `connected`、`hello`、`ping`、`message`、`message_summary`、`session`、`session_updated`、`session_removed`、`message_removed`、`cleared`、`sessions_discovered`
 - keepalive: 每 `SSE_KEEPALIVE`（15 秒）发一个 **`ping` 事件**（不是注释行）
-- 前端优先 `bridge.subscribeSSE("stream?session_id=…", ...)`；bridge 无此方法才退回原生 `EventSource`
+- 前端优先 `bridge.subscribeSSE("stream", handlers, { session_id })`（query 走 params）；bridge 无此方法才退回原生 `EventSource`
 - 全部失败时降级轮询（2.5 秒）
 
 ### 会话主题订阅
@@ -427,46 +429,66 @@ SSE 不可用时前端每 2.5 秒拉一次 `GET /updates?after_id=<全局消息 
 - ⚠️ bridge 只有 `apiGet` / `apiPost`（新版本另有 `apiFetch`）；PATCH/DELETE 走后端 `?method=` 覆盖，后端 `_effective_method()` 解析
 - 图片走 `/media?url=` 代理，规避防盗链与混合内容
 
-## bridge 缺失时的自愈与诊断
+## bridge：自带客户端，不再依赖宿主注入
 
-视图的所有后端能力都经 `window.AstrBotPluginView`（旧版 `AstrBotPluginPage`）转发，
-这个全局由 AstrBot 返回视图 HTML 时注入的 `/api/plugin/page/bridge-sdk.js` 提供。
+视图里所有后端能力都经 bridge（postMessage 转发器）走。历史上这个全局由
+AstrBot 返回视图 HTML 时注入的 `/api/plugin/page/bridge-sdk.js` 提供。
 
-**三种典型故障**，以前都只丢一句「未检测到 AstrBot 页面 Bridge」：
+**但 4.29.x 上那条路在 iframe 里走不通**，实测（`astrbot.noelorin.top`，v4.29.3）：
 
-| 现象 | 真正原因 |
+```
+GET /api/plugin/page/bridge-sdk.js                                    → 401
+GET /api/plugin/page/bridge-sdk.js?asset_token=<有效 JWT>&theme=light → 401
+```
+
+原因是双重的：
+
+- 视图 iframe 是 `sandbox="allow-scripts allow-forms allow-downloads"`（**没有**
+  `allow-same-origin`），文档是 opaque origin，Dashboard 那个 `SameSite=Strict`
+  登录 cookie **不会**跟着 `<script src>` 发出去；
+- 那条路由只认 `?asset_token=`（`dashboard/plugin_page_auth.py` 的
+  `PluginPageAuth.is_protected_path`），而带 token 也过不了 —— 所以「等宿主注入」
+  这条路在当前版本就是死路。
+
+### 现在的做法：`pages/terminal/plugin-bridge.js`
+
+bridge SDK 本质就是一段 postMessage 转发器，协议很短。我们**自己实现一份**，
+作为视图自己的静态资源加载（跟 path token 走，天生 200），直接和父页面
+（Dashboard 的 `PluginViewPage.vue`）握手，完全绕开那条 401 的路由。
+
+`ensureBridge()` 的顺序（`app.js`）：
+
+1. `window.AstrBotPluginView || AstrBotPluginPage` —— 宿主注入成功就用它（最权威）
+2. 否则 `createPluginBridge(window)` —— 自带客户端
+3. `window.parent === window`（顶层直接打开）→ 没有父页面，直接判不可用
+
+**协议**（必须与宿主 `dashboard/plugin_page_bridge.js` 一致）：
+
+| 方向 | 消息 |
 |---|---|
-| 页面在浏览器里直接打开 | 没有 Dashboard 父页面 → 没有注入、也没有人能响应 postMessage |
-| `bridge-sdk.js` 404 | WebUI 挂在反向代理子路径（`/astrbot/`）下，宿主注入的是**绝对路径** |
-| `bridge-sdk.js` 401 | URL 里没带 `asset_token`，或 token 已过期 |
+| 子 → 父 | `{channel, kind:"ready"}` |
+| 子 → 父 | `{channel, kind:"request", requestId, action, …}`，`action` = `api:get {endpoint, params}` / `api:post {endpoint, body}` / `sse:subscribe {endpoint, params, subscriptionId}` / `sse:unsubscribe {subscriptionId}` |
+| 父 → 子 | `{channel, kind:"context", context}` / `{kind:"response", requestId, ok, data\|error}` / `{kind:"sse_message", …}` / `{kind:"sse_state", state:"open"\|"error"}` |
 
-> ⚠️ **401 是主因，且和 cookie 无关。** 视图 iframe 是
-> `sandbox="allow-scripts allow-forms allow-downloads"`（**没有** `allow-same-origin`），
-> 文档是 opaque origin，Dashboard 那个 `SameSite=Strict` 的登录 cookie
-> **不会**跟着 `<script src>` 发出去。所以 AstrBot 给这条路由单开了 query token 认证
-> （`astrbot/dashboard/plugin_page_auth.py`：视图资源走 `/_t/<token>/` path token，
-> 共享的 bridge SDK 只认 `?asset_token=`）。宿主注入的标签偶尔是裸 URL，
-> 实测（`astrbot.noelorin.top`）就是 401 —— 补加载不带 token 等于白试。
+> ⚠️ **endpoint 不能带 query。** 父页面用 `normalizePluginEndpoint` 校验，
+> 出现 `?`、`#`、`://`、`..` 直接抛 `Plugin bridge endpoint is invalid.`。
+> SSE 的 `session_id` 必须走第三个参数 `params`：
+> `bridge.subscribeSSE("stream", handlers, { session_id })`。
+> 0.4.11 之前一直拼成 `"stream?session_id=…"`，在 4.29 上必然抛错 →
+> 静默退回原生 EventSource → 又因为没有 cookie 而 401，于是永远在轮询。
 
-`boot()` 现在的顺序：`ensureBridge()` → 拿到 bridge 后再并行「等上下文 + 探 health」→ 再加载会话：
+> ⚠️ **退订要 fire-and-forget。** `unsubscribeSSE` 只发不等回执：父页面万一不回，
+> 等 ack 的 Promise 会一直挂着（切会话时最致命）。`request()` 只用于要结果的调用。
 
-- `ensureBridge()` 先看宿主是否已注入；没有就按 `bridgeSdkUrls(location)` 依次补加载：
-  **第一个带 `asset_token`**（唯一能在 sandbox iframe 里过认证的形式），
-  第二个才是裸地址（同源非 sandbox 场景下 cookie 仍然生效）
-- token 两个来源都要认：`?asset_token=` 查询参数、`/views/<视图>/_t/<token>/` 路径段
-  （`assetTokenFromViewUrl`）。token 是凭证，**console 诊断里只留 `asset_token=***`**
-- 地址由 `bridgeSdkUrl(pathname)` 按**第一个 `/api/`** 切出部署前缀
-  （`/astrbot/api/v1/plugins/...` → `/astrbot/api/plugin/page/bridge-sdk.js`），
-  所以子路径部署能自愈；地址是算出来的，**不要**改成写死 `/api/plugin/page/bridge-sdk.js`
-- 补加载只在 `http(s)` 下进行（`file://` 没有同源后端），每个地址只试一次
-- `probeBridgeHandshake()` 用 `health` 探一次握手：bridge 存在但宿主不回话时，
-  后面的每个 `apiGet` 都会永久挂起，界面就会无声地卡在「正在连接」。
-  **只有超时**才算握手失败；宿主回了错误（端点自己抛异常）说明 bridge 是通的
-- 失败分支要写清楚怎么查：状态栏文案 + `console.error` 结构化诊断
-  （是否在 iframe、页面地址、是否有 token、宿主注入情况、尝试过的地址）
-  + 一条长驻 12 秒的 toast
-- `bindBridgeContext()` 不能在 `bindEvents()` 里订阅 `onContext`：那时 bridge 还可能不存在，
-  自愈后拿到的 bridge 会漏掉主题 / 语言变化
+> ⚠️ **opaque origin 下 targetOrigin 只能是 `"*"`。** sandbox iframe 的
+> `location.origin` 可能是 `"null"`，用它当 targetOrigin 会直接抛 SyntaxError；
+> 接收侧只能比 `event.source === window.parent`，没法比 origin。
+
+### 诊断
+
+失败分支必须写清楚怎么查：状态栏文案 + `console.error` 结构化诊断
+（是否在 iframe、页面地址、`bridgeSource` 是 host/local/none）+ 长驻 toast。
+`bridgeSource === "none"` 表示连自带客户端都没建起来（多半是顶层打开）。
 
 ## 配置 (`_conf_schema.json`)
 
@@ -553,7 +575,8 @@ SSE 不可用时前端每 2.5 秒拉一次 `GET /updates?after_id=<全局消息 
 | `python -m pytest tests -q` | 存储/序列化 + 插件行为（假宿主）|
 | `node --test pages/terminal/webchat-lib.test.js` | 前端纯函数 |
 | `node tests/frontend/dom-smoke.mjs` | jsdom 端到端（需 `npm i jsdom`）|
-| `node tests/frontend/bridge-missing.mjs` | bridge 缺失 / 子路径自愈（需 `npm i jsdom`）|
+| `node tests/frontend/bridge-missing.mjs` | bridge 缺失时的诊断与自带客户端（需 `npm i jsdom`）|
+| `node --test tests/frontend/plugin-bridge.test.mjs` | 自带 bridge 客户端的协议（假父窗口）|
 
 `tests/test_plugin.py` 用 `sys.modules` 注入假 AstrBot/Quart，因此**不需要装 AstrBot 就能跑**。
 新增宿主 API 依赖时，记得同步在 `_install_fake_astrbot()` 里补桩。

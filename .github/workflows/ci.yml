@@ -53,6 +53,9 @@ jobs:
       - name: Bridge fallback smoke test
         run: node tests/frontend/bridge-missing.mjs
 
+      - name: Plugin bridge protocol test
+        run: node --test tests/frontend/plugin-bridge.test.mjs
+
   metadata:
     name: Metadata sanity
     runs-on: ubuntu-latest

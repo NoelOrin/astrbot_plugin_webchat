@@ -1,16 +1,14 @@
 /**
- * bridge 缺失 / 自愈场景的冒烟。
+ * bridge 获取路径的冒烟。
  *
- * 视图跑在 Dashboard 的受限 iframe 里，后端能力全靠宿主注入的
- * bridge-sdk.js 提供的 window.AstrBotPluginView。注入可能压根没发生
- * （用户直接打开页面），也可能请求失败（反向代理子路径下绝对路径 404）。
- * 这两种情况以前都只丢一句「未检测到 Bridge」，用户无从下手。
+ * 视图跑在 Dashboard 的 sandbox iframe 里，所有后端能力都靠 postMessage 转发。
+ * AstrBot 4.29.x 注入的 `/api/plugin/page/bridge-sdk.js` 在里面必然 401
+ * （登录 cookie 是 SameSite=Strict，opaque origin 的 <script src> 带不出去；
+ * 带 ?asset_token= 实测也过不了），所以页面必须能自己顶上。
  *
- * 场景 1：直接打开页面 —— 必须给出可诊断提示，而不是停在「正在连接」。
- * 场景 2：子路径部署 —— 补加载的 SDK 地址要带上部署前缀，而不是打到域名根。
- *
- * 约定：只断言不会自行消失的信号（状态文案、console 诊断、注入的 script），
- * toast 到点会被移除，不能当稳定断言。
+ * 场景 1：顶层直接打开 —— 没有父页面，必须立刻给出可诊断提示。
+ * 场景 2：在 iframe 里但宿主没注入 SDK —— 用页面自带的客户端握手，
+ *         且**不能**再回去请求那条 401 的路由。
  */
 
 import { JSDOM } from "jsdom";
@@ -25,7 +23,8 @@ const root = path.resolve(
 const html = fs.readFileSync(path.join(root, "index.html"), "utf8");
 const appSource = fs
   .readFileSync(path.join(root, "app.js"), "utf8")
-  .replace('from "./webchat-lib.js"', `from "file://${path.join(root, "webchat-lib.js")}"`);
+  .replace('from "./webchat-lib.js"', `from "file://${path.join(root, "webchat-lib.js")}"`)
+  .replace('from "./plugin-bridge.js"', `from "file://${path.join(root, "plugin-bridge.js")}"`);
 
 const results = [];
 const check = (name, cond, extra = "") => results.push([cond ? "PASS" : "FAIL", name, extra]);
@@ -35,6 +34,8 @@ const originalError = console.error;
 console.error = (...args) => {
   errors.push(args);
 };
+
+const tempFiles = [];
 
 /** 把 jsdom 的 window 暴露成 Node 全局，app.js 作为 ESM 只能在模块求值时读一次。 */
 function exposeGlobals(window) {
@@ -63,28 +64,41 @@ function exposeGlobals(window) {
   globalThis.requestAnimationFrame = (fn) => setTimeout(fn, 0);
 }
 
-const tempFiles = [];
-async function bootPage(url) {
-  const dom = new JSDOM(html, {
-    url,
-    runScripts: "outside-only",
-    pretendToBeVisual: true,
-  });
-  exposeGlobals(dom.window);
+async function bootPage(url, { withParent = false } = {}) {
+  const dom = new JSDOM(html, { url, runScripts: "outside-only", pretendToBeVisual: true });
+  const { window } = dom;
+  const posted = [];
+  if (withParent) {
+    // jsdom 里 window.top 不可重定义，但 window.parent 可以，
+    // 而 app 判断「有没有父页面」用的正是 parent。
+    Object.defineProperty(window, "parent", {
+      configurable: true,
+      get: () => ({
+        postMessage(message, targetOrigin) {
+          posted.push({ message, targetOrigin });
+        },
+      }),
+    });
+  }
+  exposeGlobals(window);
   const tmp = path.join(os.tmpdir(), `webchat-bridge-${process.pid}-${tempFiles.length}.mjs`);
   tempFiles.push(tmp);
   fs.writeFileSync(tmp, appSource);
   await import("file://" + tmp);
-  return dom.window;
+  return { window, posted };
 }
 
 try {
-  // ── 场景 1：file:// 直接打开，没有宿主、没有 bridge ──
+  // ── 场景 1：file:// 直接打开，没有宿主、没有父页面 ──
   const standalone = await bootPage("file:///tmp/webchat-standalone/index.html");
   await new Promise((r) => setTimeout(r, 300));
 
-  const statusText = () => standalone.document.getElementById("status-text").textContent;
-  check("直接打开时状态栏显示 Bridge 不可用", statusText() === "Bridge 不可用", statusText());
+  const status = (win) => win.document.getElementById("status-text").textContent;
+  check(
+    "直接打开时状态栏显示 Bridge 不可用",
+    status(standalone.window) === "Bridge 不可用",
+    status(standalone.window),
+  );
 
   const diagnosis = errors.find(
     ([message]) => typeof message === "string" && message.includes("未检测到 AstrBot 页面 Bridge"),
@@ -96,80 +110,42 @@ try {
     JSON.stringify(diagnosis?.[1] || null),
   );
   check(
-    "诊断里给出页面地址",
-    typeof diagnosis?.[1]?.href === "string" && diagnosis[1].href.includes("index.html"),
+    "诊断里标明 bridge 来源是 none",
+    diagnosis?.[1]?.bridgeSource === "none",
     JSON.stringify(diagnosis?.[1] || null),
   );
 
-  const toastText = standalone.document.getElementById("toast-region").textContent;
+  const toastText = standalone.window.document.getElementById("toast-region").textContent;
   check("提示保留原文案", toastText.includes("未检测到 AstrBot 页面 Bridge"), toastText);
   check("提示说明要从插件详情页进入", toastText.includes("插件详情页"), toastText);
-  check("没有 bridge 时不谎报已连接", !statusText().includes("实时连接"), statusText());
-
-  // ── 场景 2：/astrbot 子路径 + 宿主注入失败，且 SDK 只认 query token ──
-  // 视图 iframe 是 sandbox（opaque origin），Dashboard 的 SameSite=Strict cookie
-  // 不会被 <script src> 带出去，所以裸地址必然 401，必须带上 asset_token。
-  const subpath = await bootPage(
-    "http://localhost/astrbot/api/v1/plugins/astrbot_plugin_webchat/views/terminal/_t/tok/" +
-      "?asset_token=tok&theme=light",
-  );
-  await new Promise((r) => setTimeout(r, 200));
-
-  const scripts = () => [
-    ...subpath.document.querySelectorAll("script[data-webchat-bridge-sdk]"),
-  ];
-  check("宿主没注入时自己补加载 bridge SDK", scripts().length > 0, String(scripts().length));
   check(
-    "第一个候选带上 asset_token（否则 sandbox 里一定 401）",
-    scripts()[0]?.getAttribute("src") ===
-      "/astrbot/api/plugin/page/bridge-sdk.js?asset_token=tok",
-    scripts()[0]?.getAttribute("src"),
+    "不再去请求必然 401 的 bridge-sdk.js",
+    standalone.window.document.querySelector('script[src*="bridge-sdk.js"]') === null,
   );
 
-  // 第一个候选 401 → 必须回落到裸地址兜底，而不是直接放弃
-  scripts()[0]?.dispatchEvent(new subpath.Event("error"));
-  await new Promise((r) => setTimeout(r, 200));
-  check(
-    "带 token 失败后回落裸地址，且前缀不丢",
-    scripts()[1]?.getAttribute("src") === "/astrbot/api/plugin/page/bridge-sdk.js",
-    scripts()[1]?.getAttribute("src"),
-  );
-
-  // SDK 加载成功后必须继续启动，而不是继续报「Bridge 不可用」
-  subpath.AstrBotPluginView = {
-    ready: () => new Promise(() => {}),
-    apiGet: () => new Promise(() => {}),
-  };
-  scripts()[1]?.dispatchEvent(new subpath.Event("load"));
-  await new Promise((r) => setTimeout(r, 120));
-  const healedStatus = subpath.document.getElementById("status-text").textContent;
-  check("补加载成功后不会再报 Bridge 不可用", healedStatus !== "Bridge 不可用", healedStatus);
-
-  // ── 场景 3：两个候选都失败（401）——诊断要交代 token 与尝试过的地址 ──
+  // ── 场景 2：iframe 里、宿主没注入 SDK ──
   errors.length = 0;
-  const denied = await bootPage(
-    "http://localhost/api/v1/plugins/astrbot_plugin_webchat/views/terminal/_t/tok/" +
-      "?asset_token=tok&theme=light",
+  const framed = await bootPage(
+    "http://localhost/api/v1/plugins/astrbot_plugin_webchat/views/terminal/_t/tok/?asset_token=tok&theme=light",
+    { withParent: true },
   );
-  await new Promise((r) => setTimeout(r, 200));
-  const deniedScripts = () => [
-    ...denied.document.querySelectorAll("script[data-webchat-bridge-sdk]"),
-  ];
-  deniedScripts()[0]?.dispatchEvent(new denied.Event("error"));
-  await new Promise((r) => setTimeout(r, 200));
-  deniedScripts()[1]?.dispatchEvent(new denied.Event("error"));
   await new Promise((r) => setTimeout(r, 200));
 
-  const deniedDiag = errors.find(
-    ([message]) => typeof message === "string" && message.includes("未检测到 AstrBot 页面 Bridge"),
-  );
-  check("401 后落到 Bridge 不可用", denied.document.getElementById("status-text").textContent === "Bridge 不可用");
-  check("诊断标明带了 asset_token", deniedDiag?.[1]?.hasAssetToken === true, JSON.stringify(deniedDiag?.[1] || null));
   check(
-    "诊断列出两次尝试且 token 已打码",
-    JSON.stringify(deniedDiag?.[1]?.attempted || []).includes("asset_token=***") &&
-      (deniedDiag?.[1]?.attempted || []).length === 2,
-    JSON.stringify(deniedDiag?.[1]?.attempted || null),
+    "iframe 里不再报 Bridge 不可用",
+    status(framed.window) !== "Bridge 不可用",
+    status(framed.window),
+  );
+  check(
+    "iframe 里也不请求 bridge-sdk.js",
+    framed.window.document.querySelector('script[src*="bridge-sdk.js"]') === null,
+  );
+  const ready = framed.posted.find(({ message }) => message?.kind === "ready");
+  check("自带客户端主动向父页面报 ready", !!ready, JSON.stringify(framed.posted));
+  check(
+    "消息走 astrbot-plugin-page 协议通道",
+    ready?.message?.channel === "astrbot-plugin-page",
+    JSON.stringify(ready?.message || null),
   );
 } finally {
   console.error = originalError;
@@ -177,8 +153,8 @@ try {
 }
 
 const failed = results.filter((r) => r[0] === "FAIL");
-for (const [status, name, extra] of results) {
-  console.log(`${status === "PASS" ? "✔" : "✘"} ${name}${status === "FAIL" ? "  <= " + extra : ""}`);
+for (const [state, name, extra] of results) {
+  console.log(`${state === "PASS" ? "✔" : "✘"} ${name}${state === "FAIL" ? "  <= " + extra : ""}`);
 }
 console.log(`\n${results.length - failed.length}/${results.length} passed`);
 process.exit(failed.length ? 1 : 0);
